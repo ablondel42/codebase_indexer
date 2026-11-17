@@ -10,11 +10,23 @@ import re
 import sys
 from typing import Any, Callable, Coroutine
 
+from repo_context.cli.formatting import estimate_tokens, print_json
+from repo_context.cli.utils import resolve_db_path
 from repo_context.config import get_config
 from repo_context.exceptions import ValidationError
 from repo_context.indexing import watch_repo
-from repo_context.cli.formatting import estimate_tokens, print_json
-from repo_context.cli.utils import resolve_db_path
+from repo_context.mcp import (
+    analyze_risk,
+    close_default_lsp_pool,
+    get_file_outline,
+    get_repo_overview,
+    get_symbol_context,
+    get_symbol_references,
+    get_symbol_source,
+    list_files,
+    run_server,
+    search_symbols,
+)
 
 _PRIMARY_ARG_BY_TOOL: dict[str, str] = {
     "get_repo_overview": "repo_id",
@@ -27,31 +39,16 @@ _PRIMARY_ARG_BY_TOOL: dict[str, str] = {
     "analyze_risk": "symbols",
 }
 _KV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
-
-
-def _load_mcp_tool_registry() -> dict[str, Callable[..., Coroutine[Any, Any, str]]]:
-    """Lazily import the 8 MCP tool functions so non-MCP CLI commands require no mcp package."""
-    from repo_context.mcp import (
-        analyze_risk,
-        get_file_outline,
-        get_repo_overview,
-        get_symbol_context,
-        get_symbol_references,
-        get_symbol_source,
-        list_files,
-        search_symbols,
-    )
-
-    return {
-        "get_repo_overview": get_repo_overview,
-        "list_files": list_files,
-        "get_file_outline": get_file_outline,
-        "search_symbols": search_symbols,
-        "get_symbol_source": get_symbol_source,
-        "get_symbol_context": get_symbol_context,
-        "get_symbol_references": get_symbol_references,
-        "analyze_risk": analyze_risk,
-    }
+_MCP_TOOL_REGISTRY: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
+    "get_repo_overview": get_repo_overview,
+    "list_files": list_files,
+    "get_file_outline": get_file_outline,
+    "search_symbols": search_symbols,
+    "get_symbol_source": get_symbol_source,
+    "get_symbol_context": get_symbol_context,
+    "get_symbol_references": get_symbol_references,
+    "analyze_risk": analyze_risk,
+}
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -79,15 +76,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     """Start the token-lean MCP server on stdio transport."""
     db_path = resolve_db_path(args)
     debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
-    try:
-        from repo_context.mcp import run_server
-    except ImportError as exc:
-        print(
-            f"Error: MCP package is required for `rc serve` ({exc}).",
-            file=sys.stderr,
-        )
-        return 1
-
     run_server(db_path=db_path, debug=debug)
     return 0
 
@@ -188,17 +176,8 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
         raw_tokens = list(raw_arg_value or [])
     repo_arg: str | None = getattr(args, "repo", None)
 
-    try:
-        tool_registry = _load_mcp_tool_registry()
-    except ImportError as exc:
-        print(
-            f"Error: MCP package is required for `rc mcp-call` ({exc}).",
-            file=sys.stderr,
-        )
-        return 1
-
-    if tool_name not in tool_registry:
-        available = ", ".join(tool_registry.keys())
+    if tool_name not in _MCP_TOOL_REGISTRY:
+        available = ", ".join(_MCP_TOOL_REGISTRY.keys())
         print(
             f"Error: Unknown MCP tool {tool_name!r}. Available tools: {available}",
             file=sys.stderr,
@@ -214,7 +193,7 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    handler = tool_registry[tool_name]
+    handler = _MCP_TOOL_REGISTRY[tool_name]
     kwargs = _normalize_tool_kwargs(
         tool_name,
         parsed_args,
@@ -222,8 +201,6 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
         db_path,
         repo_arg=repo_arg,
     )
-
-    from repo_context.mcp import close_default_lsp_pool
 
     try:
         raw_response = asyncio.run(handler(**kwargs))

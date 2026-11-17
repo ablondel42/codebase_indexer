@@ -6,25 +6,11 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from mcp.server import MCPServer
+
 from repo_context.config import get_config
 from repo_context.lsp import LspSessionPool
 from repo_context.mcp.tools import register_tools
-
-
-def _load_mcp_server_class() -> type[Any]:
-    """Load the installed MCP server class (mcp 2.x ``MCPServer`` or 1.x ``FastMCP``)."""
-    try:
-        from mcp.server import MCPServer
-
-        return MCPServer
-    except ImportError:
-        pass
-    try:
-        from mcp.server.fastmcp import FastMCP
-
-        return FastMCP
-    except ImportError as exc:
-        raise RuntimeError("The 'mcp' package is required to run the MCP server.") from exc
 
 
 def create_server(
@@ -32,11 +18,10 @@ def create_server(
     debug: bool = False,
     *,
     lsp_pool: LspSessionPool | None = None,
-) -> Any:
-    """Create and configure the token-lean MCP server (MCPServer / FastMCP)."""
-    server_cls = _load_mcp_server_class()
+) -> MCPServer[Any]:
+    """Create and configure the token-lean MCP server."""
     cfg = get_config()
-    mcp = server_cls(cfg.app_name)
+    mcp = MCPServer(cfg.app_name)
     pool = lsp_pool if lsp_pool is not None else LspSessionPool(config=cfg)
 
     register_tools(mcp, db_path=db_path, lsp_pool=pool)

@@ -5,10 +5,9 @@ from collections import Counter
 import json
 from pathlib import Path
 import sqlite3
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from repo_context.config import get_config
 from repo_context.context import (
@@ -931,7 +930,7 @@ async def analyze_risk(
 
 
 def register_tools(
-    mcp: "FastMCP | Any",
+    mcp: MCPServer[Any] | Any,
     db_path: str | Path | None = None,
     lsp_pool: LspSessionPool | None = None,
 ) -> None:

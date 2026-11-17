@@ -518,12 +518,6 @@ def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
         else:
             active_repo = None
 
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            import readline  # noqa: F401
-        except ImportError:
-            pass
-
     print(
         f"Interactive rc shell (db: {db_path}, repo: {active_repo or 'auto'}). "
         "Type 'help' or 'exit'."

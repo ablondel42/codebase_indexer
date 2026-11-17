@@ -2,7 +2,6 @@
 
 import asyncio
 from collections.abc import Iterator
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -458,12 +457,8 @@ def test_register_tools_and_create_server(indexed_mcp_repo: tuple[Path, Path, st
     ov_res = json.loads(asyncio.run(fake_mcp.tools["get_repo_overview"]()))  # type: ignore[operator]
     assert ov_res["ok"] is True
 
-    if importlib.util.find_spec("mcp") is None:
-        with pytest.raises(RuntimeError, match="mcp"):
-            create_server(db_path=db_path)
-    else:
-        server = create_server(db_path=db_path)
-        assert server is not None
+    server = create_server(db_path=db_path)
+    assert server is not None
 
 
 def test_40_method_class_token_budget(tmp_path: Path) -> None:

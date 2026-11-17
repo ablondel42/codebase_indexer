@@ -10,12 +10,8 @@ import sys
 import time
 from typing import Any, Callable
 
-try:
-    from watchdog.events import FileSystemEventHandler
-    from watchdog.observers import Observer
-except ImportError:  # pragma: no cover - allows importing/testing without watchdog installed
-    FileSystemEventHandler = object  # type: ignore[misc, assignment]
-    Observer = None  # type: ignore[misc, assignment]
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 from repo_context.config import AppConfig, get_config
 from repo_context.indexing.events import FileChangeEvent, normalize_event
@@ -91,7 +87,6 @@ def watch_repo(
     Raises:
         FileNotFoundError: If ``repo_root`` does not exist.
         NotADirectoryError: If ``repo_root`` is not a directory.
-        ImportError: If ``watchdog`` is not installed.
     """
     repo_root = Path(repo_root).resolve()
 
@@ -99,8 +94,6 @@ def watch_repo(
         raise FileNotFoundError(f"Repository root not found: {repo_root}")
     if not repo_root.is_dir():
         raise NotADirectoryError(f"Not a directory: {repo_root}")
-    if Observer is None:
-        raise ImportError("The 'watchdog' package is required for watch mode.")
 
     cfg = config or get_config()
     resolved_db_path = Path(db_path or cfg.db_path)
