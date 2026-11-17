@@ -1,90 +1,218 @@
-"""MCP tool input/output schemas.
+"""Strict Pydantic input validation schemas for the 8 token-lean MCP tools."""
 
-Defines explicit input and output contracts for all MCP tools.
-"""
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+
+SymbolKindLiteral = Literal[
+    "module",
+    "class",
+    "function",
+    "async_function",
+    "method",
+    "async_method",
+    "local_function",
+    "local_async_function",
+    "constant",
+    "attribute",
+    "type_alias",
+]
+
+DirectionLiteral = Literal["incoming", "outgoing", "both"]
 
 
-class ResolveSymbolInput(BaseModel):
-    """Input for resolve_symbol tool."""
+def _require_non_empty(value: str, field_name: str) -> str:
+    """Ensure a string input is not empty or whitespace-only."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{field_name} must not be empty or whitespace")
+    return stripped
 
-    repo_id: str = Field(..., min_length=1, pattern=r"^repo:.+")
-    qualified_name: str = Field(..., min_length=1)
-    kind: str | None = None
-    file_id: str | None = None
 
-    @field_validator("qualified_name")
+def _validate_optional_non_empty(value: str | None, field_name: str) -> str | None:
+    """Validate optional string inputs, rejecting whitespace-only strings."""
+    if value is None:
+        return None
+    return _require_non_empty(value, field_name)
+
+
+class GetRepoOverviewInput(BaseModel):
+    """Input for ``get_repo_overview``."""
+
+    repo_id: str | None = None
+
+    @field_validator("repo_id")
     @classmethod
-    def validate_qualified_name(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("qualified_name must not be empty or whitespace")
-        return v
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
+
+
+class ListFilesInput(BaseModel):
+    """Input for ``list_files``."""
+
+    repo_id: str | None = None
+    path_prefix: str | None = None
+    include_tests: bool = False
+    limit: int = Field(default=100, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
+
+    @field_validator("path_prefix")
+    @classmethod
+    def validate_path_prefix(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "path_prefix")
+
+
+class GetFileOutlineInput(BaseModel):
+    """Input for ``get_file_outline``."""
+
+    file_path: str = Field(..., min_length=1)
+    repo_id: str | None = None
+    include_private: bool = True
+    max_depth: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_file_path(cls, v: str) -> str:
+        return _require_non_empty(v, "file_path")
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
+
+
+class SearchSymbolsInput(BaseModel):
+    """Input for ``search_symbols``."""
+
+    query: str = Field(..., min_length=1)
+    repo_id: str | None = None
+    kind: SymbolKindLiteral | None = None
+    file_path: str | None = None
+    limit: int = Field(default=20, ge=1, le=200)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, v: str) -> str:
+        return _require_non_empty(v, "query")
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_file_path(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "file_path")
+
+
+class GetSymbolSourceInput(BaseModel):
+    """Input for ``get_symbol_source``."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol_id_or_name: str = Field(
+        ...,
+        min_length=1,
+        validation_alias=AliasChoices("symbol", "symbol_id_or_name"),
+    )
+    repo_id: str | None = None
+    max_lines: int = Field(default=120, ge=1, le=500)
+    offset: int = Field(default=0, ge=0)
+
+    @field_validator("symbol_id_or_name")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return _require_non_empty(v, "symbol")
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
 
 
 class GetSymbolContextInput(BaseModel):
-    """Input for get_symbol_context tool."""
+    """Input for ``get_symbol_context``."""
 
-    symbol_id: str = Field(..., min_length=1)
+    model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("symbol_id")
+    symbol_id_or_name: str = Field(
+        ...,
+        min_length=1,
+        validation_alias=AliasChoices("symbol", "symbol_id_or_name"),
+    )
+    repo_id: str | None = None
+    edge_limit: int = Field(default=20, ge=1, le=200)
+    include_source: bool = False
+    max_source_lines: int = Field(default=80, ge=1, le=500)
+
+    @field_validator("symbol_id_or_name")
     @classmethod
-    def validate_symbol_id(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("symbol_id must not be empty or whitespace")
-        return v
+    def validate_symbol(cls, v: str) -> str:
+        return _require_non_empty(v, "symbol")
 
-
-class RefreshSymbolReferencesInput(BaseModel):
-    """Input for refresh_symbol_references tool."""
-
-    symbol_id: str = Field(..., min_length=1)
-
-    @field_validator("symbol_id")
+    @field_validator("repo_id")
     @classmethod
-    def validate_symbol_id(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("symbol_id must not be empty or whitespace")
-        return v
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
 
 
 class GetSymbolReferencesInput(BaseModel):
-    """Input for get_symbol_references tool."""
+    """Input for ``get_symbol_references``."""
 
-    symbol_id: str = Field(..., min_length=1)
+    model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("symbol_id")
+    symbol_id_or_name: str = Field(
+        ...,
+        min_length=1,
+        validation_alias=AliasChoices("symbol", "symbol_id_or_name"),
+    )
+    repo_id: str | None = None
+    direction: DirectionLiteral = "incoming"
+    refresh_lsp: bool = False
+    limit: int = Field(default=30, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+    @field_validator("symbol_id_or_name")
     @classmethod
-    def validate_symbol_id(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("symbol_id must not be empty or whitespace")
-        return v
+    def validate_symbol(cls, v: str) -> str:
+        return _require_non_empty(v, "symbol")
 
-
-class AnalyzeSymbolRiskInput(BaseModel):
-    """Input for analyze_symbol_risk tool."""
-
-    symbol_id: str = Field(..., min_length=1)
-
-    @field_validator("symbol_id")
+    @field_validator("repo_id")
     @classmethod
-    def validate_symbol_id(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("symbol_id must not be empty or whitespace")
-        return v
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")
 
 
-class AnalyzeTargetSetRiskInput(BaseModel):
-    """Input for analyze_target_set_risk tool."""
+class AnalyzeRiskInput(BaseModel):
+    """Input for ``analyze_risk``."""
 
-    symbol_ids: list[str] = Field(..., min_length=1)
+    model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("symbol_ids")
+    symbols: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        validation_alias=AliasChoices("symbols", "symbol_ids"),
+    )
+    repo_id: str | None = None
+
+    @field_validator("symbols")
     @classmethod
-    def validate_symbol_ids(cls, v: list[str]) -> list[str]:
+    def validate_symbols(cls, v: list[str]) -> list[str]:
         if not v:
-            raise ValueError("symbol_ids must not be empty")
-        for i, sid in enumerate(v):
-            if not sid.strip():
-                raise ValueError(f"symbol_ids[{i}] must not be empty or whitespace")
-        return v
+            raise ValueError("symbols must not be empty")
+        normalized: list[str] = []
+        for idx, item in enumerate(v):
+            normalized.append(_require_non_empty(item, f"symbols[{idx}]"))
+        return normalized
+
+    @field_validator("repo_id")
+    @classmethod
+    def validate_repo_id(cls, v: str | None) -> str | None:
+        return _validate_optional_non_empty(v, "repo_id")

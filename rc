@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$DIR/.venv"
+
+if [ "$#" -eq 0 ]; then
+    cat <<'EOF'
+Usage: ./rc <command|path> [options]
+
+Commands:
+  ./rc path/to/repo [--cli]   Index a repository and start the interactive CLI (--cli is optional; --no-cli exits)
+  ./rc demo [--cli]           Index '.' (including tests) and start the interactive CLI (--cli is optional)
+  ./rc tests [pytest-args]    Execute the full test suite (ruff check + pytest)
+
+Forward any grouped subcommand directly: ./rc --help | ./rc db status | ./rc outline <file>
+EOF
+    exit 0
+fi
+
+find_python() {
+    for p in "${RC_PYTHON:-}" "$VENV/bin/python" \
+        "$(command -v python3 2>/dev/null || true)" \
+        "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" \
+        "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"; do
+        [ -n "$p" ] && [ -x "$p" ] && "$p" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null && {
+            printf '%s\n' "$p"
+            return 0
+        }
+    done
+    echo "Error: Python >= 3.11 is required." >&2
+    exit 1
+}
+
+ensure_env() {
+    if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
+        local host_py
+        host_py="$(find_python)"
+        echo "Bootstrapping .venv..." >&2
+        if command -v uv >/dev/null 2>&1; then
+            uv venv "$VENV" --python "$host_py" >&2 && uv pip install --python "$VENV/bin/python" -e "$DIR[dev]" >&2 || rm -rf "$VENV"
+        else
+            "$host_py" -m venv "$VENV" >&2 && "$VENV/bin/python" -m pip install -e "$DIR[dev]" >&2 || rm -rf "$VENV"
+        fi
+    fi
+    if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ -x "$VENV/bin/python" ]; then
+        PY="$VENV/bin/python"
+        RUFF="$(command -v "$VENV/bin/ruff" || command -v ruff || true)"
+    else
+        PY="$(find_python)"
+        export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+        RUFF="$(command -v "$(dirname "$PY")/ruff" || command -v ruff || true)"
+    fi
+}
+
+ensure_env
+
+if [ "$1" = "tests" ]; then
+    shift
+    cd "$DIR"
+    export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+    [ -n "$RUFF" ] && "$RUFF" check src/ tests/
+    exec "$PY" -m pytest -v ${@+"$@"}
+fi
+
+exec "$PY" -m repo_context.cli.main "$@"

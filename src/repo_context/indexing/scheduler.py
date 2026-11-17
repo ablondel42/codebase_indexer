@@ -1,58 +1,59 @@
-"""Event scheduler with debounce and batching.
+"""Event scheduler with debounce, sequence-aware collapsing, and serial worker execution."""
 
-Accepts normalized events, deduplicates by repo-relative path,
-batches events within a debounce window, and emits ready batches.
-"""
-
-import threading
 from collections import defaultdict
+import queue
+import threading
 from typing import Callable
 
 from repo_context.indexing.events import FileChangeEvent
+from repo_context.logging_config import get_logger
+
+logger = get_logger("indexing.scheduler")
 
 
 class EventScheduler:
-    """Sequential debounce and batching scheduler for file change events.
+    """Debouncing and batching scheduler with serialized worker execution.
 
-    Accepts normalized events, deduplicates by repo-relative path,
-    and emits ready batches after a configurable debounce window.
+    Collects per-path event sequences within a debounce window, collapses each
+    path's sequence into a single effective action, and dispatches batches one at
+    a time on a dedicated background worker thread so callbacks never run
+    concurrently against SQLite.
     """
 
     def __init__(
         self,
         debounce_ms: int = 500,
         on_batch_ready: Callable[[list[FileChangeEvent]], None] | None = None,
-    ):
+    ) -> None:
         """Initialize the scheduler.
 
         Args:
             debounce_ms: Debounce window in milliseconds (default 500ms).
-            on_batch_ready: Callback invoked when a batch is ready to process.
+            on_batch_ready: Callback invoked sequentially when a batch is ready.
         """
-        self._debounce_sec = debounce_ms / 1000.0
+        self._debounce_sec = max(0.0, debounce_ms / 1000.0)
         self._on_batch_ready = on_batch_ready or self._default_batch_handler
-        self._pending_events: dict[str, FileChangeEvent] = {}
+        self._pending_events: dict[str, list[FileChangeEvent]] = defaultdict(list)
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._running = True
+        self._stopped = False
+        self._batch_queue: queue.Queue[list[FileChangeEvent] | None] = queue.Queue()
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="repo-context-event-worker",
+            daemon=True,
+        )
+        self._worker_thread.start()
 
     def submit(self, event: FileChangeEvent) -> None:
-        """Submit a normalized file change event.
-
-        Events with the same repo_relative_path are deduplicated within
-        the current debounce window.
-
-        Args:
-            event: Normalized file change event.
-        """
+        """Submit a normalized file change event into the current debounce window."""
         with self._lock:
             if not self._running:
                 return
 
-            # Deduplicate: latest event for each path wins
-            self._pending_events[event.repo_relative_path] = event
+            self._pending_events[event.repo_relative_path].append(event)
 
-            # Reset debounce timer
             if self._timer is not None:
                 self._timer.cancel()
 
@@ -61,61 +62,84 @@ class EventScheduler:
             self._timer.start()
 
     def stop(self) -> None:
-        """Stop the scheduler and emit any pending batch."""
+        """Flush any pending events, stop the worker thread, and wait for completion."""
         with self._lock:
+            if self._stopped:
+                return
             self._running = False
+            self._stopped = True
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
 
-        # Emit final batch if any events pending
-        if self._pending_events:
-            self._emit_batch()
+            collapsed = self._drain_pending_locked()
+            if collapsed:
+                self._batch_queue.put(collapsed)
+            self._batch_queue.put(None)
+
+        if threading.current_thread() is not self._worker_thread:
+            self._worker_thread.join()
 
     def _emit_batch(self) -> None:
-        """Emit the current batch of events for processing."""
+        """Collapse pending events and enqueue them for sequential execution."""
         with self._lock:
-            if not self._pending_events:
+            if not self._running:
                 return
+            self._timer = None
+            collapsed = self._drain_pending_locked()
+            if collapsed:
+                self._batch_queue.put(collapsed)
 
-            events = list(self._pending_events.values())
-            self._pending_events.clear()
+    def _drain_pending_locked(self) -> list[FileChangeEvent]:
+        """Drain and collapse all pending per-path event sequences (caller holds ``_lock``)."""
+        if not self._pending_events:
+            return []
 
-        # Collapse events by path before emitting
-        collapsed = _collapse_events(events)
-        self._on_batch_ready(collapsed)
+        ordered_events: list[FileChangeEvent] = []
+        for path_events in self._pending_events.values():
+            ordered_events.extend(path_events)
+        self._pending_events.clear()
+        return _collapse_events(ordered_events)
+
+    def _worker_loop(self) -> None:
+        """Consume collapsed batches strictly one at a time."""
+        while True:
+            batch = self._batch_queue.get()
+            try:
+                if batch is None:
+                    return
+                self._on_batch_ready(batch)
+            except Exception:
+                logger.exception("Unhandled error in EventScheduler batch handler")
+            finally:
+                self._batch_queue.task_done()
 
     def _default_batch_handler(self, events: list[FileChangeEvent]) -> None:
         """Default batch handler (no-op if not overridden)."""
-        pass
+        return None
 
 
 def collapse_events(events: list[FileChangeEvent]) -> list[FileChangeEvent]:
-    """Collapse a list of events by repo-relative path.
+    """Collapse a list of events by repo-relative path using sequence semantics.
 
-    Applies deterministic final-state collapse rules:
-    - Repeated 'modified' events collapse to one 'modified'
-    - 'created' followed by 'modified' collapses to one effective create
-    - Latest 'deleted' wins over earlier create or modify events
-
-    Args:
-        events: List of normalized file change events.
-
-    Returns:
-        Collapsed list with at most one event per repo_relative_path.
+    Rules per path:
+    - ``[created, deleted]`` (no intermediate modification) collapses to ``None``
+    - ``[deleted, created]`` / ``[deleted, created, modified]`` collapses to ``'modified'``
+    - Final event is ``'deleted'`` collapses to ``'deleted'``
+    - ``[created, modified]`` (no prior delete) collapses to ``'created'``
+    - Otherwise collapses to the final non-deleted event.
     """
     return _collapse_events(events)
 
 
 def _collapse_events(events: list[FileChangeEvent]) -> list[FileChangeEvent]:
-    """Internal collapse implementation."""
-    # Group by repo_relative path
+    """Group events by ``repo_relative_path`` preserving insertion order and collapse each."""
     by_path: dict[str, list[FileChangeEvent]] = defaultdict(list)
     for event in events:
         by_path[event.repo_relative_path].append(event)
 
-    collapsed = []
-    for path, path_events in by_path.items():
+    collapsed: list[FileChangeEvent] = []
+    for path_events in by_path.values():
         final = _collapse_path_events(path_events)
         if final is not None:
             collapsed.append(final)
@@ -124,44 +148,41 @@ def _collapse_events(events: list[FileChangeEvent]) -> list[FileChangeEvent]:
 
 
 def _collapse_path_events(events: list[FileChangeEvent]) -> FileChangeEvent | None:
-    """Collapse events for a single path to one final effective action.
+    """Collapse a non-empty sequence of events for a single path."""
+    if not events:
+        return None
 
-    Rules:
-    - Latest 'deleted' wins over earlier create or modify
-    - 'created' + 'modified' = effective create (keep the create event)
-    - Repeated 'modified' = one 'modified'
-    """
-    has_delete = False
-    has_create = False
-    last_event = events[0]
+    types = [event.event_type for event in events]
+    first_type = types[0]
+    last_event = events[-1]
+    last_type = last_event.event_type
 
-    for event in events:
-        if event.event_type == "deleted":
-            has_delete = True
-            last_event = event
-        elif event.event_type == "created":
-            has_create = True
-            last_event = event
-        elif event.event_type == "modified":
-            last_event = event
+    # Ephemeral create-then-delete with no intermediate modification disappears cleanly.
+    if (
+        first_type == "created"
+        and last_type == "deleted"
+        and "modified" not in types
+        and all(t in ("created", "deleted") for t in types)
+    ):
+        return None
 
-    # If deleted, return delete event
-    if has_delete:
-        return FileChangeEvent(
-            event_type="deleted",
-            absolute_path=last_event.absolute_path,
-            repo_relative_path=last_event.repo_relative_path,
-            is_supported=last_event.is_supported,
-        )
+    if last_type == "deleted":
+        effective_type = "deleted"
+    elif "deleted" in types:
+        # e.g., [deleted, created] or [deleted, created, modified] -> file was replaced
+        effective_type = "modified"
+    elif first_type == "created":
+        # e.g., [created] or [created, modified] -> net creation within window
+        effective_type = "created"
+    else:
+        effective_type = last_type
 
-    # If created + modified, return create event (file exists)
-    if has_create:
-        return FileChangeEvent(
-            event_type="created",
-            absolute_path=last_event.absolute_path,
-            repo_relative_path=last_event.repo_relative_path,
-            is_supported=last_event.is_supported,
-        )
-
-    # Otherwise, return the last modified event
-    return last_event
+    return FileChangeEvent(
+        event_type=effective_type,
+        absolute_path=last_event.absolute_path,
+        repo_relative_path=last_event.repo_relative_path,
+        is_supported=last_event.is_supported,
+        old_absolute_path=last_event.old_absolute_path,
+        old_repo_relative_path=last_event.old_repo_relative_path,
+        repo_id=last_event.repo_id,
+    )

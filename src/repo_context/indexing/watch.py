@@ -1,129 +1,137 @@
 """Watch mode orchestration.
 
 Sets up watchdog observer, routes raw events through normalization
-and scheduler, and processes incremental updates.
+and scheduler, and processes incremental updates sequentially.
 """
 
+from pathlib import Path
+import sqlite3
 import sys
 import time
-from pathlib import Path
+from typing import Any, Callable
 
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+try:
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+except ImportError:  # pragma: no cover - allows importing/testing without watchdog installed
+    FileSystemEventHandler = object  # type: ignore[misc, assignment]
+    Observer = None  # type: ignore[misc, assignment]
 
 from repo_context.config import AppConfig, get_config
-from repo_context.storage import get_connection, close_connection, initialize_database
-from repo_context.logging_config import get_logger
-from repo_context.indexing.events import normalize_event, FileChangeEvent
-from repo_context.indexing.scheduler import EventScheduler
+from repo_context.indexing.events import FileChangeEvent, normalize_event
 from repo_context.indexing.incremental import process_event_batch
-import pathlib
+from repo_context.indexing.scheduler import EventScheduler
+from repo_context.logging_config import get_logger
+from repo_context.storage import close_connection, get_connection, initialize_database
 
 logger = get_logger("indexing.watch")
 
 
 class _RepoFileHandler(FileSystemEventHandler):
-    """Watchdog event handler that routes file events to the scheduler."""
+    """Watchdog event handler that routes normalized file events to the scheduler."""
 
     def __init__(
         self,
         repo_root: Path,
         config: AppConfig,
         scheduler: EventScheduler,
-    ):
-        """Initialize the handler.
-
-        Args:
-            repo_root: Absolute path to repository root.
-            config: Application configuration.
-            scheduler: Event scheduler for debounce and batching.
-        """
+    ) -> None:
         super().__init__()
         self._repo_root = repo_root
         self._config = config
         self._scheduler = scheduler
 
-    def on_created(self, event):
+    def on_created(self, event: Any) -> None:
         self._handle_event(event)
 
-    def on_modified(self, event):
+    def on_modified(self, event: Any) -> None:
         self._handle_event(event)
 
-    def on_deleted(self, event):
+    def on_deleted(self, event: Any) -> None:
         self._handle_event(event)
 
-    def on_moved(self, event):
+    def on_moved(self, event: Any) -> None:
         self._handle_event(event)
 
-    def _handle_event(self, event):
-        if event.is_directory:
+    def _handle_event(self, event: Any) -> None:
+        if getattr(event, "is_directory", False):
             return
 
-        normalized = normalize_event(event, self._repo_root, self._config)
-        if normalized is None:
-            return
+        normalized_events = normalize_event(event, self._repo_root, self._config)
+        for normalized in normalized_events:
+            self._scheduler.submit(normalized)
 
-        if not normalized.is_supported and normalized.event_type != "deleted":
-            return
 
-        self._scheduler.submit(normalized)
+def make_watch_connection_factory(db_path: Path | str) -> Callable[[], sqlite3.Connection]:
+    """Create a connection factory bound to ``db_path`` without re-initializing schema."""
+    resolved_db_path = Path(db_path)
+
+    def _open_connection() -> sqlite3.Connection:
+        return get_connection(resolved_db_path)
+
+    return _open_connection
 
 
 def watch_repo(
     repo_root: Path,
     config: AppConfig | None = None,
-    db_path: str | None = None,
+    db_path: Path | str | None = None,
     debounce_ms: int = 500,
     verbose: bool = False,
 ) -> None:
     """Watch a repository for file changes and perform incremental updates.
 
     Args:
-        repo_root: Absolute path to repository root.
+        repo_root: Path to repository root.
         config: Application configuration (uses default if None).
-        db_path: Optional path to database file.
+        db_path: Optional path to database file (overrides ``config.db_path``).
         debounce_ms: Debounce window in milliseconds.
         verbose: Enable verbose logging.
 
     Raises:
-        FileNotFoundError: If repo_root does not exist.
-        NotADirectoryError: If repo_root is not a directory.
+        FileNotFoundError: If ``repo_root`` does not exist.
+        NotADirectoryError: If ``repo_root`` is not a directory.
+        ImportError: If ``watchdog`` is not installed.
     """
-    repo_root = repo_root.resolve()
+    repo_root = Path(repo_root).resolve()
 
     if not repo_root.exists():
         raise FileNotFoundError(f"Repository root not found: {repo_root}")
     if not repo_root.is_dir():
         raise NotADirectoryError(f"Not a directory: {repo_root}")
+    if Observer is None:
+        raise ImportError("The 'watchdog' package is required for watch mode.")
 
     cfg = config or get_config()
+    resolved_db_path = Path(db_path or cfg.db_path)
 
-    logger.info("Starting watch mode", extra={
-        "repo_root": str(repo_root),
-        "db_path": db_path or str(cfg.db_path),
-        "debounce_ms": debounce_ms,
-    })
+    logger.info(
+        "Starting watch mode",
+        extra={
+            "repo_root": str(repo_root),
+            "db_path": str(resolved_db_path),
+            "debounce_ms": debounce_ms,
+        },
+    )
 
-    # Initialize database
-    conn = get_connection(pathlib.Path(db_path or cfg.db_path))
+    # Initialize database once at startup (never on every batch).
+    init_conn = get_connection(resolved_db_path)
     try:
-        initialize_database(conn)
+        initialize_database(init_conn)
     finally:
-        close_connection(conn)
+        close_connection(init_conn)
 
-    # Create batch handler
+    bound_conn_factory = make_watch_connection_factory(resolved_db_path)
+
     def on_batch_ready(events: list[FileChangeEvent]) -> None:
-        _process_watch_batch(conn_factory, repo_root, events, cfg, verbose)
+        _process_watch_batch(bound_conn_factory, repo_root, events, cfg, verbose)
 
     scheduler = EventScheduler(
         debounce_ms=debounce_ms,
         on_batch_ready=on_batch_ready,
     )
 
-    # Create watchdog handler
     handler = _RepoFileHandler(repo_root, cfg, scheduler)
-
-    # Set up observer
     observer = Observer()
     observer.schedule(handler, str(repo_root), recursive=True)
     observer.start()
@@ -143,30 +151,14 @@ def watch_repo(
         logger.info("Watch mode stopped")
 
 
-def conn_factory(db_path: str | None = None):
-    """Create a database connection for batch processing."""
-    config = get_config()
-    conn = get_connection(pathlib.Path(db_path or config.db_path))
-    initialize_database(conn)
-    return conn
-
-
 def _process_watch_batch(
-    conn_factory_func,
+    conn_factory_func: Callable[[], sqlite3.Connection],
     repo_root: Path,
     events: list[FileChangeEvent],
     config: AppConfig,
     verbose: bool,
 ) -> None:
-    """Process a batch of file change events.
-
-    Args:
-        conn_factory_func: Function that returns a database connection.
-        repo_root: Absolute path to repository root.
-        events: List of collapsed FileChangeEvent objects.
-        config: Application configuration.
-        verbose: Enable verbose logging.
-    """
+    """Process one collapsed batch of file change events."""
     conn = conn_factory_func()
     try:
         results = process_event_batch(conn, repo_root, events, config)
@@ -179,29 +171,42 @@ def _process_watch_batch(
                 node_count = result.get("node_count", 0)
                 edge_count = result.get("edge_count", 0)
                 invalidated = result.get("invalidated_reference_edge_count", 0)
-                msg = f"✓ Reindexed: {file_path} ({node_count} nodes, {edge_count} edges, {invalidated} refs invalidated)"
+                msg = (
+                    f"✓ Reindexed: {file_path} "
+                    f"({node_count} nodes, {edge_count} edges, {invalidated} refs invalidated)"
+                )
                 print(msg, file=sys.stderr)
                 if verbose:
-                    logger.info("File reindexed", extra={
-                        "file_path": file_path,
-                        "node_count": node_count,
-                        "edge_count": edge_count,
-                        "invalidated_refs": invalidated,
-                    })
+                    logger.info(
+                        "File reindexed",
+                        extra={
+                            "file_path": file_path,
+                            "node_count": node_count,
+                            "edge_count": edge_count,
+                            "invalidated_refs": invalidated,
+                        },
+                    )
 
             elif status == "deleted":
                 deleted_nodes = result.get("deleted_node_count", 0)
                 deleted_edges = result.get("deleted_edge_count", 0)
                 invalidated_symbols = result.get("invalidated_target_symbol_count", 0)
-                msg = f"✗ Deleted: {file_path} ({deleted_nodes} nodes, {deleted_edges} edges removed, {invalidated_symbols} symbols invalidated)"
+                msg = (
+                    f"✗ Deleted: {file_path} "
+                    f"({deleted_nodes} nodes, {deleted_edges} edges removed, "
+                    f"{invalidated_symbols} symbols invalidated)"
+                )
                 print(msg, file=sys.stderr)
                 if verbose:
-                    logger.info("File deleted", extra={
-                        "file_path": file_path,
-                        "deleted_nodes": deleted_nodes,
-                        "deleted_edges": deleted_edges,
-                        "invalidated_symbols": invalidated_symbols,
-                    })
+                    logger.info(
+                        "File deleted",
+                        extra={
+                            "file_path": file_path,
+                            "deleted_nodes": deleted_nodes,
+                            "deleted_edges": deleted_edges,
+                            "invalidated_symbols": invalidated_symbols,
+                        },
+                    )
 
             elif status == "parse_failed":
                 msg = f"⚠ Parse failed: {file_path} (previous graph preserved)"

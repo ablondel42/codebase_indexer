@@ -1,154 +1,202 @@
-"""Tests for path manipulation utilities."""
+"""Tests for path manipulation, ID derivation, and repository security utilities."""
 
-import tempfile
 from pathlib import Path
+import re
 
 import pytest
 
+from repo_context.exceptions import PathSecurityError
 from repo_context.parsing.pathing import (
-    normalize_repo_root,
-    to_relative_path,
-    to_file_uri,
+    derive_file_id,
     derive_module_path,
+    derive_repo_id,
+    ensure_safe_repo_file,
+    normalize_repo_root,
+    to_file_uri,
+    to_relative_path,
 )
 
 
 class TestNormalizeRepoRoot:
-    """Tests for normalize_repo_root function."""
+    """Tests for ``normalize_repo_root``."""
 
-    def test_valid_directory(self, tmp_path: Path) -> None:
-        """Test with valid directory path."""
+    def test_valid_directory_and_string(self, tmp_path: Path) -> None:
         result = normalize_repo_root(tmp_path)
         assert result.is_absolute()
         assert result == tmp_path.resolve()
+        assert normalize_repo_root(str(tmp_path)) == tmp_path.resolve()
 
-    def test_string_path(self, tmp_path: Path) -> None:
-        """Test with string path."""
-        result = normalize_repo_root(str(tmp_path))
-        assert result.is_absolute()
-
-    def test_nonexistent_path(self, tmp_path: Path) -> None:
-        """Test with nonexistent path raises FileNotFoundError."""
-        nonexistent = tmp_path / "nonexistent"
+    def test_nonexistent_and_file_raise(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
-            normalize_repo_root(nonexistent)
+            normalize_repo_root(tmp_path / "missing")
 
-    def test_file_instead_of_directory(self, tmp_path: Path) -> None:
-        """Test with file path raises NotADirectoryError."""
-        test_file = tmp_path / "file.txt"
-        test_file.write_text("content")
+        file_path = tmp_path / "file.txt"
+        file_path.write_text("content", encoding="utf-8")
         with pytest.raises(NotADirectoryError):
-            normalize_repo_root(test_file)
+            normalize_repo_root(file_path)
 
 
-class TestToRelativePath:
-    """Tests for to_relative_path function."""
+class TestIdDerivation:
+    """Tests for collision-resistant repo and file ID derivation."""
 
-    def test_basic_relative_path(self, tmp_path: Path) -> None:
-        """Test basic relative path conversion."""
-        subdir = tmp_path / "subdir"
-        subdir.mkdir()
-        file = subdir / "file.py"
-        file.write_text("content")
-        
-        result = to_relative_path(tmp_path, file)
-        assert result == "subdir/file.py"
+    def test_derive_repo_id_format_and_uniqueness(self, tmp_path: Path) -> None:
+        repo_a = tmp_path / "a" / "service"
+        repo_b = tmp_path / "b" / "service"
+        repo_a.mkdir(parents=True)
+        repo_b.mkdir(parents=True)
 
-    def test_nested_path(self, tmp_path: Path) -> None:
-        """Test with nested directory structure."""
-        nested = tmp_path / "a" / "b" / "c"
+        id_a = derive_repo_id(repo_a)
+        id_b = derive_repo_id(repo_b)
+
+        assert re.fullmatch(r"repo:service:[0-9a-f]{8}", id_a)
+        assert re.fullmatch(r"repo:service:[0-9a-f]{8}", id_b)
+        assert id_a != id_b
+        assert id_a == derive_repo_id(repo_a)
+
+    def test_derive_file_id_format(self, tmp_path: Path) -> None:
+        repo_id = derive_repo_id(tmp_path)
+        file_id = derive_file_id(repo_id, "pkg/mod.py")
+        assert file_id == f"file:{repo_id}:pkg/mod.py"
+
+
+class TestRelativePathAndUri:
+    """Tests for ``to_relative_path`` and ``to_file_uri``."""
+
+    def test_to_relative_path_posix(self, tmp_path: Path) -> None:
+        nested = tmp_path / "a" / "b"
         nested.mkdir(parents=True)
-        file = nested / "file.py"
-        file.write_text("content")
-        
-        result = to_relative_path(tmp_path, file)
-        assert result == "a/b/c/file.py"
+        target = nested / "file.py"
+        target.write_text("", encoding="utf-8")
 
-    def test_posix_style(self, tmp_path: Path) -> None:
-        """Test that result uses POSIX-style separators."""
-        subdir = tmp_path / "subdir"
-        subdir.mkdir()
-        file = subdir / "file.py"
-        file.write_text("content")
-        
-        result = to_relative_path(tmp_path, file)
-        assert "\\" not in result
+        rel = to_relative_path(tmp_path, target)
+        assert rel == "a/b/file.py"
+        assert "\\" not in rel
 
-
-class TestToFileUri:
-    """Tests for to_file_uri function."""
-
-    def test_basic_uri(self, tmp_path: Path) -> None:
-        """Test basic URI generation."""
-        file = tmp_path / "file.py"
-        file.write_text("content")
-        
-        result = to_file_uri(file)
-        assert result.startswith("file://")
-
-    def test_uri_contains_path(self, tmp_path: Path) -> None:
-        """Test that URI contains the file path."""
-        file = tmp_path / "test.py"
-        file.write_text("content")
-        
-        result = to_file_uri(file)
-        assert "test.py" in result
+    def test_to_file_uri(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.py"
+        target.write_text("", encoding="utf-8")
+        uri = to_file_uri(target)
+        assert uri.startswith("file://")
+        assert "test.py" in uri
 
 
 class TestDeriveModulePath:
-    """Tests for derive_module_path function."""
+    """Tests for ``derive_module_path``."""
 
-    def test_regular_module(self, tmp_path: Path) -> None:
-        """Test regular Python module."""
-        # app/services/auth.py -> app.services.auth
-        app_dir = tmp_path / "app"
-        services_dir = app_dir / "services"
-        services_dir.mkdir(parents=True)
-        auth_file = services_dir / "auth.py"
-        auth_file.write_text("content")
-        
-        result = derive_module_path(tmp_path, auth_file)
-        assert result == "app.services.auth"
+    def test_regular_and_nested_packages(self, tmp_path: Path) -> None:
+        repo = tmp_path / "my_pkg"
+        (repo / "app" / "services").mkdir(parents=True)
+        auth = repo / "app" / "services" / "auth.py"
+        auth.write_text("", encoding="utf-8")
+        init_file = repo / "app" / "__init__.py"
+        init_file.write_text("", encoding="utf-8")
+        main_file = repo / "main.py"
+        main_file.write_text("", encoding="utf-8")
+        root_init = repo / "__init__.py"
+        root_init.write_text("", encoding="utf-8")
 
-    def test_init_file(self, tmp_path: Path) -> None:
-        """Test __init__.py file."""
-        # app/__init__.py -> app
-        app_dir = tmp_path / "app"
-        app_dir.mkdir()
-        init_file = app_dir / "__init__.py"
-        init_file.write_text("content")
-        
-        result = derive_module_path(tmp_path, init_file)
-        assert result == "app"
+        assert derive_module_path(repo, auth) == "app.services.auth"
+        assert derive_module_path(repo, init_file) == "app"
+        assert derive_module_path(repo, main_file) == "main"
+        assert derive_module_path(repo, root_init) == "my_pkg"
 
-    def test_nested_init_file(self, tmp_path: Path) -> None:
-        """Test nested __init__.py file."""
-        # pkg/subpkg/__init__.py -> pkg.subpkg
-        pkg_dir = tmp_path / "pkg"
-        subpkg_dir = pkg_dir / "subpkg"
-        subpkg_dir.mkdir(parents=True)
-        init_file = subpkg_dir / "__init__.py"
-        init_file.write_text("content")
-        
-        result = derive_module_path(tmp_path, init_file)
-        assert result == "pkg.subpkg"
 
-    def test_top_level_module(self, tmp_path: Path) -> None:
-        """Test top-level module."""
-        # main.py -> main
-        main_file = tmp_path / "main.py"
-        main_file.write_text("content")
-        
-        result = derive_module_path(tmp_path, main_file)
-        assert result == "main"
+class TestEnsureSafeRepoFile:
+    """Security boundary tests for ``ensure_safe_repo_file``."""
 
-    def test_private_module(self, tmp_path: Path) -> None:
-        """Test private module with underscore prefix."""
-        # tools/_internal.py -> tools._internal
-        tools_dir = tmp_path / "tools"
-        tools_dir.mkdir()
-        internal_file = tools_dir / "_internal.py"
-        internal_file.write_text("content")
-        
-        result = derive_module_path(tmp_path, internal_file)
-        assert result == "tools._internal"
+    def test_accepts_regular_in_repo_file(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / "pkg").mkdir(parents=True)
+        target = repo / "pkg" / "mod.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+
+        assert ensure_safe_repo_file(repo, "pkg/mod.py") == target.resolve()
+        assert ensure_safe_repo_file(repo, target) == target.resolve()
+
+    def test_rejects_symlink_pointing_outside_repo_root(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "secret.py"
+        outside.write_text("SECRET = 1\n", encoding="utf-8")
+        link = repo / "escape.py"
+        link.symlink_to(outside)
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, link)
+
+    def test_rejects_symlink_pointing_inside_repo(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        real_file = repo / "real.py"
+        real_file.write_text("X = 1\n", encoding="utf-8")
+        link = repo / "alias.py"
+        link.symlink_to(real_file)
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, "alias.py")
+
+    def test_rejects_intermediate_symlink_directory(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside_dir = tmp_path / "outside_dir"
+        outside_dir.mkdir()
+        (outside_dir / "mod.py").write_text("X = 1\n", encoding="utf-8")
+        (repo / "linked_pkg").symlink_to(outside_dir)
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, repo / "linked_pkg" / "mod.py")
+
+    def test_rejects_broken_symlink(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        broken = repo / "broken.py"
+        broken.symlink_to(tmp_path / "does_not_exist.py")
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, broken)
+
+    def test_rejects_traversal_missing_and_directory(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / "subdir").mkdir(parents=True)
+        outside = tmp_path / "outside.py"
+        outside.write_text("X = 1\n", encoding="utf-8")
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, "../outside.py")
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, "missing.py")
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(repo, "subdir")
+
+    def test_rejects_mixed_resolved_root_and_unresolved_ancestor_internal_symlink(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        real_parent = tmp_path / "real_parent"
+        repo = real_parent / "repo"
+        (repo / "real_sub").mkdir(parents=True)
+        real_file = repo / "real_sub" / "secret.py"
+        real_file.write_text("X = 1\n", encoding="utf-8")
+        (repo / "link_sub").symlink_to(repo / "real_sub")
+
+        alias_parent = tmp_path / "alias_parent"
+        alias_parent.symlink_to(real_parent)
+
+        resolved_root = repo.resolve()
+        alias_root = alias_parent / "repo"
+
+        assert (
+            ensure_safe_repo_file(resolved_root, alias_root / "real_sub" / "secret.py")
+            == real_file.resolve()
+        )
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(resolved_root, alias_root / "link_sub" / "secret.py")
+
+        with pytest.raises(PathSecurityError):
+            ensure_safe_repo_file(
+                resolved_root,
+                alias_root / "real_sub" / ".." / "link_sub" / "secret.py",
+            )

@@ -1,11 +1,10 @@
 """Edge model."""
 
-import json
-from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from repo_context.models.common import normalize_json_field, validate_iso_timestamp
 
 
 class Edge(BaseModel):
@@ -14,7 +13,7 @@ class Edge(BaseModel):
     Attributes:
         id: Unique edge identifier.
         repo_id: ID of the repository this edge belongs to.
-        kind: Edge type ("contains", "imports", "inherits", "SCOPE_PARENT", "references").
+        kind: Edge type ("contains", "imports", "inherits", "scope_parent", "calls", "references").
         from_id: ID of the source symbol.
         to_id: ID of the target symbol.
         source: Data source (e.g., "python-ast", "lsp").
@@ -28,9 +27,9 @@ class Edge(BaseModel):
 
     model_config = {"frozen": True}
 
-    id: str = Field(..., min_length=1)  # Allow any non-empty ID for tests, production should use edge:...
-    repo_id: str = Field(..., min_length=1)  # Allow any non-empty ID for tests
-    kind: Literal["contains", "imports", "inherits", "SCOPE_PARENT", "references"]
+    id: str = Field(..., min_length=1)
+    repo_id: str = Field(..., min_length=1)
+    kind: Literal["contains", "imports", "inherits", "scope_parent", "calls", "references"]
     from_id: str = Field(..., min_length=1)
     to_id: str = Field(..., min_length=1)
     source: str = Field(default="python-ast")
@@ -44,21 +43,11 @@ class Edge(BaseModel):
     @field_validator("payload_json", "evidence_range_json", mode="before")
     @classmethod
     def normalize_json_fields(cls, v: Any) -> str | None:
-        """Normalize JSON fields - accept dict or string, always return string."""
-        if v is None:
-            return None
-        if isinstance(v, str):
-            return v
-        return json.dumps(v, sort_keys=True)
+        """Normalize JSON fields - accept dict/model or valid JSON string."""
+        return normalize_json_field(v)
 
     @field_validator("last_indexed_at")
     @classmethod
     def validate_timestamp(cls, v: str | None) -> str | None:
         """Validate timestamp is ISO 8601 format."""
-        if v is None:
-            return None
-        try:
-            datetime.fromisoformat(v)
-        except ValueError:
-            raise ValueError("Timestamp must be ISO 8601 format")
-        return v
+        return validate_iso_timestamp(v)

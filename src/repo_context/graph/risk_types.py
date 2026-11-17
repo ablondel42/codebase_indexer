@@ -18,12 +18,18 @@ class RiskTarget:
         qualified_name: Fully qualified name (e.g., "my_module.my_func").
         kind: Symbol kind (function, class, method, etc.).
         scope: Lexical scope (module, class, or function).
-        file_id: File ID (e.g., "file:src/my_module.py").
+        file_id: File ID (e.g., "file:repo:src/my_module.py").
         file_path: Repo-relative file path.
         module_path: Python module path (e.g., "src.my_module").
-        visibility_hint: Visibility hint (public, private, etc.).
+        visibility_hint: Visibility hint (public, private_like, local, etc.).
         lexical_parent_id: Parent symbol ID for nested declarations.
+        is_test: True if the symbol lives in a test file.
+        start_line: 1-based inclusive start line.
+        end_line: 1-based inclusive end line.
+        signature: Compact symbol signature.
+        repo_id: Owning repository ID.
     """
+
     symbol_id: str
     qualified_name: str
     kind: str
@@ -33,6 +39,11 @@ class RiskTarget:
     module_path: str
     visibility_hint: str | None = None
     lexical_parent_id: str | None = None
+    is_test: bool = False
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str | None = None
+    repo_id: str | None = None
 
 
 @dataclass
@@ -44,7 +55,7 @@ class RiskFacts:
         symbol_ids: List of all target symbol IDs.
         symbol_kinds: Set of distinct symbol kinds.
         reference_counts: Dict mapping symbol_id to reference count.
-        reference_availability: Dict mapping symbol_id to availability bool.
+        reference_availability: Dict mapping symbol_id to LSP availability bool.
         referencing_file_counts: Dict mapping symbol_id to referencing file count.
         referencing_module_counts: Dict mapping symbol_id to referencing module count.
         touches_public_surface: True if any target is public-like.
@@ -56,9 +67,10 @@ class RiskFacts:
         inheritance_involved: True if any target has inheritance.
         stale_symbols: List of stale symbol IDs.
         low_confidence_symbols: List of low-confidence symbol IDs.
-        low_confidence_edges: List of low-confidence edge IDs.
-        extra: Additional deterministic facts (e.g., availability metadata).
+        low_confidence_edges: Capped list of low-confidence edge IDs.
+        extra: Additional deterministic facts (e.g., availability/edge counts).
     """
+
     target_count: int = 0
     symbol_ids: list[str] = field(default_factory=list)
     symbol_kinds: set[str] = field(default_factory=set)
@@ -90,6 +102,7 @@ class RiskResult:
         risk_score: Numeric risk score (0-100).
         decision: Recommended decision (safe_enough, review_required, high_risk).
     """
+
     targets: list[RiskTarget] = field(default_factory=list)
     facts: RiskFacts = field(default_factory=RiskFacts)
     issues: list[str] = field(default_factory=list)

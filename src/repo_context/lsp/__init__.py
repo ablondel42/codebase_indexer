@@ -1,5 +1,5 @@
-"""LSP client for reference enrichment."""
+"""LSP client and session pool for reference enrichment."""
 
-from repo_context.lsp.client import PyrightLspClient
+from repo_context.lsp.client import LspSessionPool, PyrightLspClient
 
-__all__ = ["PyrightLspClient"]
+__all__ = ["PyrightLspClient", "LspSessionPool"]

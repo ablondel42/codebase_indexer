@@ -2,8 +2,39 @@
 
 import ast
 import json
+from collections.abc import Sequence
 
+from repo_context.constants import EDGE_KIND_INHERITS
 from repo_context.models.file import FileRecord
+from repo_context.parsing.naming import build_nested_qualified_name, safe_unparse
+from repo_context.parsing.ranges import make_declaration_lines, make_range
+
+
+def _collect_class_asts(
+    tree: ast.Module,
+    module_path: str,
+) -> tuple[dict[tuple[str, int], ast.ClassDef], dict[str, ast.ClassDef]]:
+    """Walk AST recursively and index all ``ast.ClassDef`` nodes by qualified name and line."""
+    by_qname_line: dict[tuple[str, int], ast.ClassDef] = {}
+    by_qname: dict[str, ast.ClassDef] = {}
+
+    def _walk(stmts: Sequence[ast.stmt], chain: list[str]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.ClassDef):
+                qname = build_nested_qualified_name(module_path, chain, stmt.name)
+                start_line, _ = make_declaration_lines(stmt)
+                by_qname_line[(qname, start_line)] = stmt
+                by_qname.setdefault(qname, stmt)
+                chain.append(stmt.name)
+                _walk(stmt.body, chain)
+                chain.pop()
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                chain.append(stmt.name)
+                _walk(stmt.body, chain)
+                chain.pop()
+
+    _walk(tree.body, [])
+    return by_qname_line, by_qname
 
 
 def extract_inheritance_edges(
@@ -11,102 +42,84 @@ def extract_inheritance_edges(
     file_record: FileRecord,
     class_nodes: list[dict],
     tree: ast.Module,
+    *,
+    lines: Sequence[str] | None = None,
 ) -> list[dict]:
-    """Extract inheritance edges for class definitions.
-    
+    """Extract inheritance edges for all classes (top-level, nested, and local).
+
+    Matches AST ``ClassDef`` nodes by ``(qualified_name, start_line)`` so nested
+    and same-named local classes never overwrite each other.
+
     Args:
         repo_id: Repository ID.
-        file_record: File record from Phase 2.
+        file_record: File record for the source module.
         class_nodes: List of extracted class node dicts.
         tree: Parsed AST module.
-        
+        lines: Optional pre-split source lines for exact base ranges.
+
     Returns:
-        List of inheritance edge dictionaries.
+        List of ``inherits`` edge dictionaries.
     """
-    edges = []
-    
-    # Build a map of class node ID to class AST node for lookup
-    class_ast_map = {}
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            class_ast_map[node.name] = node
-    
-    # Process each class node
+    edges: list[dict] = []
+    by_qname_line, by_qname = _collect_class_asts(tree, file_record.module_path)
+
     for class_node in class_nodes:
-        class_name = class_node["name"]
+        if class_node.get("kind") != "class":
+            continue
+
         class_node_id = class_node["id"]
-        
-        # Find the corresponding AST node
-        ast_node = class_ast_map.get(class_name)
+        qname = class_node["qualified_name"]
+        start_line = class_node.get("start_line")
+
+        ast_node = (
+            by_qname_line.get((qname, int(start_line)))
+            if start_line is not None
+            else None
+        )
+        if ast_node is None:
+            ast_node = by_qname.get(qname)
         if ast_node is None:
             continue
-        
-        # Create an inherits edge for each base
+
+        seen_bases: dict[str, int] = {}
         for base in ast_node.bases:
-            try:
-                base_name = ast.unparse(base)
-            except Exception:
-                base_name = "<unparsable>"
-            
+            base_name = safe_unparse(base)
             to_id = f"unresolved_base:{base_name}"
-            edge_id = _make_inherits_edge_id(repo_id, class_node_id, base_name)
-            
-            edges.append({
-                "id": edge_id,
-                "repo_id": repo_id,
-                "kind": "inherits",
-                "from_id": class_node_id,
-                "to_id": to_id,
-                "source": "python-ast",
-                "confidence": 0.75,
-                "evidence_file_id": file_record.id,
-                "evidence_uri": file_record.uri,
-                "evidence_range_json": json.dumps(_make_range_from_node(base), sort_keys=True) if _make_range_from_node(base) else None,
-                "payload_json": json.dumps({
-                    "base_name": base_name
-                }, sort_keys=True),
-                "last_indexed_at": file_record.last_indexed_at,
-            })
-    
+            dup_count = seen_bases.get(base_name, 0)
+            seen_bases[base_name] = dup_count + 1
+            edge_id = _make_inherits_edge_id(repo_id, class_node_id, base_name, dup_count)
+            base_range = make_range(base, lines=lines)
+
+            edges.append(
+                {
+                    "id": edge_id,
+                    "repo_id": repo_id,
+                    "kind": EDGE_KIND_INHERITS,
+                    "from_id": class_node_id,
+                    "to_id": to_id,
+                    "source": "python-ast",
+                    "confidence": 0.75,
+                    "evidence_file_id": file_record.id,
+                    "evidence_uri": file_record.uri,
+                    "evidence_range_json": json.dumps(base_range, sort_keys=True)
+                    if base_range
+                    else None,
+                    "payload_json": json.dumps({"base_name": base_name}, sort_keys=True),
+                    "last_indexed_at": file_record.last_indexed_at,
+                }
+            )
+
     return edges
 
 
-def _make_inherits_edge_id(repo_id: str, class_node_id: str, base_name: str) -> str:
-    """Create a deterministic edge ID for an inheritance edge.
-    
-    Args:
-        repo_id: Repository ID.
-        class_node_id: Class node ID.
-        base_name: Base class name.
-        
-    Returns:
-        Deterministic edge ID.
-    """
-    return f"edge:{repo_id}:inherits:{class_node_id}->unresolved_base:{base_name}"
-
-
-def _make_range_from_node(node: ast.AST) -> dict | None:
-    """Create a range dict from an AST node.
-    
-    Args:
-        node: AST node.
-        
-    Returns:
-        Range dict or None if metadata missing.
-    """
-    lineno = getattr(node, "lineno", None)
-    col_offset = getattr(node, "col_offset", None)
-    end_lineno = getattr(node, "end_lineno", None)
-    end_col_offset = getattr(node, "end_col_offset", None)
-    
-    if lineno is None or col_offset is None:
-        return None
-    
-    # Convert to zero-based
-    start_line = lineno - 1 if lineno else None
-    end_line = end_lineno - 1 if end_lineno else None
-    
-    return {
-        "start": {"line": start_line, "character": col_offset},
-        "end": {"line": end_line, "character": end_col_offset}
-    }
+def _make_inherits_edge_id(
+    repo_id: str,
+    class_node_id: str,
+    base_name: str,
+    dup_count: int = 0,
+) -> str:
+    """Create a deterministic edge ID for an inheritance edge."""
+    base = f"edge:{repo_id}:{EDGE_KIND_INHERITS}:{class_node_id}->unresolved_base:{base_name}"
+    if dup_count > 0:
+        return f"{base}:dup{dup_count}"
+    return base

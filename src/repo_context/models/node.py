@@ -1,22 +1,21 @@
 """Symbol node model."""
 
-import json
-from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from repo_context.models.common import normalize_json_field, validate_iso_timestamp
 
 
 class SymbolNode(BaseModel):
-    """Represents a symbol node in the graph (module, class, function, method).
+    """Represents a symbol node in the graph.
 
     Attributes:
         id: Unique symbol identifier (e.g., "sym:repo:module:path").
         repo_id: ID of the repository this symbol belongs to.
         file_id: ID of the file containing this symbol.
         language: Programming language (e.g., "python").
-        kind: Symbol type (module, class, function, async_function, method, async_method, local_function, local_async_function).
+        kind: Symbol type.
         name: Simple symbol name (e.g., "AuthService").
         qualified_name: Full dotted path (e.g., "auth.service.AuthService").
         uri: File URI where the symbol is defined.
@@ -27,8 +26,11 @@ class SymbolNode(BaseModel):
         payload_json: JSON string with type-specific metadata.
         range_json: JSON string with full declaration range (zero-based).
         selection_range_json: JSON string with name-focused range (zero-based).
+        start_line: 1-based inclusive start line of the symbol declaration.
+        end_line: 1-based inclusive end line of the symbol declaration.
+        signature: Compact declaration signature string.
         parent_id: ID of the containing symbol (None for modules).
-        visibility_hint: Visibility indicator ("public" or "private_like").
+        visibility_hint: Visibility indicator ("public", "private_like", "local", etc.).
         doc_summary: Short docstring summary extracted from source.
         scope: Where the symbol lives ("module", "class", or "function").
         lexical_parent_id: ID of the enclosing scope for nested declarations.
@@ -50,8 +52,11 @@ class SymbolNode(BaseModel):
         "async_method",
         "local_function",
         "local_async_function",
+        "constant",
+        "attribute",
+        "type_alias",
     ]
-    name: str = Field(..., min_length=1, max_length=256)
+    name: str = Field(..., min_length=1, max_length=1024)
     qualified_name: str = Field(..., min_length=1)
     uri: str = Field(..., pattern=r"^file://")
     content_hash: str = Field(default="")
@@ -61,6 +66,9 @@ class SymbolNode(BaseModel):
     payload_json: str = Field(default="{}")
     range_json: str | None = None
     selection_range_json: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str | None = None
     parent_id: str | None = None
     visibility_hint: str | None = None
     doc_summary: str | None = None
@@ -71,22 +79,11 @@ class SymbolNode(BaseModel):
     @field_validator("payload_json", "range_json", "selection_range_json", mode="before")
     @classmethod
     def normalize_json_fields(cls, v: Any) -> str | None:
-        """Normalize JSON fields - accept dict or string, always return string."""
-        if v is None:
-            return None
-        if isinstance(v, str):
-            return v
-        # Convert dict/list to JSON string
-        return json.dumps(v, sort_keys=True)
+        """Normalize JSON fields - accept dict/model or valid JSON string."""
+        return normalize_json_field(v)
 
     @field_validator("last_indexed_at")
     @classmethod
     def validate_timestamp(cls, v: str | None) -> str | None:
         """Validate timestamp is ISO 8601 format."""
-        if v is None:
-            return None
-        try:
-            datetime.fromisoformat(v)
-        except ValueError:
-            raise ValueError("Timestamp must be ISO 8601 format")
-        return v
+        return validate_iso_timestamp(v)

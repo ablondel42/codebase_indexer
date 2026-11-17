@@ -1,145 +1,68 @@
-"""Tests for context summary builders."""
+"""Tests for context summary and confidence builders (v0.2.0)."""
 
-from repo_context.models import SymbolContext
+from repo_context.context.helpers import PLACEHOLDER_PREFIXES
 from repo_context.context.summaries import (
-    build_structural_summary,
-    build_confidence,
     _is_local_declaration,
+    _is_nested_declaration,
+    build_confidence,
+    build_structural_summary,
 )
+from repo_context.models import SymbolContext
 
 
-def test_build_structural_summary_basic() -> None:
-    """Test building structural summary with basic context."""
+def test_build_structural_summary_counts_and_truncation() -> None:
+    """build_structural_summary exposes exact totals, truncation flag, and relationship counts."""
     context = SymbolContext(
-        focus_symbol={"id": "sym1", "kind": "function", "scope": "module"},
-        structural_parent={"id": "parent1"},
-        structural_children=[{"id": "child1"}, {"id": "child2"}],
-        lexical_parent=None,
-        lexical_children=[],
-        incoming_edges=[{"id": "edge1"}],
-        outgoing_edges=[{"id": "edge2"}, {"id": "edge3"}],
+        focus_symbol={"id": "sym1", "kind": "class", "scope": "module"},
+        structural_parent={"id": "mod1"},
+        structural_children=[{"id": "m1"}, {"id": "m2"}],
+        incoming_edges=[{"id": "e1"}],
+        outgoing_edges=[{"id": "e2"}],
         file_siblings=[{"id": "sib1"}],
     )
-    
-    summary = build_structural_summary(context)
-    
+    summary = build_structural_summary(
+        context,
+        total_structural_child_count=5,
+        total_incoming_count=10,
+        relationship_counts={"callers": 4},
+    )
     assert summary["has_structural_parent"] is True
-    assert summary["structural_child_count"] == 2
-    assert summary["has_lexical_parent"] is False
-    assert summary["lexical_child_count"] == 0
-    assert summary["incoming_edge_count"] == 1
-    assert summary["outgoing_edge_count"] == 2
+    assert summary["structural_child_count"] == 5
+    assert summary["structural_children_truncated"] is True
+    assert summary["incoming_edge_count"] == 10
+    assert summary["outgoing_edge_count"] == 1
     assert summary["same_file_sibling_count"] == 1
-    assert summary["scope"] == "module"
     assert summary["is_local_declaration"] is False
     assert summary["is_nested_declaration"] is False
+    assert summary["relationship_counts"] == {"callers": 4}
 
 
-def test_build_structural_summary_local_function() -> None:
-    """Test structural summary for local function."""
-    context = SymbolContext(
-        focus_symbol={"id": "sym1", "kind": "local_function", "scope": "function", "lexical_parent_id": "parent1"},
-        structural_parent=None,
-        structural_children=[],
-        lexical_parent={"id": "parent1"},
-        lexical_children=[],
-        incoming_edges=[],
-        outgoing_edges=[],
-        file_siblings=[],
-    )
-    
-    summary = build_structural_summary(context)
-    
-    assert summary["is_local_declaration"] is True
-    assert summary["is_nested_declaration"] is True
-    assert summary["scope"] == "function"
-
-
-def test_build_structural_summary_local_class() -> None:
-    """Test structural summary for local class."""
-    context = SymbolContext(
-        focus_symbol={"id": "sym1", "kind": "class", "scope": "function", "lexical_parent_id": "parent1"},
-        structural_parent=None,
-        structural_children=[],
-        lexical_parent={"id": "parent1"},
-        lexical_children=[],
-        incoming_edges=[],
-        outgoing_edges=[],
-        file_siblings=[],
-    )
-    
-    summary = build_structural_summary(context)
-    
-    assert summary["is_local_declaration"] is True
-    assert summary["is_nested_declaration"] is True
-
-
-def test_build_confidence_basic() -> None:
-    """Test building confidence with basic context."""
-    context = SymbolContext(
-        focus_symbol={"id": "sym1", "confidence": 0.9},
-        incoming_edges=[{"confidence": 0.8}],
-        outgoing_edges=[{"confidence": 1.0}],
-    )
-    
-    confidence = build_confidence(context)
-    
-    assert confidence["focus_symbol_confidence"] == 0.9
-    assert confidence["edge_confidence_min"] == 0.8
-    assert confidence["edge_confidence_max"] == 1.0
-    assert confidence["graph_only"] is True
-
-
-def test_build_confidence_no_edges() -> None:
-    """Test building confidence with no edges."""
-    context = SymbolContext(
-        focus_symbol={"id": "sym1", "confidence": 1.0},
-        incoming_edges=[],
-        outgoing_edges=[],
-    )
-    
-    confidence = build_confidence(context)
-    
-    assert confidence["focus_symbol_confidence"] == 1.0
-    assert confidence["edge_confidence_min"] == 1.0
-    assert confidence["edge_confidence_max"] == 1.0
-
-
-def test_build_confidence_with_placeholder_targets() -> None:
-    """Test confidence reports placeholder targets."""
-    context = SymbolContext(
-        focus_symbol={"id": "sym1", "confidence": 1.0},
-        incoming_edges=[{"from_id": "sym1", "to_id": "external_or_unresolved:ext"}],
-        outgoing_edges=[],
-    )
-    
-    confidence = build_confidence(context)
-    
-    assert confidence["contains_placeholder_targets"] is True
-
-
-def test_is_local_declaration_function() -> None:
-    """Test _is_local_declaration for various function types."""
-    # Module-level function
-    assert _is_local_declaration({"kind": "function", "scope": "module"}) is False
-    assert _is_local_declaration({"kind": "async_function", "scope": "module"}) is False
-    
-    # Local function
+def test_nested_declaration_distinguishes_class_methods_from_function_locals() -> None:
+    """Class methods are never classified as nested lexical declarations."""
     assert _is_local_declaration({"kind": "local_function", "scope": "function"}) is True
-    assert _is_local_declaration({"kind": "local_async_function", "scope": "function"}) is True
-
-
-def test_is_local_declaration_class() -> None:
-    """Test _is_local_declaration for class types."""
-    # Module-level class
-    assert _is_local_declaration({"kind": "class", "scope": "module"}) is False
-    
-    # Local class
     assert _is_local_declaration({"kind": "class", "scope": "function"}) is True
-
-
-def test_is_local_declaration_method() -> None:
-    """Test _is_local_declaration for method types."""
-    # Methods are not local declarations
     assert _is_local_declaration({"kind": "method", "scope": "class"}) is False
-    assert _is_local_declaration({"kind": "async_method", "scope": "class"}) is False
+
+    assert _is_nested_declaration({"kind": "local_function", "scope": "function", "lexical_parent_id": "p"}) is True
+    assert _is_nested_declaration({"kind": "method", "scope": "class", "lexical_parent_id": "cls"}) is False
+    assert _is_nested_declaration({"kind": "function", "scope": "module", "lexical_parent_id": None}) is False
+
+
+def test_build_confidence_none_when_no_edges_and_placeholders() -> None:
+    """edge_confidence_min/max are None when 0 edges exist; unresolved_call: is detected."""
+    no_edges = SymbolContext(focus_symbol={"id": "sym1", "confidence": 1.0})
+    conf_empty = build_confidence(no_edges)
+    assert conf_empty["edge_confidence_min"] is None
+    assert conf_empty["edge_confidence_max"] is None
+    assert conf_empty["contains_placeholder_targets"] is False
+    assert conf_empty["graph_only"] is True
+
+    assert "unresolved_call:" in PLACEHOLDER_PREFIXES
+    with_call_placeholder = SymbolContext(
+        focus_symbol={"id": "sym1", "confidence": 0.9},
+        outgoing_edges=[{"from_id": "sym1", "to_id": "unresolved_call:foo", "confidence": 0.7}],
+    )
+    conf_edges = build_confidence(with_call_placeholder)
+    assert conf_edges["edge_confidence_min"] == 0.7
+    assert conf_edges["edge_confidence_max"] == 0.7
+    assert conf_edges["contains_placeholder_targets"] is True

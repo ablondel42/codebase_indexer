@@ -1,445 +1,214 @@
-"""Context builder tests for Phase 05."""
+"""Context builder, file outline, and source reader tests (v0.2.0)."""
 
-import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+import sqlite3
 
 import pytest
 
-from repo_context.storage import (
-    get_connection,
-    close_connection,
-    initialize_database,
-    upsert_node,
-    upsert_nodes,
-    upsert_edge,
-    upsert_edges,
+from repo_context.config import AppConfig
+from repo_context.context import (
+    build_file_outline,
+    build_symbol_context,
+    read_file_snippet,
+    read_symbol_source,
 )
-from repo_context.context import build_symbol_context
+from repo_context.exceptions import PathSecurityError, RepoContextError, ValidationError
+from repo_context.parsing.linker import resolve_repo_edges
+from repo_context.parsing.pipeline import extract_file_graph
+from repo_context.parsing.scanner import scan_repository
+from repo_context.storage import (
+    close_connection,
+    get_connection,
+    initialize_database,
+    replace_file_graph,
+    upsert_files,
+    upsert_repo,
+)
 
 
 @pytest.fixture
-def temp_db() -> Path:
-    """Create a temporary database path."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield Path(tmpdir) / "test.db"
+def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path, str]]:
+    """Index a realistic multi-file repository in ``tmp_path`` and yield ``(conn, root, repo_id)``."""
+    repo_root = tmp_path / "ctx_repo"
+    repo_root.mkdir()
+
+    (repo_root / "helpers.py").write_text(
+        '"""Shared helpers."""\n'
+        "\n"
+        "def helper(val: int) -> int:\n"
+        '    """Double value."""\n'
+        "    return val * 2\n",
+        encoding="utf-8",
+    )
+    (repo_root / "service.py").write_text(
+        '"""Service module docstring."""\n'
+        "\n"
+        "from helpers import helper\n"
+        "\n"
+        "def dec(fn):\n"
+        "    return fn\n"
+        "\n"
+        "class Service:\n"
+        '    """Main service class."""\n'
+        "\n"
+        "    @dec\n"
+        "    def run(self, x: int) -> int:\n"
+        '        """Run step."""\n'
+        "        def _local(v: int) -> int:\n"
+        "            return v + 1\n"
+        "        return helper(_local(x))\n"
+        "\n"
+        "    def _private_method(self) -> None:\n"
+        "        pass\n"
+        "\n"
+        "def outer_fn() -> int:\n"
+        '    """Outer function."""\n'
+        "    def inner_fn() -> int:\n"
+        "        return 1\n"
+        "    return inner_fn()\n",
+        encoding="utf-8",
+    )
+
+    conn = get_connection(tmp_path / "context.db")
+    try:
+        initialize_database(conn)
+        cfg = AppConfig()
+        repo, files = scan_repository(repo_root, cfg)
+        upsert_repo(conn, repo)
+        upsert_files(conn, files)
+        for rec in files:
+            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
+            replace_file_graph(conn, rec.id, nodes, edges)
+        resolve_repo_edges(conn, repo.id)
+        conn.commit()
+        yield conn, repo_root, repo.id
+    finally:
+        close_connection(conn)
 
 
-@pytest.fixture
-def context_test_db(temp_db: Path):
-    """Create database with context test data."""
-    conn = get_connection(temp_db)
-    initialize_database(conn)
-    
-    # Create module node
-    module_node = {
-        "id": "sym:repo:test:module:test_module",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "module",
-        "name": "test_module",
-        "qualified_name": "test_module",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": None,
-        "visibility_hint": "module",
-        "doc_summary": "Test module",
-        "content_hash": "sha256:abc",
-        "semantic_hash": "sha256:def",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "module",
-        "lexical_parent_id": None,
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, module_node)
-    
-    # Create class node with structural parent = module
-    class_node = {
-        "id": "sym:repo:test:class:test_module.TestClass",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "class",
-        "name": "TestClass",
-        "qualified_name": "test_module.TestClass",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": "sym:repo:test:module:test_module",
-        "visibility_hint": "public",
-        "doc_summary": "Test class",
-        "content_hash": "sha256:ghi",
-        "semantic_hash": "sha256:jkl",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "module",
-        "lexical_parent_id": None,
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, class_node)
-    
-    # Create method node with structural parent = class
-    method_node = {
-        "id": "sym:repo:test:method:test_module.TestClass.test_method",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "method",
-        "name": "test_method",
-        "qualified_name": "test_module.TestClass.test_method",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": "sym:repo:test:class:test_module.TestClass",
-        "visibility_hint": "public",
-        "doc_summary": "Test method",
-        "content_hash": "sha256:mno",
-        "semantic_hash": "sha256:pqr",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "class",
-        "lexical_parent_id": "sym:repo:test:class:test_module.TestClass",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, method_node)
-    
-    # Create local function with lexical parent
-    local_func_node = {
-        "id": "sym:repo:test:local_function:test_module.outer.inner",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "local_function",
-        "name": "inner",
-        "qualified_name": "test_module.outer.inner",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": None,
-        "visibility_hint": "private_like",
-        "doc_summary": "Inner function",
-        "content_hash": "sha256:stu",
-        "semantic_hash": "sha256:vwx",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "function",
-        "lexical_parent_id": "sym:repo:test:function:test_module.outer",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, local_func_node)
-    
-    # Create outer function
-    outer_func_node = {
-        "id": "sym:repo:test:function:test_module.outer",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "function",
-        "name": "outer",
-        "qualified_name": "test_module.outer",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": "sym:repo:test:module:test_module",
-        "visibility_hint": "public",
-        "doc_summary": "Outer function",
-        "content_hash": "sha256:yza",
-        "semantic_hash": "sha256:bcd",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "module",
-        "lexical_parent_id": None,
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, outer_func_node)
-    
-    # Create factory function for local class test
-    factory_func_node = {
-        "id": "sym:repo:test:function:test_module.factory",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "function",
-        "name": "factory",
-        "qualified_name": "test_module.factory",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": "sym:repo:test:module:test_module",
-        "visibility_hint": "public",
-        "doc_summary": "Factory function",
-        "content_hash": "sha256:klm",
-        "semantic_hash": "sha256:nop",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "module",
-        "lexical_parent_id": None,
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, factory_func_node)
-    
-    # Create local class with scope=function
-    local_class_node = {
-        "id": "sym:repo:test:class:test_module.factory.LocalClass",
-        "repo_id": "repo:test",
-        "file_id": "file:test_module.py",
-        "language": "python",
-        "kind": "class",
-        "name": "LocalClass",
-        "qualified_name": "test_module.factory.LocalClass",
-        "uri": "file:///test_module.py",
-        "range_json": None,
-        "selection_range_json": None,
-        "parent_id": None,
-        "visibility_hint": "public",
-        "doc_summary": "Local class",
-        "content_hash": "sha256:efg",
-        "semantic_hash": "sha256:hij",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": "{}",
-        "scope": "function",
-        "lexical_parent_id": "sym:repo:test:function:test_module.factory",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_node(conn, local_class_node)
-    
-    # Create contains edge
-    contains_edge = {
-        "id": "edge:repo:test:contains:module->class",
-        "repo_id": "repo:test",
-        "kind": "contains",
-        "from_id": "sym:repo:test:module:test_module",
-        "to_id": "sym:repo:test:class:test_module.TestClass",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "evidence_file_id": "file:test_module.py",
-        "evidence_uri": "file:///test_module.py",
-        "evidence_range_json": None,
-        "payload_json": "{}",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_edge(conn, contains_edge)
-    
-    # Create SCOPE_PARENT edge
-    scope_edge = {
-        "id": "edge:repo:test:SCOPE_PARENT:inner->outer",
-        "repo_id": "repo:test",
-        "kind": "SCOPE_PARENT",
-        "from_id": "sym:repo:test:local_function:test_module.outer.inner",
-        "to_id": "sym:repo:test:function:test_module.outer",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "evidence_file_id": "file:test_module.py",
-        "evidence_uri": "file:///test_module.py",
-        "evidence_range_json": None,
-        "payload_json": "{}",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_edge(conn, scope_edge)
-    
-    # Create import edge with placeholder target
-    import_edge = {
-        "id": "edge:repo:test:imports:module->external",
-        "repo_id": "repo:test",
-        "kind": "imports",
-        "from_id": "sym:repo:test:module:test_module",
-        "to_id": "external_or_unresolved:external_module",
-        "source": "python-ast",
-        "confidence": 0.8,
-        "evidence_file_id": "file:test_module.py",
-        "evidence_uri": "file:///test_module.py",
-        "evidence_range_json": None,
-        "payload_json": "{}",
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
-    upsert_edge(conn, import_edge)
-    
-    yield conn
-    close_connection(conn)
+def _find_node_id(conn: sqlite3.Connection, name: str, kind: str | None = None) -> str:
+    if kind is not None:
+        row = conn.execute(
+            "SELECT id FROM nodes WHERE name = ? AND kind = ?", (name, kind)
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT id FROM nodes WHERE name = ?", (name,)).fetchone()
+    assert row is not None, f"Node not found: {name} ({kind})"
+    return row["id"]
 
 
-def test_build_symbol_context_for_module_function(context_test_db) -> None:
-    """Test context for module-level function."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:function:test_module.outer")
-    
-    assert context is not None
-    assert context.focus_symbol["kind"] == "function"
-    assert context.focus_symbol["scope"] == "module"
-    # Structural parent should be module
-    assert context.structural_parent is not None
-    assert context.structural_parent["kind"] == "module"
-    # Lexical parent should be None for module-level function
-    assert context.lexical_parent is None
+def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
+    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+) -> None:
+    """Class context has structural children only; method has no bogus lexical_parent."""
+    conn, _, _ = indexed_context_repo
+
+    cls_id = _find_node_id(conn, "Service", "class")
+    cls_ctx = build_symbol_context(conn, cls_id, edge_limit=20, include_source=True)
+    assert cls_ctx is not None
+    assert cls_ctx.structural_parent["kind"] == "module"
+    assert cls_ctx.lexical_parent is None
+    assert [c["name"] for c in cls_ctx.structural_children] == ["run", "_private_method"]
+    assert cls_ctx.lexical_children == []
+    assert "source" in cls_ctx.focus_symbol
+    assert cls_ctx.freshness["is_fresh"] is True
+    assert cls_ctx.freshness["context_source"] == "ast_only"
+
+    run_id = _find_node_id(conn, "run", "method")
+    run_ctx = build_symbol_context(conn, run_id)
+    assert run_ctx is not None
+    assert run_ctx.structural_parent["id"] == cls_id
+    # Class methods are structural class members, NOT lexical declarations
+    assert run_ctx.lexical_parent is None
+    assert [c["name"] for c in run_ctx.lexical_children] == ["_local"]
+    assert run_ctx.structural_summary["is_nested_declaration"] is False
+    assert run_ctx.structural_summary["relationship_counts"]["callees"] >= 2
+
+    inner_id = _find_node_id(conn, "inner_fn", "local_function")
+    inner_ctx = build_symbol_context(conn, inner_id)
+    assert inner_ctx is not None
+    assert inner_ctx.lexical_parent["name"] == "outer_fn"
+    assert inner_ctx.structural_summary["is_local_declaration"] is True
+    assert inner_ctx.structural_summary["is_nested_declaration"] is True
 
 
-def test_build_symbol_context_for_method(context_test_db) -> None:
-    """Test context for method."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:method:test_module.TestClass.test_method")
-    
-    assert context is not None
-    assert context.focus_symbol["kind"] == "method"
-    # Structural parent should be class
-    assert context.structural_parent is not None
-    assert context.structural_parent["kind"] == "class"
-    # Lexical parent should also be class for method
-    assert context.lexical_parent is not None
-    assert context.lexical_parent["kind"] == "class"
+def test_build_symbol_context_edge_limit_and_missing(
+    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+) -> None:
+    """build_symbol_context respects edge_limit, validates negative limits, and returns None when missing."""
+    conn, _, _ = indexed_context_repo
+    assert build_symbol_context(conn, "sym:nonexistent") is None
+    with pytest.raises(ValidationError):
+        build_symbol_context(conn, _find_node_id(conn, "Service", "class"), edge_limit=-1)
 
 
-def test_build_symbol_context_for_local_function(context_test_db) -> None:
-    """Test context for local function."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:local_function:test_module.outer.inner")
-    
-    assert context is not None
-    assert context.focus_symbol["kind"] == "local_function"
-    assert context.focus_symbol["scope"] == "function"
-    # Lexical parent should be outer function
-    assert context.lexical_parent is not None
-    assert context.lexical_parent["kind"] == "function"
-    # Lexical children should be empty (no nested functions inside inner)
-    assert len(context.lexical_children) == 0
+def test_build_file_outline_structure_and_filters(
+    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+) -> None:
+    """build_file_outline returns hierarchical start_line-ordered symbols and deduplicated imports."""
+    conn, _, repo_id = indexed_context_repo
+
+    outline = build_file_outline(conn, repo_id, "service.py")
+    assert outline["file_path"] == "service.py"
+    assert outline["module_path"] == "service"
+    assert outline["is_fresh"] is True
+    assert outline["doc"] == "Service module docstring."
+    assert outline["imports"] == ["helpers.helper"]
+    assert [s["name"] for s in outline["symbols"]] == ["dec", "Service", "outer_fn"]
+
+    svc_entry = outline["symbols"][1]
+    assert [c["name"] for c in svc_entry["children"]] == ["run", "_private_method"]
+
+    # include_private=False drops _private_method and _local
+    public_outline = build_file_outline(conn, repo_id, "service.py", include_private=False)
+    public_svc = public_outline["symbols"][1]
+    assert [c["name"] for c in public_svc["children"]] == ["run"]
+    assert public_svc["children"][0]["children"] == []
+
+    # max_depth=1 omits method children
+    shallow_outline = build_file_outline(conn, repo_id, "service.py", max_depth=1)
+    assert shallow_outline["symbols"][1]["children"] == []
+
+    with pytest.raises(RepoContextError) as missing_exc:
+        build_file_outline(conn, repo_id, "missing.py")
+    assert missing_exc.value.error_code == "file_not_found"
 
 
-def test_build_symbol_context_for_local_class(context_test_db) -> None:
-    """Test context for local class."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:class:test_module.factory.LocalClass")
-    
-    assert context is not None
-    assert context.focus_symbol["kind"] == "class"
-    assert context.focus_symbol["scope"] == "function"
-    # Lexical parent should be factory function
-    assert context.lexical_parent is not None
-    assert context.lexical_parent["kind"] == "function"
+def test_read_symbol_source_pagination_staleness_and_path_security(
+    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+    tmp_path: Path,
+) -> None:
+    """read_symbol_source slices 1-based lines, paginates, detects staleness, and rejects escapes."""
+    conn, repo_root, _ = indexed_context_repo
+    run_id = _find_node_id(conn, "run", "method")
 
+    page1 = read_symbol_source(conn, run_id, max_lines=3, offset=0)
+    assert page1["is_fresh"] is True
+    assert page1["truncated"] is True
+    assert page1["total_lines"] == 6  # lines 11..16 inclusive of @dec
+    assert page1["returned_lines"] == 3
+    assert page1["next_offset"] == 3
+    assert "11:     @dec" in page1["source"]
 
-def test_structural_and_lexical_parents_are_distinct(context_test_db) -> None:
-    """Test that structural and lexical parents remain separate."""
-    conn = context_test_db
-    
-    # For method, both should point to class but are separate fields
-    context = build_symbol_context(conn, "sym:repo:test:method:test_module.TestClass.test_method")
-    
-    assert context is not None
-    # Both fields exist and are accessible
-    assert hasattr(context, "structural_parent")
-    assert hasattr(context, "lexical_parent")
-    # For method, both happen to be the class
-    assert context.structural_parent is not None
-    assert context.lexical_parent is not None
+    page2 = read_symbol_source(conn, run_id, max_lines=10, offset=page1["next_offset"])
+    assert page2["truncated"] is False
+    assert page2["next_offset"] is None
+    assert "16:         return helper(_local(x))" in page2["source"]
 
+    # Path security: symlink / traversal rejected by read_file_snippet
+    outside = tmp_path / "secret.py"
+    outside.write_text("SECRET = 1\n", encoding="utf-8")
+    (repo_root / "escape.py").symlink_to(outside)
 
-def test_file_siblings_are_deterministic(context_test_db) -> None:
-    """Test that file siblings are ordered deterministically."""
-    conn = context_test_db
-    
-    context1 = build_symbol_context(conn, "sym:repo:test:module:test_module")
-    context2 = build_symbol_context(conn, "sym:repo:test:module:test_module")
-    
-    assert context1 is not None
-    assert context2 is not None
-    
-    # Siblings should be identical across calls
-    assert len(context1.file_siblings) == len(context2.file_siblings)
-    for i, sib in enumerate(context1.file_siblings):
-        assert sib["id"] == context2.file_siblings[i]["id"]
-        assert sib["qualified_name"] == context2.file_siblings[i]["qualified_name"]
+    with pytest.raises(PathSecurityError):
+        read_file_snippet(repo_root, "escape.py", 1, 1)
+    with pytest.raises(PathSecurityError):
+        read_file_snippet(repo_root, "../secret.py", 1, 1)
 
-
-def test_context_handles_placeholder_targets(context_test_db) -> None:
-    """Test that placeholder targets don't break context."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:module:test_module")
-    
-    assert context is not None
-    # Should have import edge with placeholder target
-    assert context.confidence["contains_placeholder_targets"] is True
-    # Context assembly should not crash
-
-
-def test_structural_summary_flags_local_declarations(context_test_db) -> None:
-    """Test structural summary flags for local declarations."""
-    conn = context_test_db
-    
-    # Test local function
-    context = build_symbol_context(conn, "sym:repo:test:local_function:test_module.outer.inner")
-    assert context is not None
-    assert context.structural_summary["is_local_declaration"] is True
-    assert context.structural_summary["is_nested_declaration"] is True
-    
-    # Test local class
-    context = build_symbol_context(conn, "sym:repo:test:class:test_module.factory.LocalClass")
-    assert context is not None
-    assert context.structural_summary["is_local_declaration"] is True
-    assert context.structural_summary["is_nested_declaration"] is True
-    
-    # Test module-level function
-    context = build_symbol_context(conn, "sym:repo:test:function:test_module.outer")
-    assert context is not None
-    assert context.structural_summary["is_local_declaration"] is False
-    assert context.structural_summary["is_nested_declaration"] is False
-
-
-def test_missing_symbol_returns_none(context_test_db) -> None:
-    """Test that missing symbol returns None."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:nonexistent")
-    
-    assert context is None
-
-
-def test_end_to_end_context_flow(context_test_db) -> None:
-    """End-to-end test: build context and verify all fields."""
-    conn = context_test_db
-    
-    context = build_symbol_context(conn, "sym:repo:test:class:test_module.TestClass")
-    
-    assert context is not None
-    
-    # Verify all required fields exist
-    assert context.focus_symbol is not None
-    assert context.structural_parent is not None  # module
-    assert isinstance(context.structural_children, list)  # methods
-    assert context.lexical_parent is None  # class at module level
-    assert isinstance(context.lexical_children, list)
-    assert isinstance(context.incoming_edges, list)
-    assert isinstance(context.outgoing_edges, list)
-    assert isinstance(context.file_siblings, list)
-    assert isinstance(context.structural_summary, dict)
-    assert isinstance(context.freshness, dict)
-    assert isinstance(context.confidence, dict)
-    
-    # Verify summary fields
-    assert "has_structural_parent" in context.structural_summary
-    assert "structural_child_count" in context.structural_summary
-    assert "has_lexical_parent" in context.structural_summary
-    assert "lexical_child_count" in context.structural_summary
-    assert "scope" in context.structural_summary
-    
-    # Verify freshness fields
-    assert "node_last_indexed_at" in context.freshness
-    assert "context_source" in context.freshness
-    assert context.freshness["context_source"] == "graph_only"
-    
-    # Verify confidence fields
-    assert "focus_symbol_confidence" in context.confidence
-    assert "graph_only" in context.confidence
-    assert context.confidence["graph_only"] is True
+    # Disk staleness detection
+    service_file = repo_root / "service.py"
+    service_file.write_text(service_file.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    stale_src = read_symbol_source(conn, run_id)
+    assert stale_src["is_fresh"] is False
+    assert stale_src["stale_reason"] == "content_hash_mismatch"

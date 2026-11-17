@@ -1,17 +1,16 @@
 """Repository record model."""
 
-from datetime import datetime
-
 from pydantic import BaseModel, Field, field_validator
 
 from repo_context.constants import Language
+from repo_context.models.common import validate_iso_timestamp
 
 
 class RepoRecord(BaseModel):
     """Represents a tracked repository.
 
     Attributes:
-        id: Unique identifier for this repository (e.g., "repo:MyProject").
+        id: Unique identifier for this repository (e.g., "repo:MyProject:abcd1234").
         root_path: Absolute path to the repository root on disk.
         name: Human-readable repository name.
         default_language: Primary language of the codebase (e.g., "python").
@@ -32,10 +31,4 @@ class RepoRecord(BaseModel):
     @classmethod
     def validate_timestamp(cls, v: str | None) -> str | None:
         """Validate timestamp is ISO 8601 format."""
-        if v is None:
-            return None
-        try:
-            datetime.fromisoformat(v)
-        except ValueError:
-            raise ValueError("Timestamp must be ISO 8601 format (e.g., '2026-01-01T00:00:00Z')")
-        return v
+        return validate_iso_timestamp(v)

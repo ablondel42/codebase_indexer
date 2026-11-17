@@ -1,200 +1,240 @@
-"""CLI main entry point."""
+"""Shared CLI database, symbol resolution, and preview utilities."""
+
+from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
+from pathlib import Path
+import sqlite3
+from typing import Any
 
 from repo_context.config import get_config
-from repo_context.logging_config import get_logger
-from repo_context.storage import (
-    get_connection,
-    initialize_database,
-)
-from dataclasses import asdict
-import typing
+from repo_context.context.helpers import format_line_span
+from repo_context.context.source_reader import _read_verified_file_text
+from repo_context.exceptions import ParseError, PathSecurityError, RepoContextError, SymbolNotFoundError
+from repo_context.graph.queries import get_files_by_ids
+from repo_context.parsing.pathing import ensure_safe_repo_file
+from repo_context.storage import get_node_by_id, resolve_repo_id
+from repo_context.storage.nodes import row_to_node
 
-logger = get_logger("cli.main")
-
-
+_MAX_PREVIEW_CHARS = 120
 
 
+def resolve_db_path(args: argparse.Namespace) -> Path:
+    """Resolve explicit ``--db-path`` or fall back to ``AppConfig.db_path``."""
+    raw = getattr(args, "db_path", None)
+    if raw is not None:
+        return Path(raw)
+    return get_config().db_path
 
-def _node_to_dict(node) -> dict:
-    """Convert a node to a dictionary.
 
-    Args:
-        node: Node dict or object.
+def _escape_like(value: str) -> str:
+    """Escape SQLite LIKE metacharacters for ``ESCAPE '\\'``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    Returns:
-        Dictionary representation.
-    """
-    if isinstance(node, dict):
+
+def _build_candidate_entries(
+    conn: sqlite3.Connection,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Format candidate symbols for ambiguity error reporting."""
+    file_ids = [c.get("file_id") for c in candidates if c.get("file_id")]
+    files_by_id = get_files_by_ids(conn, file_ids)
+    items: list[dict[str, Any]] = []
+    for cand in candidates[:25]:
+        finfo = files_by_id.get(cand.get("file_id") or "")
+        items.append(
+            {
+                "id": cand["id"],
+                "kind": cand["kind"],
+                "qualified_name": cand["qualified_name"],
+                "file_path": finfo.get("file_path") if finfo else None,
+                "lines": format_line_span(cand),
+                "signature": cand.get("signature"),
+            }
+        )
+    return items
+
+
+def resolve_repo_for_cli(
+    conn: sqlite3.Connection,
+    repo_arg: str | None = None,
+) -> str:
+    """Resolve ``--repo`` explicitly or auto-select when one repo is indexed."""
+    return resolve_repo_id(conn, repo_arg)
+
+
+def resolve_symbol_target(
+    conn: sqlite3.Connection,
+    repo_id: str | None,
+    symbol_ref: str,
+) -> dict[str, Any]:
+    """Resolve a symbol by ``sym:...`` ID, exact qualified name, exact name, or unique suffix."""
+    cleaned = symbol_ref.strip()
+    if not cleaned:
+        raise SymbolNotFoundError("Symbol identifier must not be empty.")
+
+    if cleaned.startswith("sym:"):
+        node = get_node_by_id(conn, cleaned)
+        if node is None or (repo_id is not None and node["repo_id"] != repo_id):
+            raise SymbolNotFoundError(
+                f"Symbol not found: {cleaned}",
+                context={"symbol": cleaned, "repo_id": repo_id},
+            )
         return node
-    return asdict(node)
+
+    resolved_repo_id = repo_id if repo_id is not None else resolve_repo_id(conn, None)
+
+    exact_qname_rows = conn.execute(
+        "SELECT * FROM nodes WHERE repo_id = ? AND qualified_name = ? ORDER BY kind, id",
+        (resolved_repo_id, cleaned),
+    ).fetchall()
+    if len(exact_qname_rows) == 1:
+        return row_to_node(exact_qname_rows[0])
+    if len(exact_qname_rows) > 1:
+        candidates = [row_to_node(r) for r in exact_qname_rows]
+        raise RepoContextError(
+            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
+            error_code="ambiguous_symbol",
+            context={"candidates": _build_candidate_entries(conn, candidates)},
+        )
+
+    exact_name_rows = conn.execute(
+        "SELECT * FROM nodes WHERE repo_id = ? AND name = ? ORDER BY kind, qualified_name, id",
+        (resolved_repo_id, cleaned),
+    ).fetchall()
+    if len(exact_name_rows) == 1:
+        return row_to_node(exact_name_rows[0])
+    if len(exact_name_rows) > 1:
+        candidates = [row_to_node(r) for r in exact_name_rows]
+        raise RepoContextError(
+            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
+            error_code="ambiguous_symbol",
+            context={"candidates": _build_candidate_entries(conn, candidates)},
+        )
+
+    suffix_pattern = f"%.{_escape_like(cleaned)}"
+    suffix_rows = conn.execute(
+        """
+        SELECT * FROM nodes
+        WHERE repo_id = ? AND qualified_name LIKE ? ESCAPE '\\'
+        ORDER BY kind, qualified_name, id
+        LIMIT 25
+        """,
+        (resolved_repo_id, suffix_pattern),
+    ).fetchall()
+    if len(suffix_rows) == 1:
+        return row_to_node(suffix_rows[0])
+    if len(suffix_rows) > 1:
+        candidates = [row_to_node(r) for r in suffix_rows]
+        raise RepoContextError(
+            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
+            error_code="ambiguous_symbol",
+            context={"candidates": _build_candidate_entries(conn, candidates)},
+        )
+
+    raise SymbolNotFoundError(
+        f"Symbol not found: {cleaned}",
+        context={"symbol": cleaned, "repo_id": resolved_repo_id},
+    )
 
 
+def resolve_symbol_targets(
+    conn: sqlite3.Connection,
+    repo_arg: str | None,
+    symbol_refs: Sequence[str],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Resolve one or more symbol references, preserving order and deduplicating IDs."""
+    needs_repo = repo_arg is not None or any(not ref.strip().startswith("sym:") for ref in symbol_refs)
+    resolved_repo_id: str | None = resolve_repo_id(conn, repo_arg) if needs_repo else None
 
-def _context_to_dict(context) -> dict:
-    """Convert SymbolContext to dict.
-
-    Args:
-        context: SymbolContext instance or dict.
-
-    Returns:
-        Dictionary representation.
-    """
-    if isinstance(context, dict):
-        return context
-    # Handle Pydantic model
-    if hasattr(context, "model_dump"):
-        return context.model_dump()
-    # Handle dataclass
-    return asdict(context)
-
-
-
-def _make_dict_json_serializable(d: dict) -> dict:
-    """Recursively convert sets in a dict to sorted lists for JSON serialization.
-
-    Args:
-        d: Dictionary that may contain sets.
-
-    Returns:
-        Dictionary with all sets converted to sorted lists.
-    """
-    result: typing.Any = {}
-    for k, v in d.items():
-        if isinstance(v, set):
-            result[k] = sorted(v)
-        elif isinstance(v, dict):
-            result[k] = _make_dict_json_serializable(v)
-        elif isinstance(v, list):
-            result[k] = [
-                _make_dict_json_serializable(item) if isinstance(item, dict) else item
-                for item in v
-            ]
-        else:
-            result[k] = v
-    return result
+    targets: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for ref in symbol_refs:
+        node = resolve_symbol_target(conn, resolved_repo_id, ref)
+        if node["id"] not in seen_ids:
+            seen_ids.add(node["id"])
+            targets.append(node)
+    return resolved_repo_id, targets
 
 
-
-def _risk_to_dict(risk_result) -> dict:
-    """Convert RiskResult to dict.
-
-    Args:
-        risk_result: RiskResult instance or dict.
-
-    Returns:
-        Dictionary representation (JSON-serializable).
-    """
-    if isinstance(risk_result, dict):
-        return _make_dict_json_serializable(risk_result)
-    # Handle Pydantic model
-    if hasattr(risk_result, "model_dump"):
-        return _make_dict_json_serializable(risk_result.model_dump())
-    # Handle dataclass
-    return _make_dict_json_serializable(asdict(risk_result))
+def extract_edge_line(edge: dict[str, Any]) -> int | None:
+    """Return 1-based line number from ``edge['evidence_range_json']``."""
+    rng = edge.get("evidence_range_json")
+    if isinstance(rng, dict):
+        start = rng.get("start")
+        if isinstance(start, dict) and isinstance(start.get("line"), int):
+            return start["line"] + 1
+    return None
 
 
+def _load_safe_file_lines(
+    repo_root: Path | None,
+    file_info: dict[str, Any] | None,
+    max_bytes: int,
+    cache: dict[str, list[str] | None],
+) -> list[str] | None:
+    """Safely read and cache file lines for reference site previews."""
+    if repo_root is None or file_info is None:
+        return None
+    file_id = file_info["id"]
+    if file_id in cache:
+        return cache[file_id]
 
-def _adapt_node_for_mcp(node: dict) -> dict:
-    """Adapt a node dict for MCP output.
+    rel_path = file_info.get("file_path")
+    if not rel_path:
+        cache[file_id] = None
+        return None
 
-    Args:
-        node: Node dictionary.
+    try:
+        safe_path = ensure_safe_repo_file(repo_root, rel_path)
+        text, _ = _read_verified_file_text(safe_path, max_file_size_bytes=max_bytes)
+        lines = text.splitlines()
+    except (PathSecurityError, ParseError, OSError):
+        lines = None
 
-    Returns:
-        Adapted node for MCP.
-    """
-    return {
-        "id": node.get("id"),
-        "kind": node.get("kind"),
-        "qualified_name": node.get("qualified_name"),
-        "name": node.get("name"),
-        "file_id": node.get("file_id"),
-        "parent_id": node.get("parent_id"),
-        "lexical_parent_id": node.get("lexical_parent_id"),
-        "visibility_hint": node.get("visibility_hint"),
-        "doc_summary": node.get("doc_summary"),
-    }
-
-
-
-def adapt_context(context_dict: dict) -> dict:
-    """Adapt context dict for MCP output.
-
-    Args:
-        context_dict: Context dictionary.
-
-    Returns:
-        Adapted context for MCP.
-    """
-    focus = context_dict.get("focus_symbol", {})
-    return {
-        "focus_symbol": _adapt_node_for_mcp(focus),
-        "structural_parent": _adapt_node_for_mcp(context_dict.get("structural_parent", {})) if context_dict.get("structural_parent") else None,
-        "structural_children": [_adapt_node_for_mcp(c) for c in context_dict.get("structural_children", [])],
-        "lexical_parent": _adapt_node_for_mcp(context_dict.get("lexical_parent", {})) if context_dict.get("lexical_parent") else None,
-        "lexical_children": [_adapt_node_for_mcp(c) for c in context_dict.get("lexical_children", [])],
-        "incoming_edges": context_dict.get("incoming_edges", []),
-        "outgoing_edges": context_dict.get("outgoing_edges", []),
-        "structural_summary": context_dict.get("structural_summary", {}),
-        "freshness": context_dict.get("freshness", {}),
-        "confidence": context_dict.get("confidence", {}),
-    }
+    cache[file_id] = lines
+    return lines
 
 
+def extract_site_preview(
+    edge: dict[str, Any],
+    repo_root: Path | None,
+    file_info: dict[str, Any] | None,
+    max_bytes: int,
+    cache: dict[str, list[str] | None],
+    *,
+    max_chars: int = _MAX_PREVIEW_CHARS,
+) -> str | None:
+    """Extract a 1-line trimmed source preview at an edge's evidence line."""
+    rng = edge.get("evidence_range_json")
+    if not isinstance(rng, dict):
+        return None
+    start = rng.get("start")
+    if not isinstance(start, dict):
+        return None
+    line_idx = start.get("line")
+    if not isinstance(line_idx, int) or line_idx < 0:
+        return None
 
-def adapt_risk_result(risk_dict: dict) -> dict:
-    """Adapt risk result dict for MCP output.
+    lines = _load_safe_file_lines(repo_root, file_info, max_bytes, cache)
+    if not lines or line_idx >= len(lines):
+        return None
 
-    Args:
-        risk_dict: Risk result dictionary.
-
-    Returns:
-        Adapted risk result for MCP.
-    """
-    return {
-        "risk_score": risk_dict.get("risk_score"),
-        "decision": risk_dict.get("decision"),
-        "issues": risk_dict.get("issues", []),
-        "facts": risk_dict.get("facts", {}),
-    }
-
-
-
-def adapt_references(ref_edges: list, ref_stats: dict) -> dict:
-    """Adapt references for MCP output.
-
-    Args:
-        ref_edges: List of reference edge dicts.
-        ref_stats: Reference statistics.
-
-    Returns:
-        Adapted references for MCP.
-    """
-    return {
-        "references": ref_edges,
-        "reference_summary": {
-            "count": ref_stats.get("count", 0),
-            "available": ref_stats.get("available", True),
-            "referencing_files": ref_stats.get("file_count", 0),
-            "referencing_modules": ref_stats.get("module_count", 0),
-        },
-    }
+    trimmed = lines[line_idx].strip()
+    if not trimmed:
+        return None
+    if len(trimmed) > max_chars:
+        return trimmed[: max_chars - 3] + "..."
+    return trimmed
 
 
-
-def get_connection_for_args(args: argparse.Namespace):
-    """Get a database connection from CLI args.
-
-    Args:
-        args: Parsed command line arguments.
-
-    Returns:
-        Initialized SQLite connection.
-    """
-    config = get_config()
-    db_path = args.db_path if hasattr(args, 'db_path') and args.db_path else config.db_path
-    conn = get_connection(db_path)
-    initialize_database(conn)
-    return conn
+def format_freshness_label(is_fresh: bool, stale_reason: str | None) -> str:
+    """Convert ``check_file_disk_freshness`` output into ``fresh``/``modified``/``deleted``."""
+    if is_fresh:
+        return "fresh"
+    if stale_reason == "file_missing":
+        return "deleted"
+    if stale_reason == "content_hash_mismatch":
+        return "modified"
+    return stale_reason or "stale"

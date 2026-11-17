@@ -1,509 +1,476 @@
-"""Tests for watch mode.
+"""Tests for watch mode event normalization, scheduler, deletion cleanup, and persistence."""
 
-Tests cover:
-- Event normalization
-- Batch deduplication and collapse
-- Incremental reindex on modify
-- Create event adds file
-- Delete event removes file graph
-- Reference edge invalidation
-- Reference availability becomes unavailable
-- Parse failure keeps previous graph state
-- Rename behaves as delete + create
-- Ignored files are skipped
-"""
-
-import json
-import tempfile
-import time
-import datetime
+from collections.abc import Iterator
 from pathlib import Path
+import sqlite3
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
 from repo_context.config import AppConfig
-from repo_context.storage import (
-    get_connection,
-    close_connection,
-    initialize_database,
-    upsert_repo,
-    upsert_files,
-    replace_file_graph,
+from repo_context.indexing.events import FileChangeEvent, normalize_event
+from repo_context.indexing.incremental import (
+    handle_deleted_file,
+    process_event_batch,
+    reindex_changed_file,
 )
-from repo_context.models.repo import RepoRecord
-from repo_context.models.file import FileRecord
-from repo_context.indexing.events import FileChangeEvent, normalize_event, _is_ignored_path, _is_supported_file
+from repo_context.indexing.invalidation import invalidate_reference_summaries_for_file
 from repo_context.indexing.scheduler import EventScheduler, collapse_events
-from repo_context.indexing.invalidation import (
-    mark_symbols_in_file_stale,
-    invalidate_reference_summaries_for_file,
-    collect_impacted_symbol_ids,
+from repo_context.indexing.watch import _process_watch_batch, make_watch_connection_factory
+from repo_context.parsing.pathing import derive_file_id, derive_repo_id
+from repo_context.storage import (
+    close_connection,
+    get_connection,
+    initialize_database,
+    upsert_edges,
+    upsert_reference_refresh,
 )
-from repo_context.indexing.incremental import reindex_changed_file, handle_deleted_file, process_event_batch
 
 
 @pytest.fixture
-def temp_db_path(tmp_path: Path) -> Path:
-    """Create a temporary database path."""
-    return tmp_path / "test.db"
-
-
-@pytest.fixture
-def initialized_conn(temp_db_path: Path):
-    """Create an initialized database connection."""
-    conn = get_connection(temp_db_path)
-    initialize_database(conn)
-    return conn, temp_db_path
-
-
-@pytest.fixture
-def config():
-    """Create default app config."""
-    return AppConfig()
-
-
-@pytest.fixture
-def test_repo(tmp_path: Path):
-    """Create a test repository with a Python file."""
-    repo = tmp_path / "test_repo"
-    repo.mkdir()
-    src = repo / "src"
-    src.mkdir()
-    
-    # Create a simple Python file
-    py_file = src / "module.py"
-    py_file.write_text("""
-def hello():
-    print("hello")
-
-class Greeter:
-    def greet(self):
-        return "hi"
-""")
-    return repo
-
-
-def _create_test_graph(conn, repo_id: str = "repo:test", file_path: str = "src/module.py"):
-    """Create a minimal test graph with a file and symbols."""
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    repo = RepoRecord(id=repo_id, root_path="/test", name="test", default_language="python", created_at=now)
-    upsert_repo(conn, repo)
-
-    now_str = "2024-01-01T00:00:00Z"
-    file_record = FileRecord(
-        id=f"file:{file_path}",
-        repo_id=repo_id,
-        file_path=file_path,
-        uri=f"file:///test/{file_path}",
-        module_path=file_path.replace("/", ".").replace(".py", ""),
-        language="python",
-        content_hash="sha256:abc123",
-        size_bytes=1000,
-        last_modified_at=now_str,
+def watch_env(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path, Path, AppConfig]]:
+    """Yield ``(conn, db_path, repo_root, config)`` and close the connection in teardown."""
+    db_path = tmp_path / "watch.db"
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+    (repo_root / "src" / "helper.py").write_text(
+        "def helper() -> int:\n    return 1\n", encoding="utf-8"
     )
-    upsert_files(conn, [file_record])
+    (repo_root / "src" / "module.py").write_text(
+        "from src.helper import helper\n\ndef hello() -> int:\n    return helper()\n",
+        encoding="utf-8",
+    )
 
-    # Create symbols
-    symbols = [
-        {
-            "id": f"sym:{repo_id}:function:{file_path.replace('/', '.').replace('.py', '')}.hello",
-            "repo_id": repo_id,
-            "file_id": file_record.id,
-            "language": "python",
-            "kind": "function",
-            "name": "hello",
-            "qualified_name": f"{file_path.replace('/', '.').replace('.py', '')}.hello",
-            "uri": f"file:///test/{file_path}",
-            "range_json": json.dumps({"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}}),
-            "selection_range_json": json.dumps({"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}}),
-            "parent_id": f"sym:{repo_id}:module:{file_path.replace('/', '.').replace('.py', '')}",
-            "visibility_hint": "public",
-            "doc_summary": None,
-            "content_hash": "sha256:abc",
-            "semantic_hash": "sha256:abc",
-            "source": "python-ast",
-            "confidence": 1.0,
-            "payload_json": json.dumps({"file_path": file_path, "module_path": file_path.replace("/", ".").replace(".py", "")}),
-            "scope": "module",
-            "lexical_parent_id": None,
-            "last_indexed_at": now_str,
-        },
-        {
-            "id": f"sym:{repo_id}:module:{file_path.replace('/', '.').replace('.py', '')}",
-            "repo_id": repo_id,
-            "file_id": file_record.id,
-            "language": "python",
-            "kind": "module",
-            "name": "module",
-            "qualified_name": file_path.replace("/", ".").replace(".py", ""),
-            "uri": f"file:///test/{file_path}",
-            "range_json": json.dumps({"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}}),
-            "selection_range_json": json.dumps({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}),
-            "parent_id": None,
-            "visibility_hint": "public",
-            "doc_summary": None,
-            "content_hash": "sha256:abc123",
-            "semantic_hash": "sha256:abc123",
-            "source": "python-ast",
-            "confidence": 1.0,
-            "payload_json": json.dumps({"file_path": file_path, "module_path": file_path.replace("/", ".").replace(".py", "")}),
-            "scope": "module",
-            "lexical_parent_id": None,
-            "last_indexed_at": now_str,
-        },
-    ]
+    conn = get_connection(db_path)
+    try:
+        initialize_database(conn)
+        yield conn, db_path, repo_root, AppConfig()
+    finally:
+        close_connection(conn)
 
-    for symbol in symbols:
-        conn.execute(
-            """
-            INSERT INTO nodes (
-                id, repo_id, file_id, language, kind, name, qualified_name, uri,
-                range_json, selection_range_json, parent_id, visibility_hint,
-                doc_summary, content_hash, semantic_hash, source, confidence,
-                payload_json, scope, lexical_parent_id, last_indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                symbol["id"], symbol["repo_id"], symbol["file_id"], symbol["language"],
-                symbol["kind"], symbol["name"], symbol["qualified_name"], symbol["uri"],
-                symbol["range_json"], symbol["selection_range_json"], symbol["parent_id"],
-                symbol["visibility_hint"], symbol["doc_summary"], symbol["content_hash"],
-                symbol["semantic_hash"], symbol["source"], symbol["confidence"],
-                symbol["payload_json"], symbol["scope"], symbol["lexical_parent_id"],
-                symbol["last_indexed_at"],
-            ),
+
+class TestEventNormalization:
+    """Tests for ``normalize_event`` returning ``list[FileChangeEvent]``."""
+
+    def test_created_modified_deleted_return_list_with_repo_id(
+        self,
+        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+    ) -> None:
+        _, _, repo_root, cfg = watch_env
+        expected_repo_id = derive_repo_id(repo_root)
+        target = repo_root / "src" / "module.py"
+
+        for ev_type in ("created", "modified", "deleted"):
+            raw = SimpleNamespace(event_type=ev_type, src_path=str(target), is_directory=False)
+            normalized = normalize_event(raw, repo_root, cfg)
+            assert len(normalized) == 1
+            ev = normalized[0]
+            assert ev.event_type == ev_type
+            assert ev.repo_relative_path == "src/module.py"
+            assert ev.repo_id == expected_repo_id
+
+    def test_moved_event_rename_and_tmp_atomic_save(
+        self,
+        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+    ) -> None:
+        _, _, repo_root, cfg = watch_env
+        old_path = repo_root / "src" / "old_mod.py"
+        new_path = repo_root / "src" / "module.py"
+
+        move_ev = SimpleNamespace(
+            event_type="moved",
+            src_path=str(old_path),
+            dest_path=str(new_path),
+            is_directory=False,
+        )
+        events = normalize_event(move_ev, repo_root, cfg)
+        assert [(e.event_type, e.repo_relative_path) for e in events] == [
+            ("deleted", "src/old_mod.py"),
+            ("modified", "src/module.py"),
+        ]
+        assert events[1].old_repo_relative_path == "src/old_mod.py"
+
+        # Atomic save: temp file foo.py.tmp -> src/module.py emits only modified for destination
+        atomic_ev = SimpleNamespace(
+            event_type="moved",
+            src_path=str(repo_root / "src" / "module.py.tmp"),
+            dest_path=str(new_path),
+            is_directory=False,
+        )
+        atomic_events = normalize_event(atomic_ev, repo_root, cfg)
+        assert [(e.event_type, e.repo_relative_path) for e in atomic_events] == [
+            ("modified", "src/module.py")
+        ]
+
+    def test_traversal_symlink_ignored_dirs_and_tests_filtering(
+        self,
+        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        tmp_path: Path,
+    ) -> None:
+        _, _, repo_root, cfg = watch_env
+        outside = tmp_path / "outside.py"
+        outside.write_text("SECRET = 1\n", encoding="utf-8")
+        (repo_root / "escape.py").symlink_to(outside)
+
+        assert (
+            normalize_event(
+                SimpleNamespace(event_type="modified", src_path=str(repo_root / ".." / "outside.py")),
+                repo_root,
+                cfg,
+            )
+            == []
+        )
+        assert (
+            normalize_event(
+                SimpleNamespace(event_type="created", src_path=str(repo_root / "escape.py")),
+                repo_root,
+                cfg,
+            )
+            == []
+        )
+        assert (
+            normalize_event(
+                SimpleNamespace(event_type="created", src_path=str(repo_root / "pkg.egg-info" / "a.py")),
+                repo_root,
+                cfg,
+            )
+            == []
+        )
+        assert (
+            normalize_event(
+                SimpleNamespace(event_type="created", src_path=str(repo_root / "tests" / "test_a.py")),
+                repo_root,
+                cfg,
+            )
+            == []
         )
 
-    conn.commit()
-    return file_record.id
+        # include_tests=True allows test files
+        (repo_root / "tests").mkdir()
+        test_file = repo_root / "tests" / "test_a.py"
+        test_file.write_text("def test_x(): pass\n", encoding="utf-8")
+        with_tests = normalize_event(
+            SimpleNamespace(event_type="created", src_path=str(test_file)),
+            repo_root,
+            AppConfig(include_tests=True),
+        )
+        assert len(with_tests) == 1
 
 
-# ==================== Event Normalization Tests ====================
+class TestCollapseAndSerializedScheduler:
+    """Tests for sequence-aware collapsing and serialized ``EventScheduler`` execution."""
 
-def test_is_ignored_path_ignores_git():
-    """Test that .git paths are ignored."""
-    assert _is_ignored_path(".git/config", (".git",)) is True
-    assert _is_ignored_path("src/.git/HEAD", (".git",)) is True
+    def test_collapse_deleted_created_to_modified_and_ephemeral_create_delete(self) -> None:
+        # [deleted, created] -> 'modified'
+        replaced = collapse_events(
+            [
+                FileChangeEvent("deleted", "/r/a.py", "a.py", True),
+                FileChangeEvent("created", "/r/a.py", "a.py", True),
+            ]
+        )
+        assert [(e.event_type, e.repo_relative_path) for e in replaced] == [("modified", "a.py")]
 
+        # [created, deleted] -> disappeared (empty)
+        ephemeral = collapse_events(
+            [
+                FileChangeEvent("created", "/r/b.py", "b.py", True),
+                FileChangeEvent("deleted", "/r/b.py", "b.py", True),
+            ]
+        )
+        assert ephemeral == []
 
-def test_is_ignored_path_ignores_venv():
-    """Test that .venv paths are ignored."""
-    assert _is_ignored_path(".venv/lib/python.py", (".venv",)) is True
+        # [created, modified] -> 'created'
+        created_mod = collapse_events(
+            [
+                FileChangeEvent("created", "/r/c.py", "c.py", True),
+                FileChangeEvent("modified", "/r/c.py", "c.py", True),
+            ]
+        )
+        assert [(e.event_type, e.repo_relative_path) for e in created_mod] == [("created", "c.py")]
 
+    def test_scheduler_serializes_batches_on_single_worker_thread(self) -> None:
+        active = 0
+        max_active = 0
+        batches: list[list[FileChangeEvent]] = []
+        first_started = threading.Event()
+        lock = threading.Lock()
 
-def test_is_ignored_path_allows_normal():
-    """Test that normal paths are not ignored."""
-    assert _is_ignored_path("src/module.py", (".git", ".venv")) is False
+        def on_batch(batch: list[FileChangeEvent]) -> None:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            first_started.set()
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            batches.append(batch)
 
+        scheduler = EventScheduler(debounce_ms=20, on_batch_ready=on_batch)
+        try:
+            scheduler.submit(FileChangeEvent("modified", "/r/a.py", "a.py", True))
+            assert first_started.wait(timeout=1.0)
+            scheduler.submit(FileChangeEvent("modified", "/r/b.py", "b.py", True))
+        finally:
+            scheduler.stop()
 
-def test_is_ignored_path_ignores_dotfiles():
-    """Test that dotfiles are ignored."""
-    assert _is_ignored_path(".hidden.py", ()) is True
-
-
-def test_is_supported_file_py():
-    """Test that .py files are supported."""
-    assert _is_supported_file("src/module.py", (".py",)) is True
-
-
-def test_is_supported_file_js():
-    """Test that .js files are not supported when only .py is configured."""
-    assert _is_supported_file("src/app.js", (".py",)) is False
-
-
-# ==================== Scheduler Tests ====================
-
-def test_event_batch_deduplicates_paths():
-    """Test that repeated events for same path collapse to one operation."""
-    events = [
-        FileChangeEvent("modified", "/test/src/a.py", "src/a.py", True),
-        FileChangeEvent("modified", "/test/src/a.py", "src/a.py", True),
-        FileChangeEvent("modified", "/test/src/a.py", "src/a.py", True),
-    ]
-    collapsed = collapse_events(events)
-    assert len(collapsed) == 1
-    assert collapsed[0].repo_relative_path == "src/a.py"
-
-
-def test_collapse_created_then_modified():
-    """Test that created + modified collapses to created."""
-    events = [
-        FileChangeEvent("created", "/test/src/a.py", "src/a.py", True),
-        FileChangeEvent("modified", "/test/src/a.py", "src/a.py", True),
-    ]
-    collapsed = collapse_events(events)
-    assert len(collapsed) == 1
-    assert collapsed[0].event_type == "created"
-
-
-def test_collapse_deleted_wins():
-    """Test that deleted wins over earlier create or modify."""
-    events = [
-        FileChangeEvent("created", "/test/src/a.py", "src/a.py", True),
-        FileChangeEvent("modified", "/test/src/a.py", "src/a.py", True),
-        FileChangeEvent("deleted", "/test/src/a.py", "src/a.py", True),
-    ]
-    collapsed = collapse_events(events)
-    assert len(collapsed) == 1
-    assert collapsed[0].event_type == "deleted"
+        assert max_active == 1
+        assert len(batches) == 2
 
 
-def test_scheduler_debounce():
-    """Test that scheduler debounces events."""
-    batches = []
-    
-    def on_batch(batch):
-        batches.append(batch)
-    
-    scheduler = EventScheduler(debounce_ms=100, on_batch_ready=on_batch)
-    
-    # Submit events quickly
-    scheduler.submit(FileChangeEvent("modified", "/test/a.py", "a.py", True))
-    scheduler.submit(FileChangeEvent("modified", "/test/a.py", "a.py", True))
-    scheduler.submit(FileChangeEvent("modified", "/test/a.py", "a.py", True))
-    
-    # Wait for debounce
-    time.sleep(0.2)
-    scheduler.stop()
-    
-    # Should have emitted one batch
-    assert len(batches) == 1
-    assert len(batches[0]) == 1
+class TestIncrementalDeletionRollbackAndCustomDbPath:
+    """Tests for deletion cleanup, parse failure rollback, and watch batching."""
 
+    def test_handle_deleted_file_leaves_zero_orphan_edges_and_marks_external_stale(
+        self,
+        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+    ) -> None:
+        conn, _, repo_root, cfg = watch_env
+        repo_id = derive_repo_id(repo_root)
 
-# ==================== Incremental Reindex Tests ====================
+        assert reindex_changed_file(conn, repo_root, "src/helper.py", cfg)["status"] == "reindexed"
+        assert reindex_changed_file(conn, repo_root, "src/module.py", cfg)["status"] == "reindexed"
 
-def test_modify_event_reindexes_file(initialized_conn, test_repo, config):
-    """Test that modifying a .py file reindexes it."""
-    conn, db_path = initialized_conn
-    _create_test_graph(conn)
-    
-    # Modify the file
-    py_file = test_repo / "src" / "module.py"
-    py_file.write_text("""
-def hello():
-    print("hello world")
+        helper_sym_id = conn.execute(
+            "SELECT id FROM nodes WHERE name = 'helper' AND kind = 'function'"
+        ).fetchone()["id"]
+        hello_sym_id = conn.execute(
+            "SELECT id FROM nodes WHERE name = 'hello' AND kind = 'function'"
+        ).fetchone()["id"]
+        helper_file_id = derive_file_id(repo_id, "src/helper.py")
+        module_file_id = derive_file_id(repo_id, "src/module.py")
 
-def goodbye():
-    print("goodbye")
-""")
-    
-    result = reindex_changed_file(conn, test_repo, str(py_file), config)
-    
-    assert result["status"] == "reindexed"
-    assert result["node_count"] > 0
-    assert result["edge_count"] > 0
+        # Add an LSP reference edge from module.py -> helper and mark helper refreshed
+        upsert_edges(
+            conn,
+            [
+                {
+                    "id": f"edge:{repo_id}:references:hello->helper",
+                    "repo_id": repo_id,
+                    "kind": "references",
+                    "from_id": hello_sym_id,
+                    "to_id": helper_sym_id,
+                    "source": "lsp",
+                    "confidence": 0.9,
+                    "evidence_file_id": module_file_id,
+                    "evidence_uri": (repo_root / "src" / "module.py").as_uri(),
+                    "payload_json": "{}",
+                    "last_indexed_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+        )
+        upsert_reference_refresh(conn, helper_sym_id, True, "2026-01-01T00:00:00Z", "ok")
+        upsert_reference_refresh(conn, hello_sym_id, True, "2026-01-01T00:00:00Z", "ok")
+        conn.commit()
 
+        # Invalidate reference summaries for module.py must also mark external helper stale
+        removed_refs = invalidate_reference_summaries_for_file(conn, module_file_id)
+        conn.commit()
+        assert removed_refs == 1
+        assert (
+            conn.execute(
+                "SELECT available FROM reference_refresh WHERE target_symbol_id = ?",
+                (helper_sym_id,),
+            ).fetchone()["available"]
+            == 0
+        )
 
-def test_create_event_adds_file(initialized_conn, test_repo, config):
-    """Test that creating a new .py file adds it to the graph."""
-    conn, db_path = initialized_conn
-    
-    # Create a new file
-    new_file = test_repo / "src" / "new_module.py"
-    new_file.write_text("""
-def new_func():
-    pass
-""")
-    
-    result = reindex_changed_file(conn, test_repo, str(new_file), config)
-    
-    assert result["status"] == "reindexed"
-    assert result["node_count"] > 0
+        # Delete src/helper.py and verify zero orphan edges remain pointing to helper_sym_id
+        summary = handle_deleted_file(conn, repo_id, "src/helper.py")
+        assert summary["status"] == "deleted"
+        assert summary["deleted_node_count"] > 0
 
+        orphan_count = conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE from_id = ? OR to_id = ? OR evidence_file_id = ?",
+            (helper_sym_id, helper_sym_id, helper_file_id),
+        ).fetchone()[0]
+        assert orphan_count == 0
 
-def test_delete_event_removes_file_graph(initialized_conn, test_repo, config):
-    """Test that deleting a file removes its graph state."""
-    conn, db_path = initialized_conn
-    
-    repo_id = f"repo:{test_repo.name}"
-    file_id = _create_test_graph(conn, repo_id=repo_id, file_path="src/module.py")
-    
-    result = handle_deleted_file(conn, repo_id, "src/module.py")
-    
-    assert result["status"] == "deleted"
-    assert result["deleted_node_count"] > 0
-    assert result["deleted_edge_count"] >= 0
-    
-    # Verify file is gone
-    cursor = conn.execute("SELECT COUNT(*) FROM files WHERE id = ?", (file_id,))
-    assert cursor.fetchone()[0] == 0
+    def test_parse_error_rollback_preserves_prior_graph_and_rejects_traversal(
+        self,
+        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        tmp_path: Path,
+    ) -> None:
+        conn, _, repo_root, cfg = watch_env
+        repo_id = derive_repo_id(repo_root)
+        file_id = derive_file_id(repo_id, "src/module.py")
 
+        assert reindex_changed_file(conn, repo_root, "src/module.py", cfg)["status"] == "reindexed"
+        nodes_before = conn.execute(
+            "SELECT id FROM nodes WHERE file_id = ? ORDER BY id", (file_id,)
+        ).fetchall()
+        assert len(nodes_before) >= 2
 
-def test_delete_not_tracked(initialized_conn):
-    """Test deleting a non-tracked file returns not_tracked."""
-    conn, db_path = initialized_conn
-    
-    result = handle_deleted_file(conn, "repo:test", "src/nonexistent.py")
-    
-    assert result["status"] == "not_tracked"
+        # Write syntax error and verify parse_failed preserves previous nodes
+        (repo_root / "src" / "module.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+        failed = reindex_changed_file(conn, repo_root, "src/module.py", cfg)
+        assert failed["status"] == "parse_failed"
+        nodes_after = conn.execute(
+            "SELECT id FROM nodes WHERE file_id = ? ORDER BY id", (file_id,)
+        ).fetchall()
+        assert [r["id"] for r in nodes_after] == [r["id"] for r in nodes_before]
 
+        # Traversal outside repo_root is rejected
+        outside = tmp_path / "outside.py"
+        outside.write_text("X = 1\n", encoding="utf-8")
+        err = reindex_changed_file(conn, repo_root, "../outside.py", cfg)
+        assert err["status"] == "error"
 
-# ==================== Reference Invalidation Tests ====================
+    def test_custom_db_path_persistence_in_watch_batching(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """make_watch_connection_factory + _process_watch_batch persists to custom --db-path."""
+        custom_db = tmp_path / "nested" / "custom_watch.db"
+        repo_root = tmp_path / "watch_repo"
+        repo_root.mkdir()
+        py_file = repo_root / "app.py"
+        py_file.write_text("def run():\n    return 42\n", encoding="utf-8")
 
-def test_reference_edges_for_changed_file_are_invalidated(initialized_conn):
-    """Test that reference edges with matching evidence_file_id are removed."""
-    conn, db_path = initialized_conn
-    file_id = _create_test_graph(conn)
-    
-    # Add a reference edge
-    conn.execute(
-        """
-        INSERT INTO edges (id, repo_id, kind, from_id, to_id, source, confidence,
-                          evidence_file_id, evidence_uri, evidence_range_json, payload_json, last_indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "edge:test:references:ref1",
-            "repo:test",
-            "references",
-            "sym:repo:test:function:other.func",
-            "sym:repo:test:function:src.module.hello",
-            "lsp",
-            0.9,
-            file_id,
-            "file:///test/src/module.py",
-            json.dumps({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}),
-            json.dumps({"mapping_mode": "exact"}),
-            "2024-01-01T00:00:00Z",
-        ),
-    )
-    conn.commit()
-    
-    # Invalidate
-    deleted = invalidate_reference_summaries_for_file(conn, file_id)
-    
-    assert deleted == 1
-    
-    # Verify edge is gone
-    cursor = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE kind = 'references' AND evidence_file_id = ?",
-        (file_id,),
-    )
-    assert cursor.fetchone()[0] == 0
+        init_conn = get_connection(custom_db)
+        try:
+            initialize_database(init_conn)
+        finally:
+            close_connection(init_conn)
 
+        cfg = AppConfig(db_path=custom_db)
+        events = normalize_event(
+            SimpleNamespace(event_type="created", src_path=str(py_file), is_directory=False),
+            repo_root,
+            cfg,
+        )
+        assert len(events) == 1
 
-def test_reference_availability_becomes_unavailable_after_invalidation(initialized_conn):
-    """Test that invalidated symbols report unavailable."""
-    conn, db_path = initialized_conn
-    file_id = _create_test_graph(conn)
-    
-    # Mark some symbols as available
-    conn.execute(
-        """
-        INSERT INTO reference_refresh (target_symbol_id, available, last_refreshed_at)
-        VALUES (?, 1, '2024-01-01T00:00:00Z')
-        """,
-        (f"sym:repo:test:function:src.module.hello",),
-    )
-    conn.commit()
-    
-    # Invalidate
-    mark_symbols_in_file_stale(conn, file_id)
-    conn.commit()
-    
-    # Verify availability is now 0
-    cursor = conn.execute(
-        "SELECT available FROM reference_refresh WHERE target_symbol_id = ?",
-        (f"sym:repo:test:function:src.module.hello",),
-    )
-    row = cursor.fetchone()
-    assert row is not None
-    assert row["available"] == 0
+        factory = make_watch_connection_factory(custom_db)
+        _process_watch_batch(factory, repo_root, events, cfg, verbose=False)
 
+        verify_conn = get_connection(custom_db, read_only=True)
+        try:
+            names = {
+                row["name"]
+                for row in verify_conn.execute("SELECT name FROM nodes").fetchall()
+            }
+            assert "run" in names
+        finally:
+            close_connection(verify_conn)
 
-# ==================== Parse Failure Tests ====================
+        # Ensure batch processing worked via process_event_batch too
+        py_file.unlink()
+        del_events = normalize_event(
+            SimpleNamespace(event_type="deleted", src_path=str(py_file), is_directory=False),
+            repo_root,
+            cfg,
+        )
+        write_conn = get_connection(custom_db)
+        try:
+            res = process_event_batch(write_conn, repo_root, del_events, cfg)
+            assert res[0]["status"] == "deleted"
+        finally:
+            close_connection(write_conn)
 
-def test_parse_failure_keeps_previous_graph_state(initialized_conn, test_repo, config):
-    """Test that temporary broken code doesn't erase previous valid nodes."""
-    conn, db_path = initialized_conn
-    _create_test_graph(conn)
-    
-    # Count nodes before
-    cursor = conn.execute("SELECT COUNT(*) FROM nodes WHERE file_id = 'file:src/module.py'")
-    nodes_before = cursor.fetchone()[0]
-    assert nodes_before > 0
-    
-    # Write broken Python file
-    py_file = test_repo / "src" / "module.py"
-    py_file.write_text("""
-def broken(:
-    this is not valid python
-""")
-    
-    result = reindex_changed_file(conn, test_repo, str(py_file), config)
-    
-    assert result["status"] == "parse_failed"
-    
-    # Verify previous graph state is preserved
-    cursor = conn.execute("SELECT COUNT(*) FROM nodes WHERE file_id = 'file:src/module.py'")
-    nodes_after = cursor.fetchone()[0]
-    assert nodes_after == nodes_before
+    def test_incremental_reindex_preserves_incoming_edges_and_resets_removed_symbol(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Re-indexing b.py preserves a.py incoming edges and resets removed targets cleanly."""
+        repo_root = tmp_path / "inc_repo"
+        repo_root.mkdir()
+        b_file = repo_root / "b.py"
+        b_file.write_text(
+            "def helper() -> int:\n    return 1\n\ndef keep() -> int:\n    return 2\n",
+            encoding="utf-8",
+        )
+        a_file = repo_root / "a.py"
+        a_file.write_text(
+            "from b import helper\n"
+            "from b import keep\n\n"
+            "def caller() -> int:\n"
+            "    return helper() + keep()\n",
+            encoding="utf-8",
+        )
 
+        db_path = tmp_path / "inc_edges.db"
+        cfg = AppConfig()
+        conn = get_connection(db_path)
+        try:
+            initialize_database(conn)
+            repo_id = derive_repo_id(repo_root)
+            a_file_id = derive_file_id(repo_id, "a.py")
 
-# ==================== Batch Processing Tests ====================
+            assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
+            assert reindex_changed_file(conn, repo_root, "a.py", cfg)["status"] == "reindexed"
 
-def test_process_event_batch_reindexes(initialized_conn, test_repo, config):
-    """Test that process_event_batch reindexes files."""
-    conn, db_path = initialized_conn
-    
-    # Create a new file
-    new_file = test_repo / "src" / "batch_test.py"
-    new_file.write_text("""
-def batch_func():
-    pass
-""")
-    
-    events = [
-        FileChangeEvent("created", str(new_file), "src/batch_test.py", True),
-    ]
-    
-    results = process_event_batch(conn, test_repo, events, config)
-    
-    assert len(results) == 1
-    assert results[0]["status"] == "reindexed"
-    assert results[0]["node_count"] > 0
+            helper_id = conn.execute(
+                "SELECT id FROM nodes WHERE name = 'helper' AND kind = 'function'"
+            ).fetchone()["id"]
+            keep_id = conn.execute(
+                "SELECT id FROM nodes WHERE name = 'keep' AND kind = 'function'"
+            ).fetchone()["id"]
+            caller_id = conn.execute(
+                "SELECT id FROM nodes WHERE name = 'caller' AND kind = 'function'"
+            ).fetchone()["id"]
 
+            # Seed an LSP reference edge from unmodified a.py -> b.helper
+            upsert_edges(
+                conn,
+                [
+                    {
+                        "id": f"edge:{repo_id}:references:caller->helper",
+                        "repo_id": repo_id,
+                        "kind": "references",
+                        "from_id": caller_id,
+                        "to_id": helper_id,
+                        "source": "lsp",
+                        "confidence": 0.9,
+                        "evidence_file_id": a_file_id,
+                        "evidence_uri": a_file.as_uri(),
+                        "payload_json": "{}",
+                        "last_indexed_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            )
+            conn.commit()
 
-def test_process_event_batch_deletes(initialized_conn, test_repo, config):
-    """Test that process_event_batch handles deletes."""
-    conn, db_path = initialized_conn
-    repo_id = f"repo:{test_repo.name}"
-    _create_test_graph(conn, repo_id=repo_id, file_path="src/module.py")
-    
-    events = [
-        FileChangeEvent("deleted", str(test_repo / "src" / "module.py"), "src/module.py", True),
-    ]
-    
-    results = process_event_batch(conn, test_repo, events, config)
-    
-    assert len(results) == 1
-    assert results[0]["status"] == "deleted"
+            # 1. Edit b.py while keeping helper & keep -> incoming a.py edges stay intact
+            b_file.write_text(
+                "def helper() -> int:\n    return 10\n\ndef keep() -> int:\n    return 2\n",
+                encoding="utf-8",
+            )
+            assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
 
+            incoming_kinds = {
+                row["kind"]
+                for row in conn.execute(
+                    """
+                    SELECT kind FROM edges
+                    WHERE repo_id = ? AND to_id = ? AND evidence_file_id = ?
+                    """,
+                    (repo_id, helper_id, a_file_id),
+                ).fetchall()
+            }
+            assert incoming_kinds == {"imports", "calls", "references"}
 
-# ==================== Rename Tests ====================
+            # 2. Remove helper from b.py -> a.py edges reset & dangling references pruned
+            b_file.write_text("def keep() -> int:\n    return 2\n", encoding="utf-8")
+            assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
 
-def test_rename_behaves_as_delete_plus_create(initialized_conn, test_repo, config):
-    """Test that rename is modeled as delete + create."""
-    conn, db_path = initialized_conn
-    repo_id = f"repo:{test_repo.name}"
-    _create_test_graph(conn, repo_id=repo_id, file_path="src/module.py")
-    
-    # Create the new file in the test repo
-    new_file = test_repo / "src" / "renamed.py"
-    new_file.write_text("""
-def renamed_func():
-    pass
-""")
-    
-    # Rename events: delete old, create new
-    events = [
-        FileChangeEvent("deleted", str(test_repo / "src" / "module.py"), "src/module.py", True),
-        FileChangeEvent("created", str(new_file), "src/renamed.py", True),
-    ]
-    
-    results = process_event_batch(conn, test_repo, events, config)
-    
-    assert len(results) == 2
-    statuses = {r["status"] for r in results}
-    assert "deleted" in statuses
+            a_edges = conn.execute(
+                "SELECT kind, to_id FROM edges WHERE repo_id = ? AND evidence_file_id = ?",
+                (repo_id, a_file_id),
+            ).fetchall()
+            by_kind_to = {(row["kind"], row["to_id"]) for row in a_edges}
+            assert ("imports", "external_or_unresolved:b.helper") in by_kind_to
+            assert ("calls", "unresolved_call:helper") in by_kind_to
+            assert ("imports", keep_id) in by_kind_to
+            assert ("calls", keep_id) in by_kind_to
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND kind = 'references'",
+                    (repo_id,),
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            close_connection(conn)

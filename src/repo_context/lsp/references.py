@@ -1,14 +1,28 @@
 """LSP reference enrichment orchestrator."""
 
+from __future__ import annotations
+
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
+from repo_context.config import get_config
+from repo_context.exceptions import LspError, PathSecurityError
 from repo_context.graph.references import build_reference_stats
-from repo_context.lsp.protocol import normalize_location
+from repo_context.logging_config import get_logger
+from repo_context.lsp.mapper import (
+    find_module_node_for_file,
+    normalize_location,
+    pick_smallest_containing_symbol,
+    position_codepoint_to_utf16,
+    range_utf16_to_codepoint,
+)
 from repo_context.lsp.resolver import get_reference_query_position, resolve_file_by_uri
-from repo_context.lsp.mapper import pick_smallest_containing_symbol, find_module_node_for_file
+from repo_context.parsing.pathing import ensure_safe_repo_file
 
+logger = get_logger("lsp.references")
 
 # Confidence levels
 CONFIDENCE_EXACT = 0.9
@@ -22,9 +36,9 @@ def build_reference_edge(
     confidence: float,
     evidence_file_id: str,
     evidence_uri: str,
-    evidence_range_json: dict,
-    payload_json: dict,
-) -> dict:
+    evidence_range_json: dict[str, Any],
+    payload_json: dict[str, Any],
+) -> dict[str, Any]:
     """Build a references edge dict.
 
     Edge ID format: edge:{repo_id}:references:{from_id}->{to_id}:{line}:{character}
@@ -47,47 +61,46 @@ def build_reference_edge(
     }
 
 
-def load_symbols_for_file(conn, file_id: str):
-    """Load all symbols for a file.
-
-    Args:
-        conn: SQLite connection.
-        file_id: File ID to load symbols for.
-
-    Returns:
-        List of symbol dicts.
-    """
+def load_symbols_for_file(conn: sqlite3.Connection, file_id: str) -> list[dict[str, Any]]:
+    """Load all symbols for a file."""
     cursor = conn.execute(
         "SELECT * FROM nodes WHERE file_id = ?",
         (file_id,),
     )
-    return [dict(row) for row in cursor.fetchall()]
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    if hasattr(rows[0], "keys"):
+        return [dict(row) for row in rows]
+    columns = [col[0] for col in cursor.description]
+    return [dict(zip(columns, row)) for row in rows]
 
 
-def replace_reference_edges_for_target(conn, target_symbol_id: str, edges: list, refresh_metadata: dict):
-    """Replace all reference edges for a target symbol transactionally.
+def _encode_json_once(value: Any, *, default_json: str | None = None) -> str | None:
+    """Serialize a dict/list to JSON once, preserving already-serialized strings."""
+    if value is None:
+        return default_json
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True)
 
-    Args:
-        conn: SQLite connection.
-        target_symbol_id: Target symbol ID.
-        edges: New reference edges to insert.
-        refresh_metadata: Metadata for refresh tracking.
-    """
-    try:
-        conn.execute("BEGIN")
+
+def replace_reference_edges_for_target(
+    conn: sqlite3.Connection,
+    target_symbol_id: str,
+    edges: list[dict[str, Any]],
+    refresh_metadata: dict[str, Any],
+) -> None:
+    """Replace all reference edges for a target symbol transactionally."""
+
+    def _apply() -> None:
         conn.execute(
             "DELETE FROM edges WHERE kind = 'references' AND to_id = ?",
             (target_symbol_id,),
         )
 
-        for edge in edges:
-            conn.execute(
-                """
-                INSERT INTO edges (
-                    id, repo_id, kind, from_id, to_id, source, confidence,
-                    evidence_file_id, evidence_uri, evidence_range_json, payload_json, last_indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+        if edges:
+            rows = [
                 (
                     edge["id"],
                     edge["repo_id"],
@@ -98,10 +111,21 @@ def replace_reference_edges_for_target(conn, target_symbol_id: str, edges: list,
                     edge["confidence"],
                     edge["evidence_file_id"],
                     edge["evidence_uri"],
-                    json.dumps(edge["evidence_range_json"]),
-                    json.dumps(edge["payload_json"]),
+                    _encode_json_once(edge.get("evidence_range_json")),
+                    _encode_json_once(edge.get("payload_json"), default_json="{}"),
                     edge["last_indexed_at"],
-                ),
+                )
+                for edge in edges
+            ]
+            conn.executemany(
+                """
+                INSERT INTO edges (
+                    id, repo_id, kind, from_id, to_id, source, confidence,
+                    evidence_file_id, evidence_uri, evidence_range_json,
+                    payload_json, last_indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
             )
 
         conn.execute(
@@ -117,72 +141,223 @@ def replace_reference_edges_for_target(conn, target_symbol_id: str, edges: list,
             """,
             (
                 refresh_metadata["target_symbol_id"],
-                refresh_metadata["available"],
+                int(bool(refresh_metadata["available"])),
                 refresh_metadata["last_refreshed_at"],
                 refresh_metadata.get("refresh_status"),
                 refresh_metadata.get("error_code"),
             ),
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+
+    if conn.in_transaction:
+        conn.execute("SAVEPOINT sp_replace_reference_edges")
+        try:
+            _apply()
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT sp_replace_reference_edges")
+            conn.execute("RELEASE SAVEPOINT sp_replace_reference_edges")
+            raise
+        conn.execute("RELEASE SAVEPOINT sp_replace_reference_edges")
+    else:
+        with conn:
+            _apply()
 
 
-def enrich_references_for_symbol(conn, lsp_client, target_symbol, open_all_files: bool = True):
+def _resolve_repo_root(conn: sqlite3.Connection, target_symbol: dict[str, Any]) -> Path:
+    """Resolve and verify the repository root for a target symbol."""
+    raw_root = target_symbol.get("repo_root")
+    if not raw_root and target_symbol.get("repo_id"):
+        row = conn.execute(
+            "SELECT root_path FROM repos WHERE id = ? LIMIT 1",
+            (target_symbol["repo_id"],),
+        ).fetchone()
+        if row is not None:
+            raw_root = row["root_path"] if hasattr(row, "keys") else row[0]
+
+    if not raw_root:
+        raise LspError(
+            f"Cannot determine repo_root for symbol {target_symbol.get('id', 'unknown')}.",
+            context={"symbol_id": target_symbol.get("id"), "repo_id": target_symbol.get("repo_id")},
+        )
+
+    repo_root_path = Path(raw_root).resolve()
+    if not repo_root_path.is_dir():
+        raise LspError(
+            f"Repository root directory does not exist: {repo_root_path}",
+            context={"repo_root": str(repo_root_path)},
+        )
+    return repo_root_path
+
+
+def _read_safe_repo_text(file_path: Path, max_bytes: int) -> str:
+    """Read UTF-8 text from a validated file while enforcing size bounds."""
+    try:
+        size_bytes = file_path.stat().st_size
+    except OSError as exc:
+        raise LspError(f"Unable to stat file {file_path}: {exc}") from exc
+
+    if size_bytes > max_bytes:
+        raise LspError(
+            f"File {file_path} ({size_bytes} bytes) exceeds max_file_size_bytes ({max_bytes}).",
+            context={"file_path": str(file_path), "size_bytes": size_bytes, "limit": max_bytes},
+        )
+
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LspError(f"Unable to read file {file_path}: {exc}") from exc
+
+
+def _send_did_open(lsp_client: Any, uri: str, text: str) -> None:
+    """Open or update a document on an LSP client or mock client."""
+    if hasattr(lsp_client, "did_open_or_change"):
+        lsp_client.did_open_or_change(uri, text)
+    else:
+        lsp_client.did_open(uri, text)
+
+
+def _load_file_lines_for_mapping(
+    repo_root: Path,
+    file_row: dict[str, Any],
+    max_bytes: int,
+    cache: dict[str, list[str] | None],
+) -> list[str] | None:
+    """Safely load lines for a referenced file to convert UTF-16 ranges when present on disk."""
+    file_id = file_row["id"]
+    if file_id in cache:
+        return cache[file_id]
+
+    rel_path = file_row.get("file_path")
+    if not rel_path:
+        cache[file_id] = None
+        return None
+
+    try:
+        safe_path = ensure_safe_repo_file(repo_root, repo_root / rel_path)
+        text = _read_safe_repo_text(safe_path, max_bytes)
+        lines = text.splitlines()
+    except (PathSecurityError, LspError):
+        lines = None
+
+    cache[file_id] = lines
+    return lines
+
+
+def enrich_references_for_symbol(
+    conn: sqlite3.Connection,
+    lsp_client: Any,
+    target_symbol: dict[str, Any],
+    *,
+    open_all_files: bool = False,
+) -> dict[str, Any]:
     """Enrich references for a single target symbol.
 
     Args:
         conn: SQLite connection.
-        lsp_client: PyrightLspClient instance.
-        target_symbol: Target symbol dict with keys: id, repo_id, file_id, file_path, uri, qualified_name, kind, scope, range_json, selection_range_json, repo_root.
-        open_all_files: If True (default), open all tracked .py files before requesting for better cross-file detection.
+        lsp_client: PyrightLspClient instance (or compatible mock).
+        target_symbol: Target symbol dict with id, repo_id, file_id, file_path,
+            uri, qualified_name, kind, scope, range_json, selection_range_json,
+            and optional repo_root.
+        open_all_files: If True, also open all tracked .py files in the repo;
+            defaults to False because Pyright indexes via rootUri.
 
     Returns:
         Reference stats dict from build_reference_stats.
     """
-    # Step 1: Resolve query position
+    cfg = get_config()
+
+    # Step 1: Resolve query position (in Python codepoint offsets)
     position = get_reference_query_position(target_symbol)
 
-    # Step 2: Ensure client started
-    repo_root = target_symbol.get("repo_root", str(Path.cwd()))
-    lsp_client.start(repo_root)
+    # Step 2: Resolve repo_root and validate target file path inside repo
+    repo_root_path = _resolve_repo_root(conn, target_symbol)
+    raw_file_path = target_symbol.get("file_path")
+    if not raw_file_path:
+        raise LspError(
+            f"Target symbol {target_symbol.get('id', 'unknown')} is missing file_path."
+        )
 
-    # Step 3: Open target file
-    target_path = Path(target_symbol["file_path"])
-    target_text = target_path.read_text(encoding="utf-8")
-    lsp_client.did_open(target_symbol["uri"], target_text)
+    candidate_path = repo_root_path / raw_file_path
+    try:
+        target_file_path = ensure_safe_repo_file(repo_root_path, candidate_path)
+    except PathSecurityError:
+        raise
+    except OSError as exc:
+        raise LspError(f"Target file is missing or inaccessible: {candidate_path}") from exc
 
-    # Step 4: Optionally open all tracked .py files
+    target_text = _read_safe_repo_text(target_file_path, cfg.max_file_size_bytes)
+    target_lines = target_text.splitlines()
+    query_position = position_codepoint_to_utf16(target_lines, position)
+
+    # Step 3: Ensure client started & open target document
+    lsp_client.start(str(repo_root_path))
+    target_uri = target_symbol.get("uri") or target_file_path.as_uri()
+    _send_did_open(lsp_client, target_uri, target_text)
+
+    # Step 4: Optionally open all tracked .py files in this repository
     if open_all_files:
-        rows = conn.execute("SELECT file_path, uri FROM files WHERE file_path LIKE '%.py'").fetchall()
+        rows = conn.execute(
+            "SELECT file_path, uri FROM files WHERE repo_id = ? AND file_path LIKE '%.py'",
+            (target_symbol["repo_id"],),
+        ).fetchall()
         for row in rows:
-            path = Path(row[0])
-            uri = row[1]
-            if not path.exists() or str(path) == str(target_path):
-                continue
-            lsp_client.did_open(uri, path.read_text(encoding="utf-8"))
+            rel_path = row["file_path"] if hasattr(row, "keys") else row[0]
+            uri = row["uri"] if hasattr(row, "keys") else row[1]
+            try:
+                safe_aux_path = ensure_safe_repo_file(repo_root_path, repo_root_path / rel_path)
+                if safe_aux_path == target_file_path:
+                    continue
+                aux_text = _read_safe_repo_text(safe_aux_path, cfg.max_file_size_bytes)
+                _send_did_open(lsp_client, uri, aux_text)
+            except (PathSecurityError, LspError, OSError) as exc:
+                logger.debug("Skipping auxiliary file %s during didOpen: %s", rel_path, exc)
 
-    # Step 5: Request references
-    locations = lsp_client.find_references(
-        target_symbol["uri"],
-        position["line"],
-        position["character"],
-        include_declaration=False,
-    ) or []
+    # Step 5: Request references from LSP server
+    locations = (
+        lsp_client.find_references(
+            target_uri,
+            query_position["line"],
+            query_position["character"],
+            include_declaration=False,
+        )
+        or []
+    )
 
-    # Steps 6-14: Map locations to symbols and build edges
-    edges = []
-    seen = set()
+    # Step 6: Map locations to symbols using per-call memoized caches
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, int, int]] = set()
+    file_by_uri_cache: dict[str, dict[str, Any] | None] = {}
+    symbols_by_file_cache: dict[str, list[dict[str, Any]]] = {}
+    file_lines_cache: dict[str, list[str] | None] = {target_symbol["file_id"]: target_lines}
+    repo_id = target_symbol["repo_id"]
 
     for loc in locations:
         normalized = normalize_location(loc)
-        file_row = resolve_file_by_uri(conn, normalized["uri"])
+        loc_uri = normalized["uri"]
+        if not loc_uri:
+            continue
+
+        if loc_uri not in file_by_uri_cache:
+            file_by_uri_cache[loc_uri] = resolve_file_by_uri(conn, loc_uri, repo_id=repo_id)
+        file_row = file_by_uri_cache[loc_uri]
         if not file_row:
             continue
 
-        symbols = load_symbols_for_file(conn, file_row["id"])
-        source_symbol = pick_smallest_containing_symbol(symbols, normalized["range"])
+        file_id = file_row["id"]
+        if file_id not in symbols_by_file_cache:
+            symbols_by_file_cache[file_id] = load_symbols_for_file(conn, file_id)
+        symbols = symbols_by_file_cache[file_id]
+
+        usage_range = normalized["range"]
+        lines = _load_file_lines_for_mapping(
+            repo_root_path,
+            file_row,
+            cfg.max_file_size_bytes,
+            file_lines_cache,
+        )
+        if lines is not None:
+            usage_range = range_utf16_to_codepoint(lines, usage_range)
+
+        source_symbol = pick_smallest_containing_symbol(symbols, usage_range)
         mapping_mode = "exact_symbol"
         confidence = CONFIDENCE_EXACT
 
@@ -194,27 +369,25 @@ def enrich_references_for_symbol(conn, lsp_client, target_symbol, open_all_files
         if source_symbol is None:
             continue
 
-        # Step 14: Deduplicate
         dedupe_key = (
             target_symbol["id"],
             source_symbol["id"],
-            normalized["uri"],
-            normalized["range"]["start"]["line"],
-            normalized["range"]["start"]["character"],
+            loc_uri,
+            usage_range["start"]["line"],
+            usage_range["start"]["character"],
         )
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
 
-        # Step 13: Build edge
         edge = build_reference_edge(
-            repo_id=target_symbol["repo_id"],
+            repo_id=repo_id,
             from_id=source_symbol["id"],
             to_id=target_symbol["id"],
             confidence=confidence,
-            evidence_file_id=file_row["id"],
-            evidence_uri=normalized["uri"],
-            evidence_range_json=normalized["range"],
+            evidence_file_id=file_id,
+            evidence_uri=loc_uri,
+            evidence_range_json=usage_range,
             payload_json={
                 "mapping_mode": mapping_mode,
                 "target_symbol_kind": target_symbol["kind"],
@@ -224,7 +397,6 @@ def enrich_references_for_symbol(conn, lsp_client, target_symbol, open_all_files
         )
         edges.append(edge)
 
-    # Steps 15-16: Replace edges and mark refresh
     refresh_metadata = {
         "target_symbol_id": target_symbol["id"],
         "available": True,
@@ -234,6 +406,4 @@ def enrich_references_for_symbol(conn, lsp_client, target_symbol, open_all_files
     }
 
     replace_reference_edges_for_target(conn, target_symbol["id"], edges, refresh_metadata)
-
-    # Step 17: Return stats
     return build_reference_stats(conn, target_symbol["id"])
