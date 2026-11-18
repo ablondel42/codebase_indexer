@@ -4,9 +4,9 @@ Sets up watchdog observer, routes raw events through normalization
 and scheduler, and processes incremental updates sequentially.
 """
 
+import json
 from pathlib import Path
 import sqlite3
-import sys
 import time
 from typing import Any, Callable
 
@@ -129,14 +129,33 @@ def watch_repo(
     observer.schedule(handler, str(repo_root), recursive=True)
     observer.start()
 
-    print(f"Watching {repo_root} for file changes (debounce={debounce_ms}ms)", file=sys.stderr)
-    print("Press Ctrl+C to stop.", file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "event": "watch_started",
+                "repo_root": str(repo_root),
+                "db_path": str(resolved_db_path),
+                "debounce_ms": debounce_ms,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping watch mode...", file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "event": "watch_stopped",
+                    "repo_root": str(repo_root),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
     finally:
         observer.stop()
         observer.join()
@@ -161,59 +180,36 @@ def _process_watch_batch(
             file_path = result.get("file_path", "unknown")
 
             if status == "reindexed":
-                node_count = result.get("node_count", 0)
-                edge_count = result.get("edge_count", 0)
-                invalidated = result.get("invalidated_reference_edge_count", 0)
-                msg = (
-                    f"✓ Reindexed: {file_path} "
-                    f"({node_count} nodes, {edge_count} edges, {invalidated} refs invalidated)"
-                )
-                print(msg, file=sys.stderr)
                 if verbose:
                     logger.info(
                         "File reindexed",
                         extra={
                             "file_path": file_path,
-                            "node_count": node_count,
-                            "edge_count": edge_count,
-                            "invalidated_refs": invalidated,
+                            "node_count": result.get("node_count", 0),
+                            "edge_count": result.get("edge_count", 0),
+                            "invalidated_refs": result.get("invalidated_reference_edge_count", 0),
                         },
                     )
-
             elif status == "deleted":
-                deleted_nodes = result.get("deleted_node_count", 0)
-                deleted_edges = result.get("deleted_edge_count", 0)
-                invalidated_symbols = result.get("invalidated_target_symbol_count", 0)
-                msg = (
-                    f"✗ Deleted: {file_path} "
-                    f"({deleted_nodes} nodes, {deleted_edges} edges removed, "
-                    f"{invalidated_symbols} symbols invalidated)"
-                )
-                print(msg, file=sys.stderr)
                 if verbose:
                     logger.info(
                         "File deleted",
                         extra={
                             "file_path": file_path,
-                            "deleted_nodes": deleted_nodes,
-                            "deleted_edges": deleted_edges,
-                            "invalidated_symbols": invalidated_symbols,
+                            "deleted_nodes": result.get("deleted_node_count", 0),
+                            "deleted_edges": result.get("deleted_edge_count", 0),
+                            "invalidated_symbols": result.get("invalidated_target_symbol_count", 0),
                         },
                     )
-
             elif status == "parse_failed":
-                msg = f"⚠ Parse failed: {file_path} (previous graph preserved)"
-                print(msg, file=sys.stderr)
                 logger.warning("File parse failed during watch", extra={"file_path": file_path})
-
-            elif status == "skipped":
-                if verbose:
-                    print(f"↷ Skipped: {file_path}", file=sys.stderr)
-
             elif status == "error":
-                msg = f"✗ Error: {file_path} (previous graph preserved)"
-                print(msg, file=sys.stderr)
                 logger.error("File indexing error during watch", extra={"file_path": file_path})
+
+            if status == "skipped" and not verbose:
+                continue
+
+            print(json.dumps({"event": "file_processed", **result}, indent=2), flush=True)
 
     finally:
         close_connection(conn)

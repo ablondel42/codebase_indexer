@@ -187,7 +187,6 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
                 json_args,
                 "--db-path",
                 str(db_path),
-                "--json",
             ],
             capture_output=True,
             text=True,
@@ -211,7 +210,6 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
             "get_repo_overview",
             "--db-path",
             str(missing_db),
-            "--json",
         ],
         capture_output=True,
         text=True,
@@ -252,7 +250,6 @@ def test_cli_mcp_call_shorthand_and_key_value_args(
                 *extra_args,
                 "--db-path",
                 str(db_path),
-                "--json",
             ],
             capture_output=True,
             text=True,
@@ -281,4 +278,7 @@ def test_cli_mcp_call_shorthand_and_key_value_args(
         env=env,
     )
     assert bad_json.returncode == 1
-    assert "Invalid JSON arguments" in bad_json.stderr
+    bad_err = json.loads(bad_json.stderr)
+    assert bad_err["ok"] is False
+    assert bad_err["error"]["code"] == "validation_error"
+    assert "Invalid JSON arguments" in bad_err["error"]["message"]

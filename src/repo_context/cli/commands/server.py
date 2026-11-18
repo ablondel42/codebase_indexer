@@ -7,10 +7,8 @@ import asyncio
 import json
 from pathlib import Path
 import re
-import sys
 from typing import Any, Callable, Coroutine
 
-from repo_context.cli.formatting import estimate_tokens, print_json
 from repo_context.cli.utils import resolve_db_path
 from repo_context.config import get_config
 from repo_context.exceptions import ValidationError
@@ -178,20 +176,17 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
 
     if tool_name not in _MCP_TOOL_REGISTRY:
         available = ", ".join(_MCP_TOOL_REGISTRY.keys())
-        print(
-            f"Error: Unknown MCP tool {tool_name!r}. Available tools: {available}",
-            file=sys.stderr,
+        raise ValidationError(
+            f"Unknown MCP tool {tool_name!r}. Available tools: {available}",
+            context={"tool": tool_name},
         )
-        return 1
 
     try:
         parsed_args = _parse_mcp_call_args(tool_name, raw_tokens)
     except json.JSONDecodeError as exc:
-        print(f"Error: Invalid JSON arguments: {exc}", file=sys.stderr)
-        return 1
+        raise ValidationError(f"Invalid JSON arguments: {exc}") from exc
     except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        raise ValidationError(str(exc)) from exc
 
     handler = _MCP_TOOL_REGISTRY[tool_name]
     kwargs = _normalize_tool_kwargs(
@@ -205,31 +200,32 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
     try:
         raw_response = asyncio.run(handler(**kwargs))
     except TypeError as exc:
-        print(f"Error: Invalid arguments for {tool_name}: {exc}", file=sys.stderr)
-        return 1
+        raise ValidationError(
+            f"Invalid arguments for {tool_name}: {exc}",
+            context={"tool": tool_name},
+        ) from exc
     finally:
         if tool_name == "get_symbol_references" and kwargs.get("refresh_lsp"):
             close_default_lsp_pool()
 
-    byte_size, est_tokens = estimate_tokens(raw_response)
+    byte_size = len(raw_response.encode("utf-8"))
+    est_tokens = max(1, (byte_size + 3) // 4) if byte_size > 0 else 0
     try:
         parsed_response = json.loads(raw_response)
     except json.JSONDecodeError:
         parsed_response = {"raw": raw_response}
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "tool": tool_name,
                 "bytes": byte_size,
                 "estimated_tokens": est_tokens,
                 "result": parsed_response,
-            }
+            },
+            indent=2,
         )
-    else:
-        print(f"MCP Tool: {tool_name}")
-        print(f"Payload: {byte_size} bytes (~{est_tokens} tokens)")
-        print_json(parsed_response)
+    )
 
     if isinstance(parsed_response, dict) and parsed_response.get("ok") is False:
         return 1

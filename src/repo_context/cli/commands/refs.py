@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +25,6 @@ from repo_context.storage import (
     get_repo_by_id,
     initialize_database,
     resolve_repo_id,
-)
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_key_value_section,
-    format_location,
-    print_json,
 )
 from repo_context.cli.utils import (
     extract_edge_line,
@@ -182,7 +177,7 @@ def cmd_refs(args: argparse.Namespace) -> int:
             site_location = (
                 f"{file_path}:{line_num}"
                 if file_path and line_num is not None
-                else (file_path or (f"line {line_num}" if line_num is not None else "-"))
+                else (file_path or (f"line {line_num}" if line_num is not None else None))
             )
             entries.append(
                 {
@@ -223,53 +218,5 @@ def cmd_refs(args: argparse.Namespace) -> int:
         "references": entries,
     }
 
-    if getattr(args, "json", False):
-        print_json(payload)
-        return 0
-
-    header = format_key_value_section(
-        "Symbol References",
-        [
-            ("ID", target_summary["id"]),
-            ("Kind", target_summary["kind"]),
-            ("Qualified Name", target_summary["qualified_name"]),
-            (
-                "Location",
-                format_location(
-                    target_summary["file_path"],
-                    lines=target_summary["lines"],
-                ),
-            ),
-            ("Signature", target_summary["signature"] or target["name"]),
-            ("Direction", direction),
-            ("Reference Source", stats.get("reference_source", "-")),
-            ("Reference Count", stats.get("reference_count", 0)),
-            ("Referencing Files", stats.get("referencing_file_count", 0)),
-            ("Referencing Modules", stats.get("referencing_module_count", 0)),
-            ("LSP Available", stats.get("available", False)),
-            ("Last Refreshed", stats.get("last_refreshed_at") or "-"),
-        ],
-    )
-    table = format_ascii_table(
-        ["Dir", "Kind", "Peer ID", "Peer", "Location", "Conf", "Preview"],
-        [
-            [
-                e["direction"],
-                e["kind"],
-                e["peer_id"],
-                e["peer_name"],
-                e["location"],
-                e["confidence"],
-                e["preview"] or "-",
-            ]
-            for e in entries
-        ],
-        max_col_widths=[9, 11, None, 36, None, 6, 60],
-        empty_message="(no matching references or dependency edges)",
-    )
-    print(f"{header}\n\n{table}")
-    if total_count > len(entries) or offset > 0:
-        start_idx = offset + 1 if entries else 0
-        end_idx = offset + len(entries)
-        print(f"Showing {start_idx}-{end_idx} of {total_count} edge(s).")
+    print(json.dumps(payload, indent=2))
     return 0

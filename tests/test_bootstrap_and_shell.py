@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -98,10 +99,10 @@ def test_interactive_shell_commands_and_error_recovery(
     assert _run_shell(db_path) == 0
     captured = capsys.readouterr()
     assert "Interactive rc shell" in captured.out
-    assert "Database Status" in captured.out
+    assert '"schema_ok": true' in captured.out
     assert "def hello(name: str) -> str" in captured.out
-    assert 'return f"hi {name}"' in captured.out
-    assert "MCP Tool: get_symbol_context" in captured.out
+    assert 'return f\\"hi {name}\\"' in captured.out
+    assert '"tool": "get_symbol_context"' in captured.out
     assert '"qualified_name": "pkg.greeter.hello"' in captured.out
     assert "not authorized" in captured.err
     assert "Already inside rc shell." in captured.err
@@ -122,7 +123,8 @@ def test_root_rc_modes_and_tests_runner(tmp_path: Path) -> None:
 
     no_cli = _run_root_rc(str(repo_root), "--no-cli", "--db-path", str(db_path))
     assert no_cli.returncode == 0, no_cli.stderr
-    assert "Index Summary" in no_cli.stdout
+    no_cli_data = json.loads(no_cli.stdout)
+    assert no_cli_data["files_indexed"] == 2
     assert "Interactive rc shell" not in no_cli.stdout
 
     for extra in ((), ("--cli",)):
@@ -147,7 +149,8 @@ def test_root_rc_modes_and_tests_runner(tmp_path: Path) -> None:
 
     fwd = _run_root_rc("db", "tables", "--db-path", str(demo_db))
     assert fwd.returncode == 0, fwd.stderr
-    assert "reference_refresh" in fwd.stdout
+    fwd_tables = json.loads(fwd.stdout)["tables"]
+    assert any(t["table"] == "reference_refresh" for t in fwd_tables)
 
     tests_res = _run_root_rc("tests", "-k", "test_import_package_version")
     assert tests_res.returncode == 0, tests_res.stderr

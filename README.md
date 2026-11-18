@@ -44,7 +44,7 @@ Local Repo
 
 6. **Token-Lean MCP Server & `rc` CLI (`repo_context.mcp`, `repo_context.cli`)**
    - Exposes 8 compact MCP tools over `stdio` without polluting `stdout` (all logs are directed strictly to `stderr`).
-   - Provides the grouped `rc` CLI (`--db-path`, `--json` supported on root or subcommands).
+   - Provides the grouped `rc` CLI outputting indented JSON objects by default (`--db-path` supported on root or subcommands).
 
 ---
 
@@ -86,7 +86,7 @@ Inspect database health, schema version, table counts, and latest run:
 rc db status
 ```
 
-Inspect a file outline tree (with symbol IDs, line ranges, kinds, and signatures):
+Inspect a file outline (with symbol IDs, line ranges, kinds, and signatures):
 
 ```bash
 rc outline src/repo_context/cli/main.py
@@ -121,7 +121,7 @@ rc mcp-call search_symbols '{"query": "resolve_repo_edges", "limit": 5}'
 
 ## CLI Reference (`rc`)
 
-Global flags `--db-path PATH` and `--json` work either before or after subcommands (e.g., `rc --db-path custom.db db status --json`).
+All CLI commands emit indented JSON objects to `stdout` (and structured JSON error objects to `stderr`). The global `--db-path PATH` flag works either before or after subcommands (e.g., `rc --db-path custom.db db status`).
 
 | Command | Purpose |
 | --- | --- |
@@ -132,7 +132,7 @@ Global flags `--db-path PATH` and `--json` work either before or after subcomman
 | `rc db runs [--repo] [--limit 20]` | List recent `index_runs` entries |
 | `rc db sql <query> [--limit 100]` | Execute a read-only SQL query guarded by SQLite's SELECT-only authorizer |
 | `rc files [pattern] [--repo] [--include-tests] [--limit 50]` | List tracked files with line count, symbol count, and live disk freshness (`fresh`/`modified`/`deleted`) |
-| `rc outline <file_path> [--repo] [--no-private] [--max-depth 3]` | Print indented symbol outline tree for a file |
+| `rc outline <file_path> [--repo] [--no-private] [--max-depth 3]` | Show hierarchical symbol outline for a file |
 | `rc symbols search <query> [--repo] [--kind] [--file] [--limit 20]` | Search symbols using FTS5 + ranking |
 | `rc symbols list [--repo] [--kind] [--file] [--limit 50] [--offset 0]` | Browse symbols with pagination |
 | `rc symbols show <id_or_name> [--repo] [--source]` | Inspect full symbol context (+ optional source snippet) |

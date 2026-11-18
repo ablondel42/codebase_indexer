@@ -4,16 +4,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
 
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_bytes,
-    format_key_value_section,
-    print_json,
-)
 from repo_context.cli.utils import resolve_db_path
 from repo_context.exceptions import DatabaseError, RepoContextError, ValidationError
 from repo_context.logging_config import get_logger
@@ -291,7 +286,7 @@ def _build_status_payload(
     lsp_coverage: dict[str, Any],
     latest_run: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Assemble the unified status payload used for JSON and ASCII output."""
+    """Assemble the database status payload."""
     repo_summary: dict[str, Any] | None = None
     if selected_repo is not None:
         repo_summary = {
@@ -314,92 +309,6 @@ def _build_status_payload(
         "lsp_coverage": lsp_coverage,
         "latest_run": latest_run,
     }
-
-
-def _format_status_overview(payload: dict[str, Any]) -> str:
-    """Format the top-level ``Database Status`` key-value section."""
-    size_bytes = payload["size_bytes"]
-    user_version = payload["user_version"]
-    expected_version = payload["expected_schema_version"]
-    selected_repo = payload["selected_repo"]
-    lsp_coverage = payload["lsp_coverage"]
-
-    overview_items: list[tuple[str, Any]] = [
-        ("Database", payload["db_path"]),
-        ("Size", f"{format_bytes(size_bytes)} ({size_bytes} bytes)"),
-        ("Schema Version", f"v{user_version} (expected v{expected_version})"),
-        ("Indexed Repos", payload["repo_count"]),
-    ]
-    if selected_repo is not None:
-        overview_items.extend(
-            [
-                ("Active Repo", f"{selected_repo['name']} ({selected_repo['id']})"),
-                ("Root Path", selected_repo["root_path"]),
-                ("Last Indexed", selected_repo["last_indexed_at"] or "-"),
-            ]
-        )
-    elif not payload["schema_ok"]:
-        overview_items.append(("Notice", "Schema mismatch; run `rc index` to upgrade."))
-
-    overview_items.append(
-        (
-            "LSP Coverage",
-            f"{lsp_coverage['refreshed_symbols']}/{lsp_coverage['non_module_symbols']} symbols "
-            f"({lsp_coverage['coverage_pct']}%), {lsp_coverage['lsp_reference_edges']} reference edges",
-        )
-    )
-    return format_key_value_section("Database Status", overview_items)
-
-
-def _format_latest_run_section(latest_run: dict[str, Any] | None) -> str:
-    """Format the ``Latest Index Run`` section."""
-    if latest_run is None:
-        return "Latest Index Run\n----------------\n  (none)"
-
-    return format_key_value_section(
-        "Latest Index Run",
-        [
-            ("Run ID", latest_run["id"]),
-            ("Repo ID", latest_run["repo_id"]),
-            ("Type", latest_run["run_type"]),
-            ("Status", latest_run["status"]),
-            ("Files Scanned", latest_run["files_scanned"]),
-            ("Nodes Extracted", latest_run["nodes_extracted"]),
-            ("Edges Extracted", latest_run["edges_extracted"]),
-            ("Started", latest_run["started_at"]),
-            ("Completed", latest_run["completed_at"] or "-"),
-            ("Error", latest_run["error_message"] or "-"),
-        ],
-    )
-
-
-def _format_status_report(payload: dict[str, Any]) -> str:
-    """Render the full multi-section ASCII ``rc db status`` report."""
-    tables = payload["tables"]
-    edge_counts = payload["edge_counts_by_kind"]
-
-    sections = [
-        _format_status_overview(payload),
-        "",
-        "Table Row Counts",
-        "----------------",
-        format_ascii_table(
-            ["Table", "Rows"],
-            [[t["table"], t["row_count"]] for t in tables],
-            alignments=["left", "right"],
-        ),
-        "",
-        "Edges by Kind",
-        "-------------",
-        format_ascii_table(
-            ["Kind", "Count"],
-            [[kind, count] for kind, count in edge_counts.items()],
-            alignments=["left", "right"],
-        ),
-        "",
-        _format_latest_run_section(payload["latest_run"]),
-    ]
-    return "\n".join(sections)
 
 
 def cmd_db_status(args: argparse.Namespace) -> int:
@@ -437,12 +346,7 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         lsp_coverage=lsp_coverage,
         latest_run=latest_run,
     )
-
-    if getattr(args, "json", False):
-        print_json(payload)
-        return 0
-
-    print(_format_status_report(payload))
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -504,30 +408,7 @@ def cmd_db_repos(args: argparse.Namespace) -> int:
     with connection_scope(db_path, read_only=True) as conn:
         items = _collect_repo_summaries(conn)
 
-    if getattr(args, "json", False):
-        print_json({"db_path": str(db_path), "repos": items})
-        return 0
-
-    print(
-        format_ascii_table(
-            ["ID", "Name", "Root Path", "Files", "Nodes", "Edges", "Last Indexed"],
-            [
-                [
-                    item["id"],
-                    item["name"],
-                    item["root_path"],
-                    item["files"],
-                    item["nodes"],
-                    item["edges"],
-                    item["last_indexed_at"] or "-",
-                ]
-                for item in items
-            ],
-            max_col_widths=[None, 24, None, 8, 8, 8, 28],
-            alignments=["left", "left", "left", "right", "right", "right", "left"],
-            empty_message="(no repositories indexed)",
-        )
-    )
+    print(json.dumps({"db_path": str(db_path), "repos": items}, indent=2))
     return 0
 
 
@@ -540,22 +421,14 @@ def cmd_db_tables(args: argparse.Namespace) -> int:
         user_version = _read_schema_version(conn)
         tables = _list_table_counts(conn)
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "db_path": str(db_path),
                 "user_version": user_version,
                 "tables": tables,
-            }
-        )
-        return 0
-
-    print(f"Database: {db_path} (user_version={user_version})")
-    print(
-        format_ascii_table(
-            ["Table", "Rows"],
-            [[t["table"], t["row_count"]] for t in tables],
-            alignments=["left", "right"],
+            },
+            indent=2,
         )
     )
     return 0
@@ -584,33 +457,7 @@ def cmd_db_runs(args: argparse.Namespace) -> int:
             context={"db_path": str(db_path), "repo": repo_arg},
         ) from exc
 
-    if getattr(args, "json", False):
-        print_json({"db_path": str(db_path), "repo_id": repo_id, "runs": runs})
-        return 0
-
-    print(
-        format_ascii_table(
-            ["Run ID", "Repo ID", "Type", "Status", "Files", "Nodes", "Edges", "Started", "Completed", "Error"],
-            [
-                [
-                    r["id"],
-                    r["repo_id"],
-                    r["run_type"],
-                    r["status"],
-                    r["files_scanned"],
-                    r["nodes_extracted"],
-                    r["edges_extracted"],
-                    r["started_at"],
-                    r["completed_at"] or "-",
-                    r["error_message"] or "-",
-                ]
-                for r in runs
-            ],
-            max_col_widths=[None, None, 12, 12, 7, 7, 7, 26, 26, 36],
-            alignments=["left", "left", "left", "left", "right", "right", "right", "left", "left", "left"],
-            empty_message="(no index runs recorded)",
-        )
-    )
+    print(json.dumps({"db_path": str(db_path), "repo_id": repo_id, "runs": runs}, indent=2))
     return 0
 
 
@@ -641,30 +488,17 @@ def cmd_db_sql(args: argparse.Namespace) -> int:
             context={"db_path": str(db_path)},
         ) from exc
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "db_path": str(db_path),
                 "columns": columns,
                 "row_count": len(rows),
                 "truncated": truncated,
                 "rows": [dict(zip(columns, row)) for row in rows],
-            }
-        )
-        return 0
-
-    if not columns:
-        print("(query executed; 0 columns returned)")
-        return 0
-
-    print(
-        format_ascii_table(
-            columns,
-            rows,
-            max_col_widths=[60] * len(columns),
-            empty_message="(0 rows)",
+            },
+            indent=2,
+            default=str,
         )
     )
-    if truncated:
-        print(f"(truncated to --limit {limit} rows)")
     return 0

@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 import json
+import logging
 import os
 from pathlib import Path
 import shlex
 import sqlite3
 import sys
+from typing import Any
 
 from repo_context import __version__
 from repo_context.constants import VALID_SYMBOL_KINDS
 from repo_context.exceptions import DatabaseNotFoundError, RepoContextError
+import repo_context.logging_config as logging_config
 from repo_context.logging_config import get_logger, setup_logging
 from repo_context.storage import connection_scope, list_repos, resolve_repo_id
 from repo_context.cli.commands import (
@@ -35,7 +38,6 @@ from repo_context.cli.commands import (
     cmd_symbols_show,
     cmd_watch,
 )
-from repo_context.cli.formatting import format_ascii_table, format_location
 from repo_context.cli.utils import resolve_db_path
 
 _KNOWN_COMMANDS = frozenset(
@@ -69,12 +71,6 @@ def _make_subcommand_common_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Path to SQLite database file (default: repo_context.db)",
     )
-    common.add_argument(
-        "--json",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Output result as JSON",
-    )
     return common
 
 
@@ -96,12 +92,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Path to SQLite database file (default: repo_context.db)",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        default=False,
-        help="Output result as JSON",
     )
     parser.add_argument(
         "--verbose",
@@ -232,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     outline_parser = subparsers.add_parser(
         "outline",
         parents=[sub_common],
-        help="Print indented symbol outline tree for an indexed file",
+        help="Show hierarchical symbol outline for an indexed file",
     )
     outline_parser.add_argument("file_path", type=str, help="Repository-relative file path")
     outline_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
@@ -429,41 +419,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_ambiguous_candidates(exc: RepoContextError) -> None:
-    """Print disambiguation table to stderr when symbol lookup is ambiguous."""
-    candidates = (exc.context or {}).get("candidates")
-    if not candidates:
-        return
-    table = format_ascii_table(
-        ["ID", "Kind", "Location", "Qualified Name"],
-        [
-            [
-                c.get("id"),
-                c.get("kind"),
-                format_location(c.get("file_path"), lines=c.get("lines")),
-                c.get("qualified_name"),
-            ]
-            for c in candidates
-        ],
-        max_col_widths=[None, 18, None, 48],
-    )
-    print(f"Matching candidates (re-run with exact sym:... ID):\n{table}", file=sys.stderr)
+def _print_cli_error(
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    """Write an indented JSON error object to stderr."""
+    payload = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details,
+        },
+    }
+    print(json.dumps(payload, indent=2), file=sys.stderr)
 
 
 def dispatch_args(args: argparse.Namespace) -> int:
-    """Execute parsed CLI arguments with consistent structured error handling."""
+    """Execute parsed CLI arguments with consistent structured JSON error handling."""
     try:
         return int(args.func(args))
     except DatabaseNotFoundError as exc:
-        print(f"Error: {exc}. Run `rc index` first.", file=sys.stderr)
+        _print_cli_error(
+            exc.error_code,
+            f"{exc}. Run `rc index` first.",
+            details=exc.context,
+        )
         return 1
     except RepoContextError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        if exc.error_code == "ambiguous_symbol":
-            _print_ambiguous_candidates(exc)
+        _print_cli_error(exc.error_code, exc.message, details=exc.context)
         return 1
     except (FileNotFoundError, NotADirectoryError, sqlite3.Error, json.JSONDecodeError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        _print_cli_error("error", str(exc))
         return 1
     except BrokenPipeError:
         try:
@@ -476,11 +464,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             pass
         return 0
     except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
+        _print_cli_error("interrupted", "Interrupted.")
         return 130
     except Exception as exc:
         logger.exception("CLI command failed")
-        print(f"Error: {exc}", file=sys.stderr)
+        _print_cli_error("internal_error", str(exc))
         return 1
 
 
@@ -495,7 +483,7 @@ def _preprocess_argv(tokens: list[str]) -> list[str]:
     is_demo = first == "demo"
     target = "." if is_demo else first
     rest = tokens[1:]
-    use_shell = "--no-cli" not in rest and "--json" not in rest
+    use_shell = "--no-cli" not in rest
     cleaned = [t for t in rest if t not in ("--cli", "--no-cli")]
 
     out = ["index", target]
@@ -547,7 +535,7 @@ def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
         try:
             tokens = shlex.split(stripped)
         except ValueError as exc:
-            print(f"Parse error: {exc}", file=sys.stderr)
+            _print_cli_error("parse_error", str(exc))
             continue
         if tokens[0] == "rc" and len(tokens) > 1:
             tokens = tokens[1:]
@@ -557,7 +545,7 @@ def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
             parser.print_help()
             continue
         if tokens[0] == "shell":
-            print("Already inside rc shell.", file=sys.stderr)
+            _print_cli_error("invalid_command", "Already inside rc shell.")
             continue
 
         if (
@@ -601,10 +589,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(_preprocess_argv(raw_argv))
 
     is_debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
-    setup_logging(level="DEBUG" if is_debug else "WARNING")
+    if is_debug:
+        if not logging_config.LOGGING_INITIALIZED:
+            setup_logging(level="DEBUG")
+    else:
+        root_logger = logging.getLogger("repo_context")
+        if not root_logger.handlers:
+            root_logger.addHandler(logging.NullHandler())
 
     rc = dispatch_args(args)
-    if rc == 0 and getattr(args, "shell", False) and not getattr(args, "json", False):
+    if rc == 0 and getattr(args, "shell", False):
         repo_arg = getattr(args, "repo_path", None)
         return _run_shell(
             resolve_db_path(args),

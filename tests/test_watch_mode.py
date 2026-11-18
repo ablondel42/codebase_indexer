@@ -1,6 +1,7 @@
 """Tests for watch mode event normalization, scheduler, deletion cleanup, and persistence."""
 
 from collections.abc import Iterator
+import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -321,8 +322,9 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
     def test_custom_db_path_persistence_in_watch_batching(
         self,
         tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """make_watch_connection_factory + _process_watch_batch persists to custom --db-path."""
+        """make_watch_connection_factory + _process_watch_batch persists to custom --db-path and emits JSON."""
         custom_db = tmp_path / "nested" / "custom_watch.db"
         repo_root = tmp_path / "watch_repo"
         repo_root.mkdir()
@@ -345,6 +347,10 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
 
         factory = make_watch_connection_factory(custom_db)
         _process_watch_batch(factory, repo_root, events, cfg, verbose=False)
+        watch_out = json.loads(capsys.readouterr().out)
+        assert watch_out["event"] == "file_processed"
+        assert watch_out["status"] == "reindexed"
+        assert watch_out["file_path"] == "app.py"
 
         verify_conn = get_connection(custom_db, read_only=True)
         try:

@@ -34,25 +34,28 @@ def _reset_logging() -> None:
     logging_config.LOGGING_INITIALIZED = False
 
 
-def test_build_parser_supports_root_and_trailing_global_flags(tmp_path: Path) -> None:
-    """--db-path and --json work both before and after subcommands."""
+def test_build_parser_supports_root_and_trailing_db_path_and_rejects_json_flag(
+    tmp_path: Path,
+) -> None:
+    """--db-path works before and after subcommands; legacy --json flag is rejected."""
     parser = build_parser()
     db_file = tmp_path / "custom.db"
 
-    ns_before = parser.parse_args(["--db-path", str(db_file), "--json", "db", "status"])
+    ns_before = parser.parse_args(["--db-path", str(db_file), "db", "status"])
     assert ns_before.db_path == db_file
-    assert ns_before.json is True
 
-    ns_after = parser.parse_args(["db", "status", "--db-path", str(db_file), "--json"])
+    ns_after = parser.parse_args(["db", "status", "--db-path", str(db_file)])
     assert ns_after.db_path == db_file
-    assert ns_after.json is True
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["db", "status", "--json"])
 
 
 def test_missing_db_path_fails_without_creating_zero_byte_file(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Read-only CLI commands fail cleanly on missing --db-path and create ZERO files on disk."""
+    """Read-only CLI commands fail with JSON error on missing --db-path and create ZERO files."""
     missing_db = tmp_path / "does_not_exist.db"
     invocations = [
         ["db", "status", "--db-path", str(missing_db)],
@@ -73,19 +76,27 @@ def test_missing_db_path_fails_without_creating_zero_byte_file(
         rc = main(argv)
         assert rc == 1
         assert not missing_db.exists(), f"{argv} created {missing_db}!"
-    captured = capsys.readouterr()
-    assert "rc index" in captured.err
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        err = json.loads(captured.err)
+        assert err["ok"] is False
+        assert err["error"]["code"] == "database_not_found"
+        assert "rc index" in err["error"]["message"]
 
 
-def test_symbols_show_module_with_none_structural_parent_ascii_and_json(
+def test_symbols_show_module_with_none_structural_parent_and_ambiguous_json_error(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`rc symbols show` prints untruncated sym:... IDs and handles structural_parent=None cleanly."""
+    """`rc symbols show` outputs JSON by default and emits structured candidates on ambiguity."""
     repo_root = tmp_path / "sample"
     repo_root.mkdir()
     (repo_root / "mod.py").write_text(
         '"""Sample module."""\n\ndef greet(name: str) -> str:\n    return name\n',
+        encoding="utf-8",
+    )
+    (repo_root / "other.py").write_text(
+        '"""Other module."""\n\ndef greet(name: str) -> str:\n    return name\n',
         encoding="utf-8",
     )
     db_path = tmp_path / "cli.db"
@@ -100,17 +111,20 @@ def test_symbols_show_module_with_none_structural_parent_ascii_and_json(
             replace_file_graph(conn, f.id, nodes, edges)
         conn.commit()
         mod_id = conn.execute(
-            "SELECT id FROM nodes WHERE kind = 'module' LIMIT 1"
+            "SELECT id FROM nodes WHERE kind = 'module' ORDER BY id LIMIT 1"
         ).fetchone()["id"]
     finally:
         close_connection(conn)
 
     assert main(["symbols", "show", mod_id, "--db-path", str(db_path)]) == 0
-    ascii_out = capsys.readouterr().out
-    assert mod_id in ascii_out
-    assert "Structural Parent : None" in ascii_out
-
-    assert main(["symbols", "show", mod_id, "--db-path", str(db_path), "--json"]) == 0
     json_out = json.loads(capsys.readouterr().out)
     assert json_out["focus_symbol"]["id"] == mod_id
     assert json_out["structural_parent"] is None
+
+    assert main(["symbols", "show", "greet", "--db-path", str(db_path)]) == 1
+    ambig_captured = capsys.readouterr()
+    assert ambig_captured.out == ""
+    ambig_err = json.loads(ambig_captured.err)
+    assert ambig_err["ok"] is False
+    assert ambig_err["error"]["code"] == "ambiguous_symbol"
+    assert len(ambig_err["error"]["details"]["candidates"]) == 2

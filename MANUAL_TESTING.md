@@ -45,16 +45,16 @@ rm -rf /tmp/manual_ext_repo /tmp/manual_ext.db*
 ### Incremental Index vs `--force` & `--include-tests`
 ```bash
 ./rc index . --include-tests
-./rc index . --include-tests --force --json | head -n 20
+./rc index . --include-tests --force | head -n 20
 ```
-**Expected:** First run skips unchanged files (`Files Unchanged`); `--force` re-extracts all files and prints JSON summary.
+**Expected:** First run skips unchanged files (`"files_unchanged"`); `--force` re-extracts all files and prints indented JSON summary.
 
 ### Optional Pyright LSP Index Enrichment (`--lsp`)
 ```bash
 ./rc index tests/fixtures/real_workflow/cross_file_refs --lsp --db-path /tmp/manual_lsp.db
 rm -f /tmp/manual_lsp.db*
 ```
-**Expected:** Reports `Available : True` under `LSP Enrichment` if `pyright-langserver` is in `PATH`, or prints a clean warning without failing AST indexing.
+**Expected:** Reports `"available": true` under `"lsp"` if `pyright-langserver` is in `PATH`, or records the error under `"lsp"` without failing AST indexing.
 
 ---
 
@@ -66,14 +66,14 @@ rm -f /tmp/manual_lsp.db*
 ./rc db repos
 ./rc db tables
 ```
-**Expected:** Shows schema `v2`, DB size, active repo, edge breakdown (`calls`, `imports`, `contains`, `scope_parent`, `inherits`), and row counts including `nodes_fts`.
+**Expected:** Emits indented JSON showing `"user_version": 2`, DB size, active repo, edge breakdown (`calls`, `imports`, `contains`, `scope_parent`, `inherits`), and row counts including `nodes_fts`.
 
-### Index Run History & JSON Status
+### Index Run History (`rc db runs`)
 ```bash
 ./rc db runs --limit 5
-./rc db status --json | head -n 20
+./rc db status | head -n 20
 ```
-**Expected:** Prints recent `index_runs` entries with status `completed` and machine-readable JSON status.
+**Expected:** Prints recent `index_runs` entries with `"status": "completed"` and database status JSON.
 
 ### Guarded Read-Only SQL Queries (`rc db sql`)
 ```bash
@@ -81,7 +81,7 @@ rm -f /tmp/manual_lsp.db*
 ./rc db sql "SELECT name, qualified_name FROM nodes_fts WHERE nodes_fts MATCH 'build_symbol_context' LIMIT 5"
 ! ./rc db sql "DELETE FROM nodes"
 ```
-**Expected:** `SELECT` queries print formatted ASCII tables; `DELETE FROM nodes` is blocked with `Error: not authorized` (exit code `1`, caught by `!`).
+**Expected:** `SELECT` queries emit JSON row objects; `DELETE FROM nodes` is blocked with `"not authorized"` JSON error on `stderr` (exit code `1`, caught by `!`).
 
 ---
 
@@ -92,14 +92,14 @@ rm -f /tmp/manual_lsp.db*
 ./rc files mcp
 ./rc files --include-tests --limit 15
 ```
-**Expected:** Shows line counts, symbol counts, `Test` flag, and `fresh` disk status for matching files.
+**Expected:** Emits JSON file entries with line counts, symbol counts, `is_test`, and `"freshness": "fresh"`.
 
-### Indented File Symbol Outline (`rc outline`)
+### Hierarchical File Symbol Outline (`rc outline`)
 ```bash
 ./rc outline src/repo_context/mcp/schemas.py
 ./rc outline src/repo_context/mcp/tools.py --no-private --max-depth 2
 ```
-**Expected:** Prints a tree of classes, fields, methods, functions, and constants with `[Lstart-end]` spans, signatures, and `sym:...` IDs.
+**Expected:** Emits hierarchical JSON outline of classes, fields, methods, functions, and constants with line spans, signatures, and `sym:...` IDs.
 
 ---
 
@@ -140,9 +140,9 @@ rm -f /tmp/manual_lsp.db*
 ### Single & Multi-Target Change Risk (`rc risk`)
 ```bash
 ./rc risk ListFilesInput
-./rc risk ListFilesInput build_symbol_context --json | head -n 25
+./rc risk ListFilesInput build_symbol_context | head -n 25
 ```
-**Expected:** Prints `0–100` risk score, decision (`safe_enough` / `review_required` / `high_risk`), target breakdown, and triggered issue codes.
+**Expected:** Emits JSON risk score (`0–100`), decision (`safe_enough` / `review_required` / `high_risk`), target breakdown, and triggered issue codes.
 
 ---
 
@@ -208,7 +208,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 
 ### Global Flags & Missing-DB Read-Only Guard
 ```bash
-./rc --db-path repo_context.db --json db tables
+./rc --db-path repo_context.db db tables
 ! ./rc db status --db-path /tmp/nonexistent_rc_check.db && test ! -e /tmp/nonexistent_rc_check.db && echo "OK: 0 files created"
 ```
-**Expected:** Global `--db-path`/`--json` work before or after subcommands; missing `--db-path` fails with `Run 'rc index' first.` and creates zero files on disk.
+**Expected:** Global `--db-path` works before or after subcommands; missing `--db-path` fails with `"database_not_found"` JSON error on `stderr` and creates zero files on disk.

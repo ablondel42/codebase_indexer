@@ -139,7 +139,7 @@ def test_cli_end_to_end_incremental_edit_and_prune_workflow(
     db_path = tmp_path / "cli_workflow.db"
 
     # 1. Initial index
-    idx1 = _run_rc("index", str(repo_root), "--db-path", str(db_path), "--json", cwd=repo_root)
+    idx1 = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert idx1.returncode == 0, idx1.stderr
     assert json.loads(idx1.stdout)["files_indexed"] == 1
 
@@ -151,37 +151,42 @@ def test_cli_end_to_end_incremental_edit_and_prune_workflow(
         encoding="utf-8",
     )
 
-    files_modified = _run_rc("files", "--db-path", str(db_path), "--json", cwd=repo_root)
+    files_modified = _run_rc("files", "--db-path", str(db_path), cwd=repo_root)
     assert files_modified.returncode == 0
     assert json.loads(files_modified.stdout)["files"][0]["freshness"] == "modified"
 
     # 3. Incremental re-index picks up farewell()
-    idx2 = _run_rc("index", str(repo_root), "--db-path", str(db_path), "--json", cwd=repo_root)
+    idx2 = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert idx2.returncode == 0
     assert json.loads(idx2.stdout)["files_indexed"] == 1
 
     search_res = _run_rc(
-        "symbols", "search", "farewell", "--db-path", str(db_path), "--json", cwd=repo_root
+        "symbols", "search", "farewell", "--db-path", str(db_path), cwd=repo_root
     )
     assert search_res.returncode == 0
     syms = json.loads(search_res.stdout)["symbols"]
     assert len(syms) == 1
     farewell_id = syms[0]["id"]
 
-    # 4. Inspect via CLI & mcp-call
-    assert _run_rc("outline", "greeter.py", "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("symbols", "show", farewell_id, "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("source", farewell_id, "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("refs", farewell_id, "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("risk", farewell_id, "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("db", "status", "--db-path", str(db_path), cwd=repo_root).returncode == 0
-    assert _run_rc("db", "sql", "SELECT COUNT(*) AS n FROM nodes", "--db-path", str(db_path), "--json", cwd=repo_root).returncode == 0
+    # 4. Inspect via CLI & mcp-call (all output JSON objects by default)
+    for inspect_args in (
+        ("outline", "greeter.py"),
+        ("symbols", "show", farewell_id),
+        ("source", farewell_id),
+        ("refs", farewell_id),
+        ("risk", farewell_id),
+        ("db", "status"),
+        ("db", "sql", "SELECT COUNT(*) AS n FROM nodes"),
+    ):
+        res = _run_rc(*inspect_args, "--db-path", str(db_path), cwd=repo_root)
+        assert res.returncode == 0, res.stderr
+        assert isinstance(json.loads(res.stdout), dict)
 
     # 5. Delete copied file -> rc files shows 'deleted' -> rc index prunes it
     greeter.unlink()
-    files_deleted = _run_rc("files", "--db-path", str(db_path), "--json", cwd=repo_root)
+    files_deleted = _run_rc("files", "--db-path", str(db_path), cwd=repo_root)
     assert json.loads(files_deleted.stdout)["files"][0]["freshness"] == "deleted"
 
-    idx3 = _run_rc("index", str(repo_root), "--db-path", str(db_path), "--json", cwd=repo_root)
+    idx3 = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert idx3.returncode == 0
     assert json.loads(idx3.stdout)["files_pruned"] == 1

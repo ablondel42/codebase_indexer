@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Any
 
 from repo_context.context import build_symbol_context, read_symbol_source
@@ -15,35 +16,11 @@ from repo_context.storage import (
     search_nodes_fts,
 )
 from repo_context.storage.nodes import row_to_node
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_key_value_section,
-    format_line_range,
-    format_location,
-    print_json,
-)
 from repo_context.cli.utils import (
     _escape_like,
     resolve_db_path,
     resolve_symbol_target,
 )
-
-
-def _format_symbol_row(node: dict[str, Any], file_info: dict[str, Any] | None) -> list[Any]:
-    """Build standard table row ``[ID, Kind, Location, Qualified Name, Signature]``."""
-    file_path = file_info.get("file_path") if file_info else None
-    location = format_location(
-        file_path,
-        start_line=node.get("start_line"),
-        end_line=node.get("end_line"),
-    )
-    return [
-        node["id"],
-        node["kind"],
-        location,
-        node["qualified_name"],
-        node.get("signature") or node["name"],
-    ]
 
 
 def _serialize_symbol_entry(node: dict[str, Any], file_info: dict[str, Any] | None) -> dict[str, Any]:
@@ -94,8 +71,8 @@ def cmd_symbols_search(args: argparse.Namespace) -> int:
         )
         files_by_id = get_files_by_ids(conn, [n.get("file_id", "") for n in nodes])
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "repo_id": repo_id,
                 "query": args.query,
@@ -104,19 +81,8 @@ def cmd_symbols_search(args: argparse.Namespace) -> int:
                     _serialize_symbol_entry(n, files_by_id.get(n.get("file_id", "")))
                     for n in nodes
                 ],
-            }
-        )
-        return 0
-
-    print(
-        format_ascii_table(
-            ["ID", "Kind", "Location", "Qualified Name", "Signature"],
-            [
-                _format_symbol_row(n, files_by_id.get(n.get("file_id", "")))
-                for n in nodes
-            ],
-            max_col_widths=[None, 20, None, 48, 64],
-            empty_message=f"(no symbols matching {args.query!r})",
+            },
+            indent=2,
         )
     )
     return 0
@@ -185,8 +151,8 @@ def cmd_symbols_list(args: argparse.Namespace) -> int:
             for r in rows
         }
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "repo_id": repo_id,
                 "total_count": total_count,
@@ -198,35 +164,10 @@ def cmd_symbols_list(args: argparse.Namespace) -> int:
                     _serialize_symbol_entry(n, file_meta.get(n["id"]))
                     for n in nodes
                 ],
-            }
-        )
-        return 0
-
-    print(
-        format_ascii_table(
-            ["ID", "Kind", "Qualified Name", "Location", "Signature"],
-            [
-                [
-                    n["id"],
-                    n["kind"],
-                    n["qualified_name"],
-                    format_location(
-                        (file_meta.get(n["id"]) or {}).get("file_path"),
-                        start_line=n.get("start_line"),
-                        end_line=n.get("end_line"),
-                    ),
-                    n.get("signature") or n["name"],
-                ]
-                for n in nodes
-            ],
-            max_col_widths=[None, 20, 48, None, 64],
-            empty_message="(no matching symbols)",
+            },
+            indent=2,
         )
     )
-    if total_count > len(nodes) or offset > 0:
-        start_idx = offset + 1 if nodes else 0
-        end_idx = offset + len(nodes)
-        print(f"Showing {start_idx}-{end_idx} of {total_count} symbols.")
     return 0
 
 
@@ -257,203 +198,7 @@ def cmd_symbols_show(args: argparse.Namespace) -> int:
                 context={"symbol": target["id"]},
             )
 
-    if getattr(args, "json", False):
-        print_json(ctx.model_dump())
-        return 0
-
-    focus = ctx.focus_symbol
-    struct_parent = ctx.structural_parent
-    lex_parent = ctx.lexical_parent
-    struct_sum = ctx.structural_summary or {}
-    ref_sum = ctx.reference_summary or {}
-    freshness = ctx.freshness or {}
-    confidence = ctx.confidence or {}
-
-    sections: list[str] = [
-        format_key_value_section(
-            "Focus Symbol",
-            [
-                ("ID", focus["id"]),
-                ("Kind", focus.get("kind")),
-                ("Qualified Name", focus.get("qualified_name")),
-                (
-                    "Location",
-                    format_location(
-                        focus.get("file_path"),
-                        start_line=focus.get("start_line"),
-                        end_line=focus.get("end_line"),
-                    ),
-                ),
-                ("Signature", focus.get("signature") or focus.get("name")),
-                ("Scope", focus.get("scope") or "-"),
-                ("Visibility", focus.get("visibility_hint") or "-"),
-                ("Doc Summary", focus.get("doc_summary") or "-"),
-                (
-                    "Structural Parent",
-                    f"{struct_parent['qualified_name']} ({struct_parent['kind']}) [{struct_parent['id']}]"
-                    if struct_parent
-                    else "None",
-                ),
-                (
-                    "Lexical Parent",
-                    f"{lex_parent['qualified_name']} ({lex_parent['kind']}) [{lex_parent['id']}]"
-                    if lex_parent
-                    else "None",
-                ),
-            ],
-        )
-    ]
-
-    if ctx.structural_children:
-        sections.append("")
-        sections.append(
-            f"Structural Children ({struct_sum.get('structural_child_count', len(ctx.structural_children))})"
-        )
-        sections.append(
-            format_ascii_table(
-                ["ID", "Kind", "Name", "Lines", "Signature"],
-                [
-                    [
-                        c["id"],
-                        c["kind"],
-                        c["name"],
-                        format_line_range(lines=c.get("lines")),
-                        c.get("signature") or c["name"],
-                    ]
-                    for c in ctx.structural_children
-                ],
-                max_col_widths=[None, 18, 32, 14, 64],
-            )
-        )
-
-    if ctx.lexical_children:
-        sections.append("")
-        sections.append(
-            f"Lexical Children ({struct_sum.get('lexical_child_count', len(ctx.lexical_children))})"
-        )
-        sections.append(
-            format_ascii_table(
-                ["ID", "Kind", "Name", "Lines", "Signature"],
-                [
-                    [
-                        c["id"],
-                        c["kind"],
-                        c["name"],
-                        format_line_range(lines=c.get("lines")),
-                        c.get("signature") or c["name"],
-                    ]
-                    for c in ctx.lexical_children
-                ],
-                max_col_widths=[None, 20, 32, 14, 64],
-            )
-        )
-
-    if ctx.incoming_edges:
-        sections.append("")
-        sections.append(
-            f"Incoming Relationships ({struct_sum.get('incoming_edge_count', len(ctx.incoming_edges))})"
-        )
-        sections.append(
-            format_ascii_table(
-                ["Kind", "From ID", "Peer", "Location", "Conf"],
-                [
-                    [
-                        e.get("kind"),
-                        e.get("from_id"),
-                        e.get("peer_name") or "-",
-                        format_location(e.get("file_path"), start_line=e.get("line")),
-                        e.get("confidence"),
-                    ]
-                    for e in ctx.incoming_edges
-                ],
-                max_col_widths=[14, None, 40, None, 6],
-            )
-        )
-
-    if ctx.outgoing_edges:
-        sections.append("")
-        sections.append(
-            f"Outgoing Relationships ({struct_sum.get('outgoing_edge_count', len(ctx.outgoing_edges))})"
-        )
-        sections.append(
-            format_ascii_table(
-                ["Kind", "To ID", "Peer", "Location", "Conf"],
-                [
-                    [
-                        e.get("kind"),
-                        e.get("to_id"),
-                        e.get("peer_name") or "-",
-                        format_location(e.get("file_path"), start_line=e.get("line")),
-                        e.get("confidence"),
-                    ]
-                    for e in ctx.outgoing_edges
-                ],
-                max_col_widths=[14, None, 40, None, 6],
-            )
-        )
-
-    if ctx.file_siblings:
-        sections.append("")
-        sections.append(
-            f"File Siblings ({struct_sum.get('same_file_sibling_count', len(ctx.file_siblings))})"
-        )
-        sections.append(
-            format_ascii_table(
-                ["ID", "Kind", "Name", "Lines", "Signature"],
-                [
-                    [
-                        s["id"],
-                        s["kind"],
-                        s["name"],
-                        format_line_range(lines=s.get("lines")),
-                        s.get("signature") or s["name"],
-                    ]
-                    for s in ctx.file_siblings
-                ],
-                max_col_widths=[None, 18, 32, 14, 64],
-            )
-        )
-
-    edge_conf_min = confidence.get("edge_confidence_min")
-    edge_conf_max = confidence.get("edge_confidence_max")
-    edge_conf_range = (
-        f"{edge_conf_min}-{edge_conf_max}"
-        if edge_conf_min is not None and edge_conf_max is not None
-        else "-"
-    )
-
-    sections.append("")
-    sections.append(
-        format_key_value_section(
-            "Summaries",
-            [
-                ("Reference Source", ref_sum.get("reference_source", "-")),
-                ("Reference Count", ref_sum.get("reference_count", 0)),
-                ("Referencing Files", ref_sum.get("referencing_file_count", 0)),
-                ("Referencing Modules", ref_sum.get("referencing_module_count", 0)),
-                ("LSP Refreshed", ref_sum.get("available", False)),
-                ("Context Source", freshness.get("context_source", "-")),
-                ("Disk Fresh", freshness.get("is_fresh", "-")),
-                ("Stale Reason", freshness.get("stale_reason") or "-"),
-                ("Symbol Confidence", confidence.get("focus_symbol_confidence", "-")),
-                ("Edge Confidence", edge_conf_range),
-                ("Placeholders", confidence.get("contains_placeholder_targets", "-")),
-            ],
-        )
-    )
-
-    if include_source:
-        sections.append("")
-        if focus.get("source"):
-            sections.append("Source")
-            sections.append("------")
-            sections.append(focus["source"])
-            if focus.get("source_truncated"):
-                sections.append("... (source truncated; use `rc source` to paginate)")
-        elif focus.get("source_error"):
-            sections.append(f"Source unavailable: {focus['source_error']}")
-
-    print("\n".join(sections))
+    print(json.dumps(ctx.model_dump(mode="json"), indent=2))
     return 0
 
 
@@ -480,28 +225,5 @@ def cmd_source(args: argparse.Namespace) -> int:
             offset=offset,
         )
 
-    if getattr(args, "json", False):
-        print_json(data)
-        return 0
-
-    freshness = "fresh" if data.get("is_fresh", True) else f"stale ({data.get('stale_reason')})"
-    header = format_key_value_section(
-        "Symbol Source",
-        [
-            ("ID", data["symbol_id"]),
-            ("Kind", data["kind"]),
-            ("Qualified Name", data["qualified_name"]),
-            ("Location", format_location(data["file_path"], lines=data.get("lines"))),
-            ("Signature", data.get("signature") or "-"),
-            ("Freshness", freshness),
-            ("Lines Returned", f"{data['returned_lines']}/{data['total_lines']}"),
-        ],
-    )
-    parts = [header, "", data.get("source") or "(empty)"]
-    if data.get("truncated") and data.get("next_offset") is not None:
-        parts.append(
-            f"\n--- truncated ({data['returned_lines']}/{data['total_lines']} lines shown; "
-            f"continue with --offset {data['next_offset']}) ---"
-        )
-    print("\n".join(parts))
+    print(json.dumps(data, indent=2))
     return 0

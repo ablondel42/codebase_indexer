@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-import sys
 from typing import Any
 
 from repo_context.config import get_config
@@ -31,11 +31,6 @@ from repo_context.storage import (
     replace_file_graph,
     upsert_files,
     upsert_repo,
-)
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_key_value_section,
-    print_json,
 )
 from repo_context.cli.utils import resolve_db_path
 
@@ -111,7 +106,7 @@ def _run_lsp_enrichment(
     except LspError as exc:
         summary["available"] = False
         summary["error"] = str(exc)
-        print(f"Warning: LSP enrichment unavailable ({exc})", file=sys.stderr)
+        logger.warning("LSP enrichment unavailable: %s", exc)
 
     return summary
 
@@ -266,61 +261,5 @@ def cmd_index(args: argparse.Namespace) -> int:
     if lsp_summary is not None:
         payload["lsp"] = lsp_summary
 
-    if getattr(args, "json", False):
-        print_json(payload)
-        return 0
-
-    lines = [
-        format_key_value_section(
-            "Index Summary",
-            [
-                ("Database", str(db_path)),
-                ("Run ID", run_id),
-                ("Repo ID", repo.id),
-                ("Repo Name", repo.name),
-                ("Root Path", repo.root_path),
-                ("Files Scanned", len(scanned_files)),
-                ("Files Indexed", len(extracted)),
-                ("Files Unchanged", unchanged_count),
-                ("Files Pruned", pruned_count),
-                ("Files Failed", len(failures)),
-                ("Nodes Extracted", nodes_extracted),
-                ("Edges Extracted", edges_extracted),
-                ("Edges Resolved", link_stats.get("total_resolved", 0)),
-                ("Total Repo Files", repo_totals.get("file_count", 0)),
-                ("Total Repo Nodes", repo_totals.get("node_count", 0)),
-                ("Total Repo Edges", repo_totals.get("edge_count", 0)),
-            ],
-        )
-    ]
-
-    if lsp_summary is not None:
-        lines.append("")
-        lines.append(
-            format_key_value_section(
-                "LSP Enrichment",
-                [
-                    ("Available", lsp_summary["available"]),
-                    ("Symbols Attempted", lsp_summary["symbols_attempted"]),
-                    ("Symbols Refreshed", lsp_summary["symbols_refreshed"]),
-                    ("References Stored", lsp_summary["total_references"]),
-                    ("Errors", lsp_summary["errors"]),
-                    ("Error Detail", lsp_summary["error"] or "-"),
-                ],
-            )
-        )
-
-    if failures:
-        lines.append("")
-        lines.append("Parse Failures")
-        lines.append("--------------")
-        lines.append(
-            format_ascii_table(
-                ["File", "Error"],
-                [[item["file_path"], item["error"]] for item in failures],
-                max_col_widths=[50, 70],
-            )
-        )
-
-    print("\n".join(lines))
+    print(json.dumps(payload, indent=2))
     return 0

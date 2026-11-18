@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,6 @@ from repo_context.storage import (
     get_repo_by_id,
     initialize_database,
     resolve_repo_id,
-)
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_outline_tree,
-    print_json,
 )
 from repo_context.cli.utils import format_freshness_label, resolve_db_path
 
@@ -103,43 +99,22 @@ def cmd_files(args: argparse.Namespace) -> int:
                 }
             )
 
-    if getattr(args, "json", False):
-        print_json(
+    print(
+        json.dumps(
             {
                 "repo_id": repo_id,
                 "total_count": total_count,
                 "returned_count": len(entries),
                 "files": entries,
-            }
-        )
-        return 0
-
-    print(
-        format_ascii_table(
-            ["File Path", "Module", "Lines", "Symbols", "Test", "Freshness"],
-            [
-                [
-                    entry["file_path"],
-                    entry["module_path"],
-                    entry["line_count"],
-                    entry["symbol_count"],
-                    "yes" if entry["is_test"] else "no",
-                    entry["freshness"],
-                ]
-                for entry in entries
-            ],
-            max_col_widths=[None, 44, 8, 8, 6, 20],
-            alignments=["left", "left", "right", "right", "left", "left"],
-            empty_message="(no matching indexed files)",
+            },
+            indent=2,
         )
     )
-    if total_count > len(entries):
-        print(f"Showing {len(entries)} of {total_count} matching files (use --limit to view more).")
     return 0
 
 
 def cmd_outline(args: argparse.Namespace) -> int:
-    """Display an indented hierarchical symbol tree for an indexed file."""
+    """Display hierarchical symbol outline for an indexed file."""
     db_path = resolve_db_path(args)
     repo_arg: str | None = getattr(args, "repo", None)
     include_private = not bool(getattr(args, "no_private", False))
@@ -166,9 +141,5 @@ def cmd_outline(args: argparse.Namespace) -> int:
             max_depth=max_depth,
         )
 
-    if getattr(args, "json", False):
-        print_json(outline)
-        return 0
-
-    print(format_outline_tree(outline))
+    print(json.dumps(outline, indent=2))
     return 0

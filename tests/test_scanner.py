@@ -1,5 +1,6 @@
 """Repository scanner tests covering v0.2.0 IDs, ignore globs, test flags, and security."""
 
+import json
 import os
 from pathlib import Path
 import re
@@ -227,7 +228,8 @@ def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
         env=_subprocess_env(),
     )
     assert result.returncode == 0, result.stderr
-    assert "Index Summary" in result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["files_indexed"] == 4
     assert db_path.exists()
 
     conn = sqlite3.connect(str(db_path))

@@ -3,16 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import Any
 
 from repo_context.graph import RiskResult, analyze_target_set_risk
 from repo_context.storage import connection_scope, initialize_database
-from repo_context.cli.formatting import (
-    format_ascii_table,
-    format_key_value_section,
-    format_location,
-    print_json,
-)
 from repo_context.cli.utils import resolve_db_path, resolve_symbol_targets
 
 
@@ -79,60 +74,5 @@ def cmd_risk(args: argparse.Namespace) -> int:
         result = analyze_target_set_risk(conn, [t["id"] for t in targets])
 
     serialized = _serialize_risk_result(result)
-    if getattr(args, "json", False):
-        print_json(serialized)
-        return 0
-
-    facts = result.facts
-    summary_section = format_key_value_section(
-        "Risk Assessment",
-        [
-            ("Risk Score", f"{result.risk_score}/100"),
-            ("Decision", result.decision),
-            ("Targets", facts.target_count),
-            ("Touches Public Surface", facts.touches_public_surface),
-            ("Local Scope Only", facts.touches_local_scope_only),
-            ("Targets Multi-File", facts.target_spans_multiple_files),
-            ("Targets Multi-Module", facts.target_spans_multiple_modules),
-            ("Cross-File Impact", facts.cross_file_impact),
-            ("Cross-Module Impact", facts.cross_module_impact),
-            ("Inheritance Involved", facts.inheritance_involved),
-            ("Stale Symbols", len(facts.stale_symbols)),
-            ("Low-Confidence Symbols", len(facts.low_confidence_symbols)),
-            (
-                "Low-Confidence Edges",
-                facts.extra.get("low_confidence_edge_count", len(facts.low_confidence_edges)),
-            ),
-        ],
-    )
-
-    targets_table = format_ascii_table(
-        ["ID", "Kind", "Location", "Qualified Name", "Signature", "Refs"],
-        [
-            [
-                t.symbol_id,
-                t.kind,
-                format_location(t.file_path, start_line=t.start_line, end_line=t.end_line),
-                t.qualified_name,
-                t.signature or t.qualified_name,
-                facts.reference_counts.get(t.symbol_id, 0),
-            ]
-            for t in result.targets
-        ],
-        max_col_widths=[None, 18, None, 44, 56, 6],
-        alignments=["left", "left", "left", "left", "left", "right"],
-    )
-
-    issues_table = format_ascii_table(
-        ["#", "Issue Code"],
-        [[idx + 1, issue] for idx, issue in enumerate(result.issues)],
-        alignments=["right", "left"],
-        empty_message="(no risk issues detected)",
-    )
-
-    print(
-        f"{summary_section}\n\n"
-        f"Targets\n-------\n{targets_table}\n\n"
-        f"Issues ({len(result.issues)})\n------\n{issues_table}"
-    )
+    print(json.dumps(serialized, indent=2))
     return 0
