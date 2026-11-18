@@ -11,6 +11,7 @@ Usage: ./rc <command|path> [options]
 Commands:
   ./rc path/to/repo [--cli]   Index a repository and start the interactive CLI (--cli is optional; --no-cli exits)
   ./rc demo [--cli]           Index '.' (including tests) and start the interactive CLI (--cli is optional)
+  ./rc dev                    Delete and recreate DB, run full indexing + LSP, and display system status
   ./rc tests [pytest-args]    Execute the full test suite (ruff check + pytest)
 
 Forward any grouped subcommand directly: ./rc --help | ./rc db status | ./rc outline <file>
@@ -44,6 +45,7 @@ ensure_env() {
         fi
     fi
     if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ -x "$VENV/bin/python" ]; then
+        export PATH="$VENV/bin:$PATH"
         PY="$VENV/bin/python"
         RUFF="$(command -v "$VENV/bin/ruff" || command -v ruff || true)"
     else
@@ -54,6 +56,15 @@ ensure_env() {
 }
 
 ensure_env
+
+if [ "$1" = "dev" ]; then
+    shift
+    cd "$DIR"
+    export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+    rm -f "$DIR/repo_context.db" "$DIR/repo_context.db-wal" "$DIR/repo_context.db-shm" "$DIR/repo_context.db-journal"
+    "$PY" -m repo_context.cli.main index . --include-tests --force --lsp ${@+"$@"}
+    exec "$PY" -m repo_context.cli.main db status
+fi
 
 if [ "$1" = "tests" ]; then
     shift
