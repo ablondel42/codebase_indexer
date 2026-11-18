@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from repo_context.config import AppConfig
 from repo_context.context import build_symbol_context
@@ -67,6 +68,7 @@ from repo_context.storage import (
     close_connection,
     get_connection,
     initialize_database,
+    nodes_table,
     record_index_run_finish,
     record_index_run_start,
     replace_file_graph,
@@ -602,12 +604,22 @@ def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_erro
             nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
             replace_file_graph(conn, rec.id, nodes, edges)
         conn.commit()
-        outer_id = conn.execute(
-            "SELECT id FROM nodes WHERE name = 'outer' AND kind = 'function'"
-        ).fetchone()["id"]
-        victim_id = conn.execute(
-            "SELECT id FROM nodes WHERE name = 'victim' AND kind = 'function'"
-        ).fetchone()["id"]
+        outer_id = str(
+            conn.execute(
+                select(nodes_table.c.id).where(
+                    nodes_table.c.name == "outer",
+                    nodes_table.c.kind == "function",
+                )
+            ).scalar_one()
+        )
+        victim_id = str(
+            conn.execute(
+                select(nodes_table.c.id).where(
+                    nodes_table.c.name == "victim",
+                    nodes_table.c.kind == "function",
+                )
+            ).scalar_one()
+        )
     finally:
         close_connection(conn)
 

@@ -1,7 +1,8 @@
 """Hierarchical file outline builder."""
 
 from collections import defaultdict
-import sqlite3
+
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import SYMBOL_KIND_MODULE
 from repo_context.context.helpers import format_line_span
@@ -73,7 +74,7 @@ def _collect_deduplicated_imports(
 
 
 def build_file_outline(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     file_path: str,
     *,

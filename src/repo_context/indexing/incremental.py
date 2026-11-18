@@ -1,7 +1,12 @@
-"""Incremental reindexing and deletion cleanup for changed files."""
+"""Incremental reindexing and deletion cleanup for changed files using SQLAlchemy Core."""
+
+from __future__ import annotations
 
 from pathlib import Path
-import sqlite3
+from typing import Any
+
+from sqlalchemy import delete, exists, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import AppConfig, get_config
 from repo_context.exceptions import ParseError, PathSecurityError
@@ -14,13 +19,25 @@ from repo_context.indexing.invalidation import (
 )
 from repo_context.logging_config import get_logger
 from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pathing import derive_file_id, derive_repo_id, ensure_safe_repo_file, to_relative_path
+from repo_context.parsing.pathing import (
+    derive_file_id,
+    derive_repo_id,
+    ensure_safe_repo_file,
+    to_relative_path,
+)
 from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.scanner import build_file_record, build_repo_record, is_supported_source_file
+from repo_context.parsing.scanner import (
+    build_file_record,
+    build_repo_record,
+    is_supported_source_file,
+)
 from repo_context.storage import (
+    edges_table,
+    files_table,
     get_file_by_id,
     get_file_by_path,
     get_repo_by_id,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_repo,
@@ -31,41 +48,15 @@ logger = get_logger("indexing.incremental")
 _EDGE_DELETE_CHUNK_SIZE = 200
 
 
-def _rollback_transaction(conn: sqlite3.Connection, savepoint_name: str | None) -> None:
-    """Roll back either a nested savepoint or the active connection transaction."""
-    if savepoint_name is not None:
-        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-        conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-    elif conn.in_transaction:
-        conn.rollback()
-
-
 def reindex_changed_file(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_root: Path,
     file_path: Path | str,
     config: AppConfig | None = None,
     *,
     commit: bool = True,
-) -> dict:
-    """Reindex a created or modified Python file inside ``repo_root``.
-
-    Validates path safety with ``ensure_safe_repo_file``, parses and extracts the
-    AST graph before mutating SQLite, updates graph and cross-file links inside
-    a single transaction/savepoint, invalidates stale reference summaries, and
-    commits when ``commit=True``.
-
-    Args:
-        conn: Writable SQLite connection.
-        repo_root: Repository root path.
-        file_path: Candidate file path (absolute or relative to ``repo_root``).
-        config: Optional application configuration (defaults to ``get_config()``).
-        commit: Whether to commit on success (default True).
-
-    Returns:
-        Structured summary dictionary containing ``file_path``, ``status``,
-        ``node_count``, and ``edge_count``.
-    """
+) -> dict[str, Any]:
+    """Reindex a created or modified Python file inside ``repo_root``."""
     cfg = config or get_config()
     raw_root = Path(repo_root)
     resolved_root = raw_root.resolve()
@@ -83,7 +74,7 @@ def reindex_changed_file(
                 "edge_count": 0,
             }
         logger.exception("Path security check failed during reindex for %s", file_path)
-        if commit and conn.in_transaction:
+        if commit and conn.in_transaction():
             conn.rollback()
         return {
             "file_path": display_path,
@@ -93,7 +84,7 @@ def reindex_changed_file(
         }
     except Exception:
         logger.exception("Unexpected error resolving file path during reindex for %s", file_path)
-        if commit and conn.in_transaction:
+        if commit and conn.in_transaction():
             conn.rollback()
         return {
             "file_path": display_path,
@@ -143,7 +134,7 @@ def reindex_changed_file(
         )
     except (ParseError, SyntaxError):
         logger.exception("Parse failure reindexing %s; keeping previous graph", repo_relative)
-        if commit and conn.in_transaction:
+        if commit and conn.in_transaction():
             conn.rollback()
         return {
             "file_path": repo_relative,
@@ -161,7 +152,7 @@ def reindex_changed_file(
                 "edge_count": 0,
             }
         logger.exception("Security error extracting %s", repo_relative)
-        if commit and conn.in_transaction:
+        if commit and conn.in_transaction():
             conn.rollback()
         return {
             "file_path": repo_relative,
@@ -179,7 +170,7 @@ def reindex_changed_file(
         }
     except Exception:
         logger.exception("Unexpected error extracting %s", repo_relative)
-        if commit and conn.in_transaction:
+        if commit and conn.in_transaction():
             conn.rollback()
         return {
             "file_path": repo_relative,
@@ -188,44 +179,23 @@ def reindex_changed_file(
             "edge_count": 0,
         }
 
-    savepoint_name: str | None = "_reindex_changed_file" if (not commit and conn.in_transaction) else None
-    if savepoint_name is not None:
-        conn.execute(f"SAVEPOINT {savepoint_name}")
-
-    try:
+    def _apply_reindex() -> dict[str, Any]:
         if get_repo_by_id(conn, repo_id) is None:
             upsert_repo(conn, build_repo_record(resolved_root))
 
-        # Invalidate reference refresh state and clear old reference edges before
-        # replace_file_graph deletes edges with evidence_file_id = file_record.id.
         invalidated_count = invalidate_reference_summaries_for_file(conn, file_record.id)
-
         upsert_files(conn, [file_record])
         replace_file_graph(conn, file_record.id, nodes, edges)
-
-        # Re-resolve repo-wide AST edges so surviving cross-file edges to removed
-        # or renamed symbols reset cleanly while intact targets stay linked.
         link_stats = resolve_repo_edges(conn, repo_id)
 
-        # Prune any cached LSP reference edges whose target symbol no longer exists.
         conn.execute(
-            """
-            DELETE FROM edges
-            WHERE repo_id = ?
-              AND kind = 'references'
-              AND NOT EXISTS (
-                  SELECT 1 FROM nodes n WHERE n.id = edges.to_id
-              )
-            """,
-            (repo_id,),
+            delete(edges_table).where(
+                edges_table.c.repo_id == repo_id,
+                edges_table.c.kind == "references",
+                ~exists(select(1).where(nodes_table.c.id == edges_table.c.to_id)),
+            )
         )
-
         mark_symbols_in_file_stale(conn, file_record.id)
-
-        if savepoint_name is not None:
-            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-        elif commit:
-            conn.commit()
 
         return {
             "file_path": repo_relative,
@@ -235,9 +205,19 @@ def reindex_changed_file(
             "invalidated_reference_edge_count": invalidated_count,
             "resolved_edge_count": link_stats.get("total_resolved", 0),
         }
+
+    try:
+        if not commit and conn.in_transaction():
+            with conn.begin_nested():
+                return _apply_reindex()
+        result = _apply_reindex()
+        if commit:
+            conn.commit()
+        return result
     except Exception:
         logger.exception("Failed to persist reindex update for %s", repo_relative)
-        _rollback_transaction(conn, savepoint_name)
+        if commit and conn.in_transaction():
+            conn.rollback()
         return {
             "file_path": repo_relative,
             "status": "error",
@@ -247,23 +227,13 @@ def reindex_changed_file(
 
 
 def handle_deleted_file(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     repo_relative_path: str,
     *,
     commit: bool = True,
-) -> dict:
-    """Clean up all graph state, edges, and stale target references for a deleted file.
-
-    Args:
-        conn: Writable SQLite connection.
-        repo_id: Repository ID.
-        repo_relative_path: Repository-relative POSIX path of the deleted file.
-        commit: Whether to commit atomically on success (default True).
-
-    Returns:
-        Structured summary with deleted node/edge counts and invalidated external targets.
-    """
+) -> dict[str, Any]:
+    """Clean up all graph state, edges, and stale target references for a deleted file."""
     file_row = get_file_by_path(conn, repo_id, repo_relative_path)
     if file_row is None:
         fallback_id = derive_file_id(repo_id, repo_relative_path)
@@ -278,55 +248,51 @@ def handle_deleted_file(
             "invalidated_target_symbol_count": 0,
         }
 
-    file_id = file_row["id"]
-    savepoint_name: str | None = "_handle_deleted_file" if (not commit and conn.in_transaction) else None
-    if savepoint_name is not None:
-        conn.execute(f"SAVEPOINT {savepoint_name}")
+    file_id = str(file_row["id"])
 
-    try:
-        # Collect local symbols and external impacted targets before deleting nodes/edges.
+    def _apply_delete() -> dict[str, Any]:
         symbol_ids = [
-            row["id"]
-            for row in conn.execute("SELECT id FROM nodes WHERE file_id = ?", (file_id,)).fetchall()
+            str(nid)
+            for nid in conn.execute(
+                select(nodes_table.c.id).where(nodes_table.c.file_id == file_id)
+            )
+            .scalars()
+            .all()
         ]
         symbol_id_set = set(symbol_ids)
 
-        target_rows = conn.execute(
-            "SELECT DISTINCT to_id FROM edges WHERE evidence_file_id = ?",
-            (file_id,),
-        ).fetchall()
-        external_target_ids = [
-            row["to_id"] for row in target_rows if row["to_id"] not in symbol_id_set
+        target_ids = [
+            str(tid)
+            for tid in conn.execute(
+                select(edges_table.c.to_id)
+                .distinct()
+                .where(
+                    edges_table.c.evidence_file_id == file_id
+                )
+            )
+            .scalars()
+            .all()
         ]
+        external_target_ids = [tid for tid in target_ids if tid not in symbol_id_set]
 
-        # Delete all edges anchored on this file or referencing any symbol declared in it.
         deleted_edge_count = 0
-        cursor = conn.execute(
-            "DELETE FROM edges WHERE evidence_file_id = ?",
-            (file_id,),
-        )
-        deleted_edge_count += max(cursor.rowcount, 0)
+        res = conn.execute(delete(edges_table).where(edges_table.c.evidence_file_id == file_id))
+        deleted_edge_count += max(res.rowcount or 0, 0)
 
         for chunk in _chunked(symbol_ids, _EDGE_DELETE_CHUNK_SIZE):
-            placeholders = ",".join("?" * len(chunk))
-            params = tuple(chunk) + tuple(chunk)
-            cursor = conn.execute(
-                f"DELETE FROM edges WHERE from_id IN ({placeholders}) OR to_id IN ({placeholders})",
-                params,
+            res = conn.execute(
+                delete(edges_table).where(
+                    or_(
+                        edges_table.c.from_id.in_(chunk),
+                        edges_table.c.to_id.in_(chunk),
+                    )
+                )
             )
-            deleted_edge_count += max(cursor.rowcount, 0)
+            deleted_edge_count += max(res.rowcount or 0, 0)
 
-        # Mark surviving external target symbols stale in reference_refresh.
         marked_external = mark_symbol_ids_stale(conn, external_target_ids)
-
-        # Delete nodes explicitly so FTS5 delete triggers fire, then delete the file row.
-        conn.execute("DELETE FROM nodes WHERE file_id = ?", (file_id,))
-        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
-
-        if savepoint_name is not None:
-            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-        elif commit:
-            conn.commit()
+        conn.execute(delete(nodes_table).where(nodes_table.c.file_id == file_id))
+        conn.execute(delete(files_table).where(files_table.c.id == file_id))
 
         return {
             "file_path": repo_relative_path,
@@ -335,9 +301,19 @@ def handle_deleted_file(
             "deleted_edge_count": deleted_edge_count,
             "invalidated_target_symbol_count": len(marked_external),
         }
+
+    try:
+        if not commit and conn.in_transaction():
+            with conn.begin_nested():
+                return _apply_delete()
+        result = _apply_delete()
+        if commit:
+            conn.commit()
+        return result
     except Exception:
         logger.exception("Failed to delete graph state for %s (%s)", repo_relative_path, file_id)
-        _rollback_transaction(conn, savepoint_name)
+        if commit and conn.in_transaction():
+            conn.rollback()
         return {
             "file_path": repo_relative_path,
             "status": "error",
@@ -348,16 +324,16 @@ def handle_deleted_file(
 
 
 def process_event_batch(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_root: Path,
-    events: list,
+    events: list[Any],
     config: AppConfig | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Process a batch of collapsed file change events sequentially."""
     cfg = config or get_config()
     resolved_root = Path(repo_root).resolve()
     default_repo_id = derive_repo_id(resolved_root)
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
 
     for event in events:
         if event.event_type == "deleted":

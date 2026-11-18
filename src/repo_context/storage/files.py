@@ -1,51 +1,50 @@
-"""File persistence helpers."""
+"""File persistence helpers using SQLAlchemy Core."""
 
-import sqlite3
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
 
 from repo_context.models.file import FileRecord
+from repo_context.storage.schema import edges_table, files_table, nodes_table
 
 _PRUNE_BATCH_SIZE = 500
 
-_UPSERT_FILE_SQL = """
-INSERT INTO files (
-    id, repo_id, file_path, uri, module_path, language,
-    content_hash, size_bytes, line_count, is_test,
-    last_modified_at, last_indexed_at
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-    repo_id = excluded.repo_id,
-    file_path = excluded.file_path,
-    uri = excluded.uri,
-    module_path = excluded.module_path,
-    language = excluded.language,
-    content_hash = excluded.content_hash,
-    size_bytes = excluded.size_bytes,
-    line_count = excluded.line_count,
-    is_test = excluded.is_test,
-    last_modified_at = excluded.last_modified_at,
-    last_indexed_at = excluded.last_indexed_at
-"""
+
+def _file_values(file_record: FileRecord) -> dict[str, Any]:
+    return {
+        "id": file_record.id,
+        "repo_id": file_record.repo_id,
+        "file_path": file_record.file_path,
+        "uri": file_record.uri,
+        "module_path": file_record.module_path,
+        "language": file_record.language,
+        "content_hash": file_record.content_hash,
+        "size_bytes": file_record.size_bytes,
+        "line_count": file_record.line_count,
+        "is_test": bool(file_record.is_test),
+        "last_modified_at": file_record.last_modified_at,
+        "last_indexed_at": file_record.last_indexed_at,
+    }
 
 
-def _file_params(file_record: FileRecord) -> tuple:
-    return (
-        file_record.id,
-        file_record.repo_id,
-        file_record.file_path,
-        file_record.uri,
-        file_record.module_path,
-        file_record.language,
-        file_record.content_hash,
-        file_record.size_bytes,
-        file_record.line_count,
-        int(file_record.is_test),
-        file_record.last_modified_at,
-        file_record.last_indexed_at,
+def _build_upsert_file_stmt() -> Any:
+    base = sqlite_insert(files_table)
+    return base.on_conflict_do_update(
+        index_elements=[files_table.c.id],
+        set_={
+            col.name: base.excluded[col.name]
+            for col in files_table.columns
+            if col.name != "id"
+        },
     )
 
 
-def _row_to_file_record(row: sqlite3.Row) -> FileRecord:
+def _row_to_file_record(row: Mapping[str, Any]) -> FileRecord:
     return FileRecord(
         id=row["id"],
         repo_id=row["repo_id"],
@@ -62,61 +61,42 @@ def _row_to_file_record(row: sqlite3.Row) -> FileRecord:
     )
 
 
-def _row_to_file_dict(row: sqlite3.Row) -> dict:
+def _row_to_file_dict(row: Mapping[str, Any]) -> dict[str, Any]:
     data = dict(row)
     if "is_test" in data:
         data["is_test"] = bool(data["is_test"])
     return data
 
 
-def upsert_file(conn: sqlite3.Connection, file_record: FileRecord) -> None:
+def upsert_file(conn: Connection, file_record: FileRecord) -> None:
     """Insert or update a single file record."""
-    conn.execute(_UPSERT_FILE_SQL, _file_params(file_record))
+    conn.execute(_build_upsert_file_stmt(), _file_values(file_record))
 
 
-def upsert_files(conn: sqlite3.Connection, file_records: list[FileRecord]) -> None:
+def upsert_files(conn: Connection, file_records: list[FileRecord]) -> None:
     """Insert or update multiple file records in a single batch."""
     if not file_records:
         return
-    conn.executemany(_UPSERT_FILE_SQL, [_file_params(rec) for rec in file_records])
+    conn.execute(_build_upsert_file_stmt(), [_file_values(rec) for rec in file_records])
 
 
 def list_files_for_repo(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     *,
     include_tests: bool = True,
 ) -> list[FileRecord]:
     """List file records for a repository sorted by ``file_path``."""
-    if include_tests:
-        cursor = conn.execute(
-            """
-            SELECT id, repo_id, file_path, uri, module_path, language,
-                   content_hash, size_bytes, line_count, is_test,
-                   last_modified_at, last_indexed_at
-            FROM files
-            WHERE repo_id = ?
-            ORDER BY file_path
-            """,
-            (repo_id,),
-        )
-    else:
-        cursor = conn.execute(
-            """
-            SELECT id, repo_id, file_path, uri, module_path, language,
-                   content_hash, size_bytes, line_count, is_test,
-                   last_modified_at, last_indexed_at
-            FROM files
-            WHERE repo_id = ? AND is_test = 0
-            ORDER BY file_path
-            """,
-            (repo_id,),
-        )
-    return [_row_to_file_record(row) for row in cursor.fetchall()]
+    stmt = select(files_table).where(files_table.c.repo_id == repo_id)
+    if not include_tests:
+        stmt = stmt.where(files_table.c.is_test.is_(False))
+    stmt = stmt.order_by(files_table.c.file_path)
+    rows = conn.execute(stmt).mappings().all()
+    return [_row_to_file_record(row) for row in rows]
 
 
 def _delete_files_by_ids_batched(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     stale_file_ids: list[str],
 ) -> int:
@@ -127,94 +107,81 @@ def _delete_files_by_ids_batched(
     deleted = 0
     for start in range(0, len(stale_file_ids), _PRUNE_BATCH_SIZE):
         batch = stale_file_ids[start : start + _PRUNE_BATCH_SIZE]
-        placeholders = ",".join("?" * len(batch))
-        batch_tuple = tuple(batch)
+        node_subq = select(nodes_table.c.id).where(nodes_table.c.file_id.in_(batch))
 
-        conn.execute(
-            f"DELETE FROM edges WHERE evidence_file_id IN ({placeholders})",
-            batch_tuple,
+        conn.execute(delete(edges_table).where(edges_table.c.evidence_file_id.in_(batch)))
+        conn.execute(delete(edges_table).where(edges_table.c.from_id.in_(node_subq)))
+        conn.execute(delete(edges_table).where(edges_table.c.to_id.in_(node_subq)))
+        conn.execute(delete(nodes_table).where(nodes_table.c.file_id.in_(batch)))
+        res = conn.execute(
+            delete(files_table).where(
+                files_table.c.repo_id == repo_id,
+                files_table.c.id.in_(batch),
+            )
         )
-        conn.execute(
-            f"DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE file_id IN ({placeholders}))",
-            batch_tuple,
-        )
-        conn.execute(
-            f"DELETE FROM edges WHERE to_id IN (SELECT id FROM nodes WHERE file_id IN ({placeholders}))",
-            batch_tuple,
-        )
-        conn.execute(
-            f"DELETE FROM nodes WHERE file_id IN ({placeholders})",
-            batch_tuple,
-        )
-        cursor = conn.execute(
-            f"DELETE FROM files WHERE repo_id = ? AND id IN ({placeholders})",
-            (repo_id, *batch_tuple),
-        )
-        deleted += cursor.rowcount
+        deleted += max(res.rowcount or 0, 0)
     return deleted
 
 
 def prune_stale_files(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     keep_file_ids: set[str],
 ) -> int:
     """Delete files (and their edges and nodes) for ``repo_id`` not in ``keep_file_ids``."""
-    rows = conn.execute(
-        "SELECT id FROM files WHERE repo_id = ?",
-        (repo_id,),
-    ).fetchall()
-    stale_ids = [row["id"] for row in rows if row["id"] not in keep_file_ids]
+    existing_ids = [
+        str(fid)
+        for fid in conn.execute(select(files_table.c.id).where(files_table.c.repo_id == repo_id))
+        .scalars()
+        .all()
+    ]
+    stale_ids = [fid for fid in existing_ids if fid not in keep_file_ids]
     return _delete_files_by_ids_batched(conn, repo_id, stale_ids)
 
 
 def delete_files_not_in_set(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     keep_paths: set[str],
 ) -> int:
     """Delete file records (and associated graph state) whose file_path is not in ``keep_paths``."""
-    rows = conn.execute(
-        "SELECT id, file_path FROM files WHERE repo_id = ?",
-        (repo_id,),
-    ).fetchall()
-    stale_ids = [row["id"] for row in rows if row["file_path"] not in keep_paths]
+    rows = (
+        conn.execute(
+            select(files_table.c.id, files_table.c.file_path).where(
+                files_table.c.repo_id == repo_id
+            )
+        )
+        .mappings()
+        .all()
+    )
+    stale_ids = [str(row["id"]) for row in rows if row["file_path"] not in keep_paths]
     return _delete_files_by_ids_batched(conn, repo_id, stale_ids)
 
 
-def get_file_by_id(conn: sqlite3.Connection, file_id: str) -> dict | None:
+def get_file_by_id(conn: Connection, file_id: str) -> dict[str, Any] | None:
     """Get a file record dictionary by its ID."""
-    row = conn.execute(
-        """
-        SELECT id, repo_id, file_path, uri, module_path, language,
-               content_hash, size_bytes, line_count, is_test,
-               last_modified_at, last_indexed_at
-        FROM files
-        WHERE id = ?
-        """,
-        (file_id,),
-    ).fetchone()
+    row = conn.execute(select(files_table).where(files_table.c.id == file_id)).mappings().first()
     if row is None:
         return None
     return _row_to_file_dict(row)
 
 
 def get_file_by_path(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     file_path: str,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Get a file record dictionary by ``(repo_id, file_path)``."""
-    row = conn.execute(
-        """
-        SELECT id, repo_id, file_path, uri, module_path, language,
-               content_hash, size_bytes, line_count, is_test,
-               last_modified_at, last_indexed_at
-        FROM files
-        WHERE repo_id = ? AND file_path = ?
-        """,
-        (repo_id, file_path),
-    ).fetchone()
+    row = (
+        conn.execute(
+            select(files_table).where(
+                files_table.c.repo_id == repo_id,
+                files_table.c.file_path == file_path,
+            )
+        )
+        .mappings()
+        .first()
+    )
     if row is None:
         return None
     return _row_to_file_dict(row)

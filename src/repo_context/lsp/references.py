@@ -1,12 +1,13 @@
-"""LSP reference enrichment orchestrator."""
+"""LSP reference enrichment orchestrator using SQLAlchemy Core."""
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import delete, select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
 from repo_context.exceptions import LspError, PathSecurityError
@@ -21,10 +22,17 @@ from repo_context.lsp.mapper import (
 )
 from repo_context.lsp.resolver import get_reference_query_position, resolve_file_by_uri
 from repo_context.parsing.pathing import ensure_safe_repo_file
+from repo_context.storage import (
+    edges_table,
+    files_table,
+    list_nodes_for_file,
+    repos_table,
+    upsert_edges,
+    upsert_reference_refresh,
+)
 
 logger = get_logger("lsp.references")
 
-# Confidence levels
 CONFIDENCE_EXACT = 0.9
 CONFIDENCE_MODULE = 0.7
 
@@ -39,10 +47,7 @@ def build_reference_edge(
     evidence_range_json: dict[str, Any],
     payload_json: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build a references edge dict.
-
-    Edge ID format: edge:{repo_id}:references:{from_id}->{to_id}:{line}:{character}
-    """
+    """Build a references edge dict."""
     start = evidence_range_json["start"]
     edge_id = f"edge:{repo_id}:references:{from_id}->{to_id}:{start['line']}:{start['character']}"
     return {
@@ -61,32 +66,13 @@ def build_reference_edge(
     }
 
 
-def load_symbols_for_file(conn: sqlite3.Connection, file_id: str) -> list[dict[str, Any]]:
+def load_symbols_for_file(conn: Connection, file_id: str) -> list[dict[str, Any]]:
     """Load all symbols for a file."""
-    cursor = conn.execute(
-        "SELECT * FROM nodes WHERE file_id = ?",
-        (file_id,),
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        return []
-    if hasattr(rows[0], "keys"):
-        return [dict(row) for row in rows]
-    columns = [col[0] for col in cursor.description]
-    return [dict(zip(columns, row)) for row in rows]
-
-
-def _encode_json_once(value: Any, *, default_json: str | None = None) -> str | None:
-    """Serialize a dict/list to JSON once, preserving already-serialized strings."""
-    if value is None:
-        return default_json
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, sort_keys=True)
+    return list_nodes_for_file(conn, file_id)
 
 
 def replace_reference_edges_for_target(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_symbol_id: str,
     edges: list[dict[str, Any]],
     refresh_metadata: dict[str, Any],
@@ -95,83 +81,44 @@ def replace_reference_edges_for_target(
 
     def _apply() -> None:
         conn.execute(
-            "DELETE FROM edges WHERE kind = 'references' AND to_id = ?",
-            (target_symbol_id,),
-        )
-
-        if edges:
-            rows = [
-                (
-                    edge["id"],
-                    edge["repo_id"],
-                    edge["kind"],
-                    edge["from_id"],
-                    edge["to_id"],
-                    edge["source"],
-                    edge["confidence"],
-                    edge["evidence_file_id"],
-                    edge["evidence_uri"],
-                    _encode_json_once(edge.get("evidence_range_json")),
-                    _encode_json_once(edge.get("payload_json"), default_json="{}"),
-                    edge["last_indexed_at"],
-                )
-                for edge in edges
-            ]
-            conn.executemany(
-                """
-                INSERT INTO edges (
-                    id, repo_id, kind, from_id, to_id, source, confidence,
-                    evidence_file_id, evidence_uri, evidence_range_json,
-                    payload_json, last_indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
+            delete(edges_table).where(
+                edges_table.c.kind == "references",
+                edges_table.c.to_id == target_symbol_id,
             )
-
-        conn.execute(
-            """
-            INSERT INTO reference_refresh (
-                target_symbol_id, available, last_refreshed_at, refresh_status, error_code
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(target_symbol_id) DO UPDATE SET
-                available = excluded.available,
-                last_refreshed_at = excluded.last_refreshed_at,
-                refresh_status = excluded.refresh_status,
-                error_code = excluded.error_code
-            """,
-            (
-                refresh_metadata["target_symbol_id"],
-                int(bool(refresh_metadata["available"])),
-                refresh_metadata["last_refreshed_at"],
-                refresh_metadata.get("refresh_status"),
-                refresh_metadata.get("error_code"),
-            ),
+        )
+        if edges:
+            upsert_edges(conn, edges)  # type: ignore[arg-type]
+        upsert_reference_refresh(
+            conn,
+            refresh_metadata["target_symbol_id"],
+            bool(refresh_metadata["available"]),
+            refresh_metadata["last_refreshed_at"],
+            refresh_metadata.get("refresh_status"),
+            refresh_metadata.get("error_code"),
         )
 
-    if conn.in_transaction:
-        conn.execute("SAVEPOINT sp_replace_reference_edges")
+    if conn.in_transaction():
+        with conn.begin_nested():
+            _apply()
+    else:
         try:
             _apply()
+            conn.commit()
         except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT sp_replace_reference_edges")
-            conn.execute("RELEASE SAVEPOINT sp_replace_reference_edges")
+            if conn.in_transaction():
+                conn.rollback()
             raise
-        conn.execute("RELEASE SAVEPOINT sp_replace_reference_edges")
-    else:
-        with conn:
-            _apply()
 
 
-def _resolve_repo_root(conn: sqlite3.Connection, target_symbol: dict[str, Any]) -> Path:
+def _resolve_repo_root(conn: Connection, target_symbol: dict[str, Any]) -> Path:
     """Resolve and verify the repository root for a target symbol."""
     raw_root = target_symbol.get("repo_root")
     if not raw_root and target_symbol.get("repo_id"):
-        row = conn.execute(
-            "SELECT root_path FROM repos WHERE id = ? LIMIT 1",
-            (target_symbol["repo_id"],),
-        ).fetchone()
-        if row is not None:
-            raw_root = row["root_path"] if hasattr(row, "keys") else row[0]
+        raw_root = conn.execute(
+            select(repos_table.c.root_path)
+            .where(repos_table.c.id == target_symbol["repo_id"])
+            .limit(1)
+        ).scalar_one_or_none()
 
     if not raw_root:
         raise LspError(
@@ -243,32 +190,16 @@ def _load_file_lines_for_mapping(
 
 
 def enrich_references_for_symbol(
-    conn: sqlite3.Connection,
+    conn: Connection,
     lsp_client: Any,
     target_symbol: dict[str, Any],
     *,
     open_all_files: bool = False,
 ) -> dict[str, Any]:
-    """Enrich references for a single target symbol.
-
-    Args:
-        conn: SQLite connection.
-        lsp_client: PyrightLspClient instance (or compatible mock).
-        target_symbol: Target symbol dict with id, repo_id, file_id, file_path,
-            uri, qualified_name, kind, scope, range_json, selection_range_json,
-            and optional repo_root.
-        open_all_files: If True, also open all tracked .py files in the repo;
-            defaults to False because Pyright indexes via rootUri.
-
-    Returns:
-        Reference stats dict from build_reference_stats.
-    """
+    """Enrich references for a single target symbol."""
     cfg = get_config()
 
-    # Step 1: Resolve query position (in Python codepoint offsets)
     position = get_reference_query_position(target_symbol)
-
-    # Step 2: Resolve repo_root and validate target file path inside repo
     repo_root_path = _resolve_repo_root(conn, target_symbol)
     raw_file_path = target_symbol.get("file_path")
     if not raw_file_path:
@@ -288,20 +219,24 @@ def enrich_references_for_symbol(
     target_lines = target_text.splitlines()
     query_position = position_codepoint_to_utf16(target_lines, position)
 
-    # Step 3: Ensure client started & open target document
     lsp_client.start(str(repo_root_path))
     target_uri = target_symbol.get("uri") or target_file_path.as_uri()
     _send_did_open(lsp_client, target_uri, target_text)
 
-    # Step 4: Optionally open all tracked .py files in this repository
     if open_all_files:
-        rows = conn.execute(
-            "SELECT file_path, uri FROM files WHERE repo_id = ? AND file_path LIKE '%.py'",
-            (target_symbol["repo_id"],),
-        ).fetchall()
+        rows = (
+            conn.execute(
+                select(files_table.c.file_path, files_table.c.uri).where(
+                    files_table.c.repo_id == target_symbol["repo_id"],
+                    files_table.c.file_path.like("%.py"),
+                )
+            )
+            .mappings()
+            .all()
+        )
         for row in rows:
-            rel_path = row["file_path"] if hasattr(row, "keys") else row[0]
-            uri = row["uri"] if hasattr(row, "keys") else row[1]
+            rel_path = row["file_path"]
+            uri = row["uri"]
             try:
                 safe_aux_path = ensure_safe_repo_file(repo_root_path, repo_root_path / rel_path)
                 if safe_aux_path == target_file_path:
@@ -311,7 +246,6 @@ def enrich_references_for_symbol(
             except (PathSecurityError, LspError, OSError) as exc:
                 logger.debug("Skipping auxiliary file %s during didOpen: %s", rel_path, exc)
 
-    # Step 5: Request references from LSP server
     locations = (
         lsp_client.find_references(
             target_uri,
@@ -322,7 +256,6 @@ def enrich_references_for_symbol(
         or []
     )
 
-    # Step 6: Map locations to symbols using per-call memoized caches
     edges: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, int, int]] = set()
     file_by_uri_cache: dict[str, dict[str, Any] | None] = {}

@@ -202,7 +202,7 @@ WPID=$!; sleep 1; printf "\ndef added_live():\n    return 42\n" >> /tmp/manual_w
 ### MCP `stdio` Server (`rc serve`)
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"0.1"}}}\n' | ./rc serve --debug
-.venv/bin/python -c 'import asyncio, mcp, mcp.client.stdio as s; exec("async def f():\n async with s.stdio_client(mcp.StdioServerParameters(command=\"./rc\",args=[\"serve\"])) as (r,w):\n  async with mcp.ClientSession(r,w) as c: await c.initialize(); print([t.name for t in (await c.list_tools()).tools])\nasyncio.run(f())")'
+venv/bin/python -c 'import asyncio, mcp, mcp.client.stdio as s; exec("async def f():\n async with s.stdio_client(mcp.StdioServerParameters(command=\"./rc\",args=[\"serve\"])) as (r,w):\n  async with mcp.ClientSession(r,w) as c: await c.initialize(); print([t.name for t in (await c.list_tools()).tools])\nasyncio.run(f())")'
 ```
 **Expected:** First line prints the `initialize` JSON-RPC response on stdout (and debug tool list on stderr); second line connects as a live MCP client and prints all 8 tool names.
 

@@ -1,7 +1,8 @@
 """Context builders for assembling slim, bounded symbol-centered graph views."""
 
 from collections import Counter
-import sqlite3
+
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import (
     EDGE_KIND_CALLS,
@@ -208,7 +209,7 @@ def _compute_relationship_counts(
 
 
 def build_symbol_context(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     edge_limit: int = 20,

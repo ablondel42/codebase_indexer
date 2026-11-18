@@ -1,60 +1,23 @@
-"""Node persistence and FTS5/LIKE search helpers."""
+"""Node persistence and FTS5/LIKE search helpers using SQLAlchemy Core."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping
 import json
 import re
-import sqlite3
 from typing import Any
+
+from sqlalchemy import case, delete, func, literal_column, or_, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from repo_context.exceptions import DatabaseError, ValidationError
 from repo_context.logging_config import get_logger
 from repo_context.models.node import SymbolNode
+from repo_context.storage.schema import files_table, nodes_fts_table, nodes_table
 
 logger = get_logger("storage.nodes")
-
-_NODE_COLUMNS = (
-    "id, repo_id, file_id, language, kind, name, qualified_name, uri, "
-    "range_json, selection_range_json, start_line, end_line, signature, "
-    "parent_id, visibility_hint, doc_summary, content_hash, semantic_hash, "
-    "source, confidence, payload_json, scope, lexical_parent_id, last_indexed_at"
-)
-
-_UPSERT_NODE_SQL = """
-INSERT INTO nodes (
-    id, repo_id, file_id, language, kind, name, qualified_name, uri,
-    range_json, selection_range_json, start_line, end_line, signature,
-    parent_id, visibility_hint, doc_summary, content_hash, semantic_hash,
-    source, confidence, payload_json, scope, lexical_parent_id, last_indexed_at
-) VALUES (
-    :id, :repo_id, :file_id, :language, :kind, :name, :qualified_name, :uri,
-    :range_json, :selection_range_json, :start_line, :end_line, :signature,
-    :parent_id, :visibility_hint, :doc_summary, :content_hash, :semantic_hash,
-    :source, :confidence, :payload_json, :scope, :lexical_parent_id, :last_indexed_at
-)
-ON CONFLICT(id) DO UPDATE SET
-    repo_id = excluded.repo_id,
-    file_id = excluded.file_id,
-    language = excluded.language,
-    kind = excluded.kind,
-    name = excluded.name,
-    qualified_name = excluded.qualified_name,
-    uri = excluded.uri,
-    range_json = excluded.range_json,
-    selection_range_json = excluded.selection_range_json,
-    start_line = excluded.start_line,
-    end_line = excluded.end_line,
-    signature = excluded.signature,
-    parent_id = excluded.parent_id,
-    visibility_hint = excluded.visibility_hint,
-    doc_summary = excluded.doc_summary,
-    content_hash = excluded.content_hash,
-    semantic_hash = excluded.semantic_hash,
-    source = excluded.source,
-    confidence = excluded.confidence,
-    payload_json = excluded.payload_json,
-    scope = excluded.scope,
-    lexical_parent_id = excluded.lexical_parent_id,
-    last_indexed_at = excluded.last_indexed_at
-"""
 
 _SPECIAL_FTS_CHARS_RE = re.compile(r"[^A-Za-z0-9_.\s]")
 
@@ -68,10 +31,10 @@ def _ensure_json_string(value: Any, *, default: str | None = None) -> str | None
     return json.dumps(value, sort_keys=True)
 
 
-def _deserialize_json(value: str | None) -> Any:
-    """Deserialize a JSON string to a Python object."""
-    if value is None:
-        return None
+def _deserialize_json(value: Any) -> Any:
+    """Deserialize a JSON string if needed; pass already-decoded Python objects through."""
+    if value is None or not isinstance(value, str):
+        return value
     return json.loads(value)
 
 
@@ -80,7 +43,7 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _validate_and_normalize_node(node: dict | SymbolNode) -> SymbolNode:
+def _validate_and_normalize_node(node: dict[str, Any] | SymbolNode) -> SymbolNode:
     """Validate and normalize a node input."""
     if isinstance(node, SymbolNode):
         return node
@@ -97,7 +60,7 @@ def _validate_and_normalize_node(node: dict | SymbolNode) -> SymbolNode:
         raise ValidationError(f"Invalid node data: {exc}") from exc
 
 
-def node_to_row(node: dict) -> dict:
+def node_to_row(node: dict[str, Any]) -> dict[str, Any]:
     """Convert node dictionary to database row values without double JSON encoding."""
     return {
         "id": node["id"],
@@ -127,8 +90,8 @@ def node_to_row(node: dict) -> dict:
     }
 
 
-def row_to_node(row: sqlite3.Row) -> dict:
-    """Convert a SQLite row to a node dictionary with deserialized JSON fields."""
+def row_to_node(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a database mapping row to a node dictionary with decoded JSON fields."""
     return {
         "id": row["id"],
         "repo_id": row["repo_id"],
@@ -157,14 +120,26 @@ def row_to_node(row: sqlite3.Row) -> dict:
     }
 
 
-def upsert_node(conn: sqlite3.Connection, node: dict | SymbolNode) -> None:
+def _build_upsert_node_stmt() -> Any:
+    base = sqlite_insert(nodes_table)
+    return base.on_conflict_do_update(
+        index_elements=[nodes_table.c.id],
+        set_={
+            col.name: base.excluded[col.name]
+            for col in nodes_table.columns
+            if col.name != "id"
+        },
+    )
+
+
+def upsert_node(conn: Connection, node: dict[str, Any] | SymbolNode) -> None:
     """Insert or update a single node."""
     validated = _validate_and_normalize_node(node)
     logger.debug("Upserting node", extra={"node_id": validated.id})
     row = node_to_row(validated.model_dump())
     try:
-        conn.execute(_UPSERT_NODE_SQL, row)
-    except sqlite3.Error as exc:
+        conn.execute(_build_upsert_node_stmt(), row)
+    except SQLAlchemyError as exc:
         logger.error(
             "Database error upserting node",
             extra={"node_id": validated.id, "error": str(exc)},
@@ -172,119 +147,96 @@ def upsert_node(conn: sqlite3.Connection, node: dict | SymbolNode) -> None:
         raise DatabaseError(f"Failed to upsert node {validated.id}: {exc}") from exc
 
 
-def upsert_nodes(conn: sqlite3.Connection, nodes: list[dict | SymbolNode]) -> None:
+def upsert_nodes(conn: Connection, nodes: list[dict[str, Any] | SymbolNode]) -> None:
     """Insert or update multiple nodes in a single batch."""
     if not nodes:
         return
     rows = [node_to_row(_validate_and_normalize_node(node).model_dump()) for node in nodes]
     try:
-        conn.executemany(_UPSERT_NODE_SQL, rows)
-    except sqlite3.Error as exc:
+        conn.execute(_build_upsert_node_stmt(), rows)
+    except SQLAlchemyError as exc:
         logger.error("Database error upserting nodes batch", extra={"error": str(exc)})
         raise DatabaseError(f"Failed to upsert {len(rows)} nodes: {exc}") from exc
 
 
-def get_node_by_id(conn: sqlite3.Connection, node_id: str) -> dict | None:
+def get_node_by_id(conn: Connection, node_id: str) -> dict[str, Any] | None:
     """Get a node by its ID."""
-    row = conn.execute(
-        f"SELECT {_NODE_COLUMNS} FROM nodes WHERE id = ?",
-        (node_id,),
-    ).fetchone()
+    row = conn.execute(select(nodes_table).where(nodes_table.c.id == node_id)).mappings().first()
     if row is None:
         return None
     return row_to_node(row)
 
 
 def get_node_by_qualified_name(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     qualified_name: str,
     kind: str | None = None,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Get a node by exact qualified name (returns None if missing or ambiguous)."""
+    stmt = select(nodes_table).where(
+        nodes_table.c.repo_id == repo_id,
+        nodes_table.c.qualified_name == qualified_name,
+    )
     if kind is not None:
-        rows = conn.execute(
-            f"""
-            SELECT {_NODE_COLUMNS}
-            FROM nodes
-            WHERE repo_id = ? AND qualified_name = ? AND kind = ?
-            """,
-            (repo_id, qualified_name, kind),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"""
-            SELECT {_NODE_COLUMNS}
-            FROM nodes
-            WHERE repo_id = ? AND qualified_name = ?
-            """,
-            (repo_id, qualified_name),
-        ).fetchall()
-
+        stmt = stmt.where(nodes_table.c.kind == kind)
+    rows = conn.execute(stmt).mappings().all()
     if len(rows) != 1:
         return None
     return row_to_node(rows[0])
 
 
-def list_nodes_for_file(conn: sqlite3.Connection, file_id: str) -> list[dict]:
+def list_nodes_for_file(conn: Connection, file_id: str) -> list[dict[str, Any]]:
     """List all nodes for a specific file ordered by source start_line."""
-    rows = conn.execute(
-        f"""
-        SELECT {_NODE_COLUMNS}
-        FROM nodes
-        WHERE file_id = ?
-        ORDER BY COALESCE(start_line, 0), kind, qualified_name, id
-        """,
-        (file_id,),
-    ).fetchall()
-    return [row_to_node(row) for row in rows]
+    stmt = (
+        select(nodes_table)
+        .where(nodes_table.c.file_id == file_id)
+        .order_by(
+            func.coalesce(nodes_table.c.start_line, 0),
+            nodes_table.c.kind,
+            nodes_table.c.qualified_name,
+            nodes_table.c.id,
+        )
+    )
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
-def list_nodes_for_repo(conn: sqlite3.Connection, repo_id: str) -> list[dict]:
+def list_nodes_for_repo(conn: Connection, repo_id: str) -> list[dict[str, Any]]:
     """List all nodes for a specific repository ordered by kind, qualified_name, id."""
-    rows = conn.execute(
-        f"""
-        SELECT {_NODE_COLUMNS}
-        FROM nodes
-        WHERE repo_id = ?
-        ORDER BY kind, qualified_name, id
-        """,
-        (repo_id,),
-    ).fetchall()
-    return [row_to_node(row) for row in rows]
+    stmt = (
+        select(nodes_table)
+        .where(nodes_table.c.repo_id == repo_id)
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+    )
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def find_nodes_by_name(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     name_pattern: str,
     kind: str | None = None,
     limit: int = 50,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Find nodes by name or qualified name using safely escaped SQL LIKE."""
     if not name_pattern or limit <= 0:
         return []
     like_pattern = f"%{_escape_like(name_pattern)}%"
-    params: list[Any] = [repo_id, like_pattern, like_pattern]
-    kind_clause = ""
+    stmt = select(nodes_table).where(
+        nodes_table.c.repo_id == repo_id,
+        or_(
+            nodes_table.c.name.like(like_pattern, escape="\\"),
+            nodes_table.c.qualified_name.like(like_pattern, escape="\\"),
+        ),
+    )
     if kind is not None:
-        kind_clause = " AND kind = ?"
-        params.append(kind)
-    params.append(limit)
-
-    rows = conn.execute(
-        f"""
-        SELECT {_NODE_COLUMNS}
-        FROM nodes
-        WHERE repo_id = ?
-          AND (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')
-          {kind_clause}
-        ORDER BY kind, qualified_name, id
-        LIMIT ?
-        """,
-        params,
-    ).fetchall()
-    return [row_to_node(row) for row in rows]
+        stmt = stmt.where(nodes_table.c.kind == kind)
+    stmt = stmt.order_by(
+        nodes_table.c.kind,
+        nodes_table.c.qualified_name,
+        nodes_table.c.id,
+    ).limit(limit)
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def _build_fts_match_expression(raw_query: str) -> str | None:
@@ -302,74 +254,83 @@ def _build_fts_match_expression(raw_query: str) -> str | None:
     return " ".join(quoted_terms)
 
 
+def _search_rank_case(raw_query: str, prefix_pattern: str) -> Any:
+    """Build deterministic exact/prefix match priority ranking CASE expression."""
+    return case(
+        (func.lower(nodes_table.c.name) == func.lower(raw_query), 0),
+        (func.lower(nodes_table.c.qualified_name) == func.lower(raw_query), 1),
+        (func.lower(nodes_table.c.name).like(func.lower(prefix_pattern), escape="\\"), 2),
+        (
+            func.lower(nodes_table.c.qualified_name).like(
+                func.lower(prefix_pattern), escape="\\"
+            ),
+            3,
+        ),
+        else_=4,
+    )
+
+
 def _search_nodes_like_fallback(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     raw_query: str,
     *,
     kind: str | None = None,
     file_path: str | None = None,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Fallback escaped LIKE search when query uses special tokens or FTS has no hits."""
     escaped = _escape_like(raw_query)
     sub_pattern = f"%{escaped}%"
     prefix_pattern = f"{escaped}%"
 
-    join_sql = "LEFT JOIN files f ON f.id = n.file_id"
-    where_clauses = [
-        "n.repo_id = ?",
-        (
-            "(n.name LIKE ? ESCAPE '\\' "
-            "OR n.qualified_name LIKE ? ESCAPE '\\' "
-            "OR COALESCE(n.signature, '') LIKE ? ESCAPE '\\' "
-            "OR COALESCE(n.doc_summary, '') LIKE ? ESCAPE '\\')"
-        ),
-    ]
-    params: list[Any] = [repo_id, sub_pattern, sub_pattern, sub_pattern, sub_pattern]
-
+    from_clause = (
+        nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
+        if file_path is not None
+        else nodes_table.outerjoin(files_table, files_table.c.id == nodes_table.c.file_id)
+    )
+    stmt = (
+        select(nodes_table)
+        .select_from(from_clause)
+        .where(
+            nodes_table.c.repo_id == repo_id,
+            or_(
+                nodes_table.c.name.like(sub_pattern, escape="\\"),
+                nodes_table.c.qualified_name.like(sub_pattern, escape="\\"),
+                func.coalesce(nodes_table.c.signature, "").like(sub_pattern, escape="\\"),
+                func.coalesce(nodes_table.c.doc_summary, "").like(sub_pattern, escape="\\"),
+            ),
+        )
+    )
     if kind is not None:
-        where_clauses.append("n.kind = ?")
-        params.append(kind)
+        stmt = stmt.where(nodes_table.c.kind == kind)
     if file_path is not None:
-        join_sql = "JOIN files f ON f.id = n.file_id"
         fp_clean = file_path.rstrip("/")
-        where_clauses.append("(f.file_path = ? OR f.file_path LIKE ? ESCAPE '\\')")
-        params.extend([file_path, f"{_escape_like(fp_clean)}/%"])
+        stmt = stmt.where(
+            or_(
+                files_table.c.file_path == file_path,
+                files_table.c.file_path.like(f"{_escape_like(fp_clean)}/%", escape="\\"),
+            )
+        )
 
-    order_params = [raw_query, raw_query, prefix_pattern, prefix_pattern]
-    node_cols = ", ".join(f"n.{col.strip()}" for col in _NODE_COLUMNS.split(","))
-    sql = f"""
-        SELECT {node_cols}
-        FROM nodes n
-        {join_sql}
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY
-            CASE
-                WHEN LOWER(n.name) = LOWER(?) THEN 0
-                WHEN LOWER(n.qualified_name) = LOWER(?) THEN 1
-                WHEN LOWER(n.name) LIKE LOWER(?) ESCAPE '\\' THEN 2
-                WHEN LOWER(n.qualified_name) LIKE LOWER(?) ESCAPE '\\' THEN 3
-                ELSE 4
-            END ASC,
-            n.kind ASC,
-            n.qualified_name ASC,
-            n.id ASC
-        LIMIT ?
-    """
-    rows = conn.execute(sql, [*params, *order_params, limit]).fetchall()
-    return [row_to_node(row) for row in rows]
+    stmt = stmt.order_by(
+        _search_rank_case(raw_query, prefix_pattern).asc(),
+        nodes_table.c.kind.asc(),
+        nodes_table.c.qualified_name.asc(),
+        nodes_table.c.id.asc(),
+    ).limit(limit)
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def search_nodes_fts(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     query: str,
     *,
     kind: str | None = None,
     file_path: str | None = None,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Search symbol nodes via FTS5 with exact/prefix ranking boost and safe LIKE fallback."""
     if not query or not query.strip() or limit <= 0:
         return []
@@ -382,44 +343,45 @@ def search_nodes_fts(
         )
 
     prefix_pattern = f"{_escape_like(raw_query)}%"
-    join_files = "LEFT JOIN files f ON f.id = n.file_id"
-    where_clauses = ["nodes_fts MATCH ?", "n.repo_id = ?"]
-    params: list[Any] = [fts_expr, repo_id]
-
-    if kind is not None:
-        where_clauses.append("n.kind = ?")
-        params.append(kind)
+    from_clause = nodes_fts_table.join(
+        nodes_table,
+        literal_column("nodes.rowid") == nodes_fts_table.c.rowid,
+    )
     if file_path is not None:
-        join_files = "JOIN files f ON f.id = n.file_id"
-        fp_clean = file_path.rstrip("/")
-        where_clauses.append("(f.file_path = ? OR f.file_path LIKE ? ESCAPE '\\')")
-        params.extend([file_path, f"{_escape_like(fp_clean)}/%"])
+        from_clause = from_clause.join(files_table, files_table.c.id == nodes_table.c.file_id)
+    else:
+        from_clause = from_clause.outerjoin(files_table, files_table.c.id == nodes_table.c.file_id)
 
-    order_params = [raw_query, raw_query, prefix_pattern, prefix_pattern]
-    node_cols = ", ".join(f"n.{col.strip()}" for col in _NODE_COLUMNS.split(","))
-    sql = f"""
-        SELECT {node_cols}
-        FROM nodes_fts
-        JOIN nodes n ON n.rowid = nodes_fts.rowid
-        {join_files}
-        WHERE {' AND '.join(where_clauses)}
-        ORDER BY
-            CASE
-                WHEN LOWER(n.name) = LOWER(?) THEN 0
-                WHEN LOWER(n.qualified_name) = LOWER(?) THEN 1
-                WHEN LOWER(n.name) LIKE LOWER(?) ESCAPE '\\' THEN 2
-                WHEN LOWER(n.qualified_name) LIKE LOWER(?) ESCAPE '\\' THEN 3
-                ELSE 4
-            END ASC,
-            bm25(nodes_fts, 0.0, 0.0, 10.0, 8.0, 3.0, 1.0) ASC,
-            n.kind ASC,
-            n.qualified_name ASC,
-            n.id ASC
-        LIMIT ?
-    """
+    stmt = (
+        select(nodes_table)
+        .select_from(from_clause)
+        .where(
+            literal_column("nodes_fts").op("MATCH")(fts_expr),
+            nodes_table.c.repo_id == repo_id,
+        )
+    )
+    if kind is not None:
+        stmt = stmt.where(nodes_table.c.kind == kind)
+    if file_path is not None:
+        fp_clean = file_path.rstrip("/")
+        stmt = stmt.where(
+            or_(
+                files_table.c.file_path == file_path,
+                files_table.c.file_path.like(f"{_escape_like(fp_clean)}/%", escape="\\"),
+            )
+        )
+
+    stmt = stmt.order_by(
+        _search_rank_case(raw_query, prefix_pattern).asc(),
+        func.bm25(literal_column("nodes_fts"), 0.0, 0.0, 10.0, 8.0, 3.0, 1.0).asc(),
+        nodes_table.c.kind.asc(),
+        nodes_table.c.qualified_name.asc(),
+        nodes_table.c.id.asc(),
+    ).limit(limit)
+
     try:
-        rows = conn.execute(sql, [*params, *order_params, limit]).fetchall()
-    except sqlite3.OperationalError:
+        rows = conn.execute(stmt).mappings().all()
+    except OperationalError:
         return _search_nodes_like_fallback(
             conn, repo_id, raw_query, kind=kind, file_path=file_path, limit=limit
         )
@@ -431,34 +393,36 @@ def search_nodes_fts(
     return [row_to_node(row) for row in rows]
 
 
-def list_child_nodes(conn: sqlite3.Connection, parent_id: str) -> list[dict]:
+def list_child_nodes(conn: Connection, parent_id: str) -> list[dict[str, Any]]:
     """List structural child nodes by ``parent_id``."""
-    rows = conn.execute(
-        f"""
-        SELECT {_NODE_COLUMNS}
-        FROM nodes
-        WHERE parent_id = ?
-        ORDER BY COALESCE(start_line, 0), kind, name, id
-        """,
-        (parent_id,),
-    ).fetchall()
-    return [row_to_node(row) for row in rows]
+    stmt = (
+        select(nodes_table)
+        .where(nodes_table.c.parent_id == parent_id)
+        .order_by(
+            func.coalesce(nodes_table.c.start_line, 0),
+            nodes_table.c.kind,
+            nodes_table.c.name,
+            nodes_table.c.id,
+        )
+    )
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
-def list_lexical_children(conn: sqlite3.Connection, lexical_parent_id: str) -> list[dict]:
+def list_lexical_children(conn: Connection, lexical_parent_id: str) -> list[dict[str, Any]]:
     """List lexical child nodes by ``lexical_parent_id``."""
-    rows = conn.execute(
-        f"""
-        SELECT {_NODE_COLUMNS}
-        FROM nodes
-        WHERE lexical_parent_id = ?
-        ORDER BY COALESCE(start_line, 0), kind, name, id
-        """,
-        (lexical_parent_id,),
-    ).fetchall()
-    return [row_to_node(row) for row in rows]
+    stmt = (
+        select(nodes_table)
+        .where(nodes_table.c.lexical_parent_id == lexical_parent_id)
+        .order_by(
+            func.coalesce(nodes_table.c.start_line, 0),
+            nodes_table.c.kind,
+            nodes_table.c.name,
+            nodes_table.c.id,
+        )
+    )
+    return [row_to_node(row) for row in conn.execute(stmt).mappings().all()]
 
 
-def delete_nodes_for_file(conn: sqlite3.Connection, file_id: str) -> None:
+def delete_nodes_for_file(conn: Connection, file_id: str) -> None:
     """Delete all nodes owned by a specific file."""
-    conn.execute("DELETE FROM nodes WHERE file_id = ?", (file_id,))
+    conn.execute(delete(nodes_table).where(nodes_table.c.file_id == file_id))

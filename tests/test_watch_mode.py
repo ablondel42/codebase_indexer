@@ -3,12 +3,13 @@
 from collections.abc import Iterator
 import json
 from pathlib import Path
-import sqlite3
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import AppConfig
 from repo_context.indexing.events import FileChangeEvent, normalize_event
@@ -23,15 +24,18 @@ from repo_context.indexing.watch import _process_watch_batch, make_watch_connect
 from repo_context.parsing.pathing import derive_file_id, derive_repo_id
 from repo_context.storage import (
     close_connection,
+    edges_table,
     get_connection,
     initialize_database,
+    nodes_table,
+    reference_refresh_table,
     upsert_edges,
     upsert_reference_refresh,
 )
 
 
 @pytest.fixture
-def watch_env(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path, Path, AppConfig]]:
+def watch_env(tmp_path: Path) -> Iterator[tuple[Connection, Path, Path, AppConfig]]:
     """Yield ``(conn, db_path, repo_root, config)`` and close the connection in teardown."""
     db_path = tmp_path / "watch.db"
     repo_root = tmp_path / "repo"
@@ -57,7 +61,7 @@ class TestEventNormalization:
 
     def test_created_modified_deleted_return_list_with_repo_id(
         self,
-        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        watch_env: tuple[Connection, Path, Path, AppConfig],
     ) -> None:
         _, _, repo_root, cfg = watch_env
         expected_repo_id = derive_repo_id(repo_root)
@@ -74,7 +78,7 @@ class TestEventNormalization:
 
     def test_moved_event_rename_and_tmp_atomic_save(
         self,
-        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        watch_env: tuple[Connection, Path, Path, AppConfig],
     ) -> None:
         _, _, repo_root, cfg = watch_env
         old_path = repo_root / "src" / "old_mod.py"
@@ -107,7 +111,7 @@ class TestEventNormalization:
 
     def test_traversal_symlink_ignored_dirs_and_tests_filtering(
         self,
-        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        watch_env: tuple[Connection, Path, Path, AppConfig],
         tmp_path: Path,
     ) -> None:
         _, _, repo_root, cfg = watch_env
@@ -226,7 +230,7 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
 
     def test_handle_deleted_file_leaves_zero_orphan_edges_and_marks_external_stale(
         self,
-        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        watch_env: tuple[Connection, Path, Path, AppConfig],
     ) -> None:
         conn, _, repo_root, cfg = watch_env
         repo_id = derive_repo_id(repo_root)
@@ -234,12 +238,22 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
         assert reindex_changed_file(conn, repo_root, "src/helper.py", cfg)["status"] == "reindexed"
         assert reindex_changed_file(conn, repo_root, "src/module.py", cfg)["status"] == "reindexed"
 
-        helper_sym_id = conn.execute(
-            "SELECT id FROM nodes WHERE name = 'helper' AND kind = 'function'"
-        ).fetchone()["id"]
-        hello_sym_id = conn.execute(
-            "SELECT id FROM nodes WHERE name = 'hello' AND kind = 'function'"
-        ).fetchone()["id"]
+        helper_sym_id = str(
+            conn.execute(
+                select(nodes_table.c.id).where(
+                    nodes_table.c.name == "helper",
+                    nodes_table.c.kind == "function",
+                )
+            ).scalar_one()
+        )
+        hello_sym_id = str(
+            conn.execute(
+                select(nodes_table.c.id).where(
+                    nodes_table.c.name == "hello",
+                    nodes_table.c.kind == "function",
+                )
+            ).scalar_one()
+        )
         helper_file_id = derive_file_id(repo_id, "src/helper.py")
         module_file_id = derive_file_id(repo_id, "src/module.py")
 
@@ -272,10 +286,11 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
         assert removed_refs == 1
         assert (
             conn.execute(
-                "SELECT available FROM reference_refresh WHERE target_symbol_id = ?",
-                (helper_sym_id,),
-            ).fetchone()["available"]
-            == 0
+                select(reference_refresh_table.c.available).where(
+                    reference_refresh_table.c.target_symbol_id == helper_sym_id
+                )
+            ).scalar_one()
+            is False
         )
 
         # Delete src/helper.py and verify zero orphan edges remain pointing to helper_sym_id
@@ -283,15 +298,24 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
         assert summary["status"] == "deleted"
         assert summary["deleted_node_count"] > 0
 
-        orphan_count = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE from_id = ? OR to_id = ? OR evidence_file_id = ?",
-            (helper_sym_id, helper_sym_id, helper_file_id),
-        ).fetchone()[0]
+        orphan_count = int(
+            conn.execute(
+                select(func.count())
+                .select_from(edges_table)
+                .where(
+                    or_(
+                        edges_table.c.from_id == helper_sym_id,
+                        edges_table.c.to_id == helper_sym_id,
+                        edges_table.c.evidence_file_id == helper_file_id,
+                    )
+                )
+            ).scalar_one()
+        )
         assert orphan_count == 0
 
     def test_parse_error_rollback_preserves_prior_graph_and_rejects_traversal(
         self,
-        watch_env: tuple[sqlite3.Connection, Path, Path, AppConfig],
+        watch_env: tuple[Connection, Path, Path, AppConfig],
         tmp_path: Path,
     ) -> None:
         conn, _, repo_root, cfg = watch_env
@@ -299,19 +323,27 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
         file_id = derive_file_id(repo_id, "src/module.py")
 
         assert reindex_changed_file(conn, repo_root, "src/module.py", cfg)["status"] == "reindexed"
-        nodes_before = conn.execute(
-            "SELECT id FROM nodes WHERE file_id = ? ORDER BY id", (file_id,)
-        ).fetchall()
+        nodes_before = list(
+            conn.execute(
+                select(nodes_table.c.id)
+                .where(nodes_table.c.file_id == file_id)
+                .order_by(nodes_table.c.id.asc())
+            ).scalars()
+        )
         assert len(nodes_before) >= 2
 
         # Write syntax error and verify parse_failed preserves previous nodes
         (repo_root / "src" / "module.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
         failed = reindex_changed_file(conn, repo_root, "src/module.py", cfg)
         assert failed["status"] == "parse_failed"
-        nodes_after = conn.execute(
-            "SELECT id FROM nodes WHERE file_id = ? ORDER BY id", (file_id,)
-        ).fetchall()
-        assert [r["id"] for r in nodes_after] == [r["id"] for r in nodes_before]
+        nodes_after = list(
+            conn.execute(
+                select(nodes_table.c.id)
+                .where(nodes_table.c.file_id == file_id)
+                .order_by(nodes_table.c.id.asc())
+            ).scalars()
+        )
+        assert nodes_after == nodes_before
 
         # Traversal outside repo_root is rejected
         outside = tmp_path / "outside.py"
@@ -354,10 +386,7 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
 
         verify_conn = get_connection(custom_db, read_only=True)
         try:
-            names = {
-                row["name"]
-                for row in verify_conn.execute("SELECT name FROM nodes").fetchall()
-            }
+            names = set(verify_conn.execute(select(nodes_table.c.name)).scalars())
             assert "run" in names
         finally:
             close_connection(verify_conn)
@@ -408,15 +437,19 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
             assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
             assert reindex_changed_file(conn, repo_root, "a.py", cfg)["status"] == "reindexed"
 
-            helper_id = conn.execute(
-                "SELECT id FROM nodes WHERE name = 'helper' AND kind = 'function'"
-            ).fetchone()["id"]
-            keep_id = conn.execute(
-                "SELECT id FROM nodes WHERE name = 'keep' AND kind = 'function'"
-            ).fetchone()["id"]
-            caller_id = conn.execute(
-                "SELECT id FROM nodes WHERE name = 'caller' AND kind = 'function'"
-            ).fetchone()["id"]
+            def _fn_id(name: str) -> str:
+                return str(
+                    conn.execute(
+                        select(nodes_table.c.id).where(
+                            nodes_table.c.name == name,
+                            nodes_table.c.kind == "function",
+                        )
+                    ).scalar_one()
+                )
+
+            helper_id = _fn_id("helper")
+            keep_id = _fn_id("keep")
+            caller_id = _fn_id("caller")
 
             # Seed an LSP reference edge from unmodified a.py -> b.helper
             upsert_edges(
@@ -446,36 +479,47 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
             )
             assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
 
-            incoming_kinds = {
-                row["kind"]
-                for row in conn.execute(
-                    """
-                    SELECT kind FROM edges
-                    WHERE repo_id = ? AND to_id = ? AND evidence_file_id = ?
-                    """,
-                    (repo_id, helper_id, a_file_id),
-                ).fetchall()
-            }
+            incoming_kinds = set(
+                conn.execute(
+                    select(edges_table.c.kind).where(
+                        edges_table.c.repo_id == repo_id,
+                        edges_table.c.to_id == helper_id,
+                        edges_table.c.evidence_file_id == a_file_id,
+                    )
+                ).scalars()
+            )
             assert incoming_kinds == {"imports", "calls", "references"}
 
             # 2. Remove helper from b.py -> a.py edges reset & dangling references pruned
             b_file.write_text("def keep() -> int:\n    return 2\n", encoding="utf-8")
             assert reindex_changed_file(conn, repo_root, "b.py", cfg)["status"] == "reindexed"
 
-            a_edges = conn.execute(
-                "SELECT kind, to_id FROM edges WHERE repo_id = ? AND evidence_file_id = ?",
-                (repo_id, a_file_id),
-            ).fetchall()
+            a_edges = (
+                conn.execute(
+                    select(edges_table.c.kind, edges_table.c.to_id).where(
+                        edges_table.c.repo_id == repo_id,
+                        edges_table.c.evidence_file_id == a_file_id,
+                    )
+                )
+                .mappings()
+                .all()
+            )
             by_kind_to = {(row["kind"], row["to_id"]) for row in a_edges}
             assert ("imports", "external_or_unresolved:b.helper") in by_kind_to
             assert ("calls", "unresolved_call:helper") in by_kind_to
             assert ("imports", keep_id) in by_kind_to
             assert ("calls", keep_id) in by_kind_to
             assert (
-                conn.execute(
-                    "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND kind = 'references'",
-                    (repo_id,),
-                ).fetchone()[0]
+                int(
+                    conn.execute(
+                        select(func.count())
+                        .select_from(edges_table)
+                        .where(
+                            edges_table.c.repo_id == repo_id,
+                            edges_table.c.kind == "references",
+                        )
+                    ).scalar_one()
+                )
                 == 0
             )
         finally:

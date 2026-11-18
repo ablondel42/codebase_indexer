@@ -4,10 +4,11 @@ import asyncio
 from collections import Counter
 import json
 from pathlib import Path
-import sqlite3
 from typing import Any
 
 from mcp.server import MCPServer
+from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
 from repo_context.context import (
@@ -63,11 +64,13 @@ from repo_context.mcp.schemas import (
 from repo_context.parsing.pathing import ensure_safe_repo_file
 from repo_context.storage import (
     connection_scope,
+    files_table,
     get_file_by_id,
     get_node_by_id,
     get_repo_by_id,
     initialize_database,
     list_index_runs,
+    nodes_table,
     resolve_repo_id,
 )
 from repo_context.storage.nodes import row_to_node
@@ -106,7 +109,7 @@ def _normalize_path_prefix(path_prefix: str) -> str:
     return clean.rstrip("/")
 
 
-def _format_ambiguous_candidates(conn: sqlite3.Connection, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _format_ambiguous_candidates(conn: Connection, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build compact disambiguation candidate entries for ambiguous symbol lookups."""
     file_ids = [c.get("file_id") for c in candidates if c.get("file_id")]
     files_by_id = get_files_by_ids(conn, file_ids)
@@ -128,7 +131,7 @@ def _format_ambiguous_candidates(conn: sqlite3.Connection, candidates: list[dict
 
 
 def _resolve_symbol_target(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     symbol_ref: str,
 ) -> dict[str, Any]:
@@ -142,10 +145,18 @@ def _resolve_symbol_target(
             )
         return node
 
-    exact_qname_rows = conn.execute(
-        "SELECT * FROM nodes WHERE repo_id = ? AND qualified_name = ? ORDER BY kind, id",
-        (repo_id, symbol_ref),
-    ).fetchall()
+    exact_qname_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == repo_id,
+                nodes_table.c.qualified_name == symbol_ref,
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.id)
+        )
+        .mappings()
+        .all()
+    )
     if len(exact_qname_rows) == 1:
         return row_to_node(exact_qname_rows[0])
     if len(exact_qname_rows) > 1:
@@ -156,10 +167,18 @@ def _resolve_symbol_target(
             context={"candidates": _format_ambiguous_candidates(conn, candidates)},
         )
 
-    exact_name_rows = conn.execute(
-        "SELECT * FROM nodes WHERE repo_id = ? AND name = ? ORDER BY kind, qualified_name, id",
-        (repo_id, symbol_ref),
-    ).fetchall()
+    exact_name_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == repo_id,
+                nodes_table.c.name == symbol_ref,
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+        )
+        .mappings()
+        .all()
+    )
     if len(exact_name_rows) == 1:
         return row_to_node(exact_name_rows[0])
     if len(exact_name_rows) > 1:
@@ -171,15 +190,19 @@ def _resolve_symbol_target(
         )
 
     suffix_pattern = f"%.{_escape_like(symbol_ref)}"
-    suffix_rows = conn.execute(
-        """
-        SELECT * FROM nodes
-        WHERE repo_id = ? AND qualified_name LIKE ? ESCAPE '\\'
-        ORDER BY kind, qualified_name, id
-        LIMIT 25
-        """,
-        (repo_id, suffix_pattern),
-    ).fetchall()
+    suffix_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == repo_id,
+                nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+            .limit(25)
+        )
+        .mappings()
+        .all()
+    )
     if len(suffix_rows) == 1:
         return row_to_node(suffix_rows[0])
     if len(suffix_rows) > 1:
@@ -215,10 +238,15 @@ def _sync_get_repo_overview(
             )
 
         stats = get_repo_graph_stats(conn, resolved_repo_id)
-        file_rows = conn.execute(
-            "SELECT file_path, is_test FROM files WHERE repo_id = ? ORDER BY file_path",
-            (resolved_repo_id,),
-        ).fetchall()
+        file_rows = (
+            conn.execute(
+                select(files_table.c.file_path, files_table.c.is_test)
+                .where(files_table.c.repo_id == resolved_repo_id)
+                .order_by(files_table.c.file_path)
+            )
+            .mappings()
+            .all()
+        )
 
         top_dir_counts: Counter[str] = Counter()
         for row in file_rows:
@@ -302,34 +330,42 @@ def _sync_list_files(
         initialize_database(conn)
         resolved_repo_id = resolve_repo_id(conn, inp.repo_id)
 
-        where_clauses = ["repo_id = ?"]
-        params: list[Any] = [resolved_repo_id]
-
+        filters: list[Any] = [files_table.c.repo_id == resolved_repo_id]
         if not inp.include_tests:
-            where_clauses.append("is_test = 0")
+            filters.append(files_table.c.is_test.is_(False))
 
         if inp.path_prefix is not None:
             clean_prefix = _normalize_path_prefix(inp.path_prefix)
             if clean_prefix:
                 escaped = _escape_like(clean_prefix)
-                where_clauses.append("(file_path = ? OR file_path LIKE ? ESCAPE '\\')")
-                params.extend([clean_prefix, f"{escaped}/%"])
+                filters.append(
+                    or_(
+                        files_table.c.file_path == clean_prefix,
+                        files_table.c.file_path.like(f"{escaped}/%", escape="\\"),
+                    )
+                )
 
-        where_sql = " AND ".join(where_clauses)
         total_count = int(
-            conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", tuple(params)).fetchone()[0]
+            conn.execute(select(func.count()).select_from(files_table).where(*filters)).scalar_one()
         )
 
-        rows = conn.execute(
-            f"""
-            SELECT file_path, module_path, line_count, size_bytes, is_test
-            FROM files
-            WHERE {where_sql}
-            ORDER BY file_path
-            LIMIT ? OFFSET ?
-            """,
-            (*params, inp.limit, inp.offset),
-        ).fetchall()
+        rows = (
+            conn.execute(
+                select(
+                    files_table.c.file_path,
+                    files_table.c.module_path,
+                    files_table.c.line_count,
+                    files_table.c.size_bytes,
+                    files_table.c.is_test,
+                )
+                .where(*filters)
+                .order_by(files_table.c.file_path)
+                .limit(inp.limit)
+                .offset(inp.offset)
+            )
+            .mappings()
+            .all()
+        )
 
         files = [
             {

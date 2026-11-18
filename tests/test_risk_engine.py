@@ -3,9 +3,9 @@
 from collections.abc import Iterator
 import json
 from pathlib import Path
-import sqlite3
 
 import pytest
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_INHERITS, EDGE_KIND_REFERENCES
 from repo_context.graph.risk_engine import analyze_symbol_risk, analyze_target_set_risk
@@ -55,7 +55,7 @@ from repo_context.storage import (
 
 
 @pytest.fixture
-def initialized_conn(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
+def initialized_conn(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
     """Yield an initialized SQLite connection and real repo directory, closing in teardown."""
     repo_root = tmp_path / "repo"
     (repo_root / "src").mkdir(parents=True)
@@ -67,7 +67,7 @@ def initialized_conn(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]
         close_connection(conn)
 
 
-def _seed_two_module_graph(conn: sqlite3.Connection, repo_root: Path) -> str:
+def _seed_two_module_graph(conn: Connection, repo_root: Path) -> str:
     """Populate a realistic two-module graph backed by real disk files."""
     repo_id = "repo:test:12345678"
     f1_disk = repo_root / "src" / "module1.py"
@@ -284,7 +284,7 @@ def _seed_two_module_graph(conn: sqlite3.Connection, repo_root: Path) -> str:
 
 
 def test_load_risk_targets_populates_file_metadata_from_files_join(
-    initialized_conn: tuple[sqlite3.Connection, Path],
+    initialized_conn: tuple[Connection, Path],
 ) -> None:
     """load_risk_targets joins files so file_path, module_path, is_test, and line bounds populate."""
     conn, repo_root = initialized_conn
@@ -343,7 +343,7 @@ def test_is_public_like_checks_local_scope_before_visibility_hint() -> None:
 
 
 def test_base_class_incoming_inherits_and_method_inheritance_risk(
-    initialized_conn: tuple[sqlite3.Connection, Path],
+    initialized_conn: tuple[Connection, Path],
 ) -> None:
     """Base classes (incoming inherits) and their methods flag inheritance_risk."""
     conn, repo_root = initialized_conn
@@ -362,7 +362,7 @@ def test_base_class_incoming_inherits_and_method_inheritance_risk(
 
 
 def test_multi_module_targets_and_cross_module_impact(
-    initialized_conn: tuple[sqlite3.Connection, Path],
+    initialized_conn: tuple[Connection, Path],
 ) -> None:
     """Multi-target analysis detects multi-file/multi-module targets and cross-module impact."""
     conn, repo_root = initialized_conn
@@ -390,7 +390,7 @@ def test_multi_module_targets_and_cross_module_impact(
 
 
 def test_disk_staleness_and_low_confidence_edge_capping(
-    initialized_conn: tuple[sqlite3.Connection, Path],
+    initialized_conn: tuple[Connection, Path],
 ) -> None:
     """collect_stale_symbols detects modified disk files and low_confidence_edges caps at 25."""
     conn, repo_root = initialized_conn

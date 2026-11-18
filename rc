@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$DIR/.venv"
+VENV="$DIR/venv"
 
 if [ "$#" -eq 0 ]; then
     cat <<'EOF'
@@ -36,7 +36,7 @@ ensure_env() {
     if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
         local host_py
         host_py="$(find_python)"
-        echo "Bootstrapping .venv..." >&2
+        echo "Bootstrapping venv..." >&2
         if command -v uv >/dev/null 2>&1; then
             uv venv "$VENV" --python "$host_py" >&2 && uv pip install --python "$VENV/bin/python" -e "$DIR[dev]" >&2 || rm -rf "$VENV"
         else

@@ -1,12 +1,16 @@
-"""LSP query position resolver and file URI lookup."""
+"""LSP query position resolver and file URI lookup using SQLAlchemy Core."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
+
+from repo_context.storage.schema import files_table, repos_table
 
 
 def _parse_range_field(value: Any) -> dict[str, Any] | None:
@@ -22,20 +26,7 @@ def _parse_range_field(value: Any) -> dict[str, Any] | None:
 
 
 def get_reference_query_position(symbol: Any) -> dict[str, int]:
-    """Get the query position for finding references to a symbol.
-
-    Prefers selection_range_json.start (most precise - name only).
-    Falls back to range_json.start (full declaration range).
-
-    Args:
-        symbol: Symbol dictionary or object with range_json and selection_range_json.
-
-    Returns:
-        Position dict with 'line' and 'character' keys.
-
-    Raises:
-        ValueError: If symbol has no usable range information.
-    """
+    """Get the query position for finding references to a symbol."""
     if isinstance(symbol, dict):
         selection_range = symbol.get("selection_range_json")
         range_json = symbol.get("range_json")
@@ -55,18 +46,6 @@ def get_reference_query_position(symbol: Any) -> dict[str, int]:
     raise ValueError(f"Symbol {symbol_id} has no stored range for references query")
 
 
-def _row_to_dict(cursor: sqlite3.Cursor, row: Any) -> dict[str, Any] | None:
-    """Convert a SQLite row (Row or tuple) to a plain dict."""
-    if row is None:
-        return None
-    if isinstance(row, dict):
-        return row
-    if hasattr(row, "keys"):
-        return dict(row)
-    columns = [col[0] for col in cursor.description]
-    return dict(zip(columns, row))
-
-
 def _extract_file_candidates(uri: str) -> tuple[list[str], Path | None]:
     """Build candidate file URIs and canonical filesystem path from a URI string."""
     candidates: list[str] = []
@@ -84,7 +63,12 @@ def _extract_file_candidates(uri: str) -> tuple[list[str], Path | None]:
 
     if parsed.scheme in ("file", "") and parsed.path:
         decoded_path = unquote(parsed.path)
-        if len(decoded_path) >= 3 and decoded_path[0] == "/" and decoded_path[2] == ":" and decoded_path[1].isalpha():
+        if (
+            len(decoded_path) >= 3
+            and decoded_path[0] == "/"
+            and decoded_path[2] == ":"
+            and decoded_path[1].isalpha()
+        ):
             decoded_path = decoded_path[1:]
 
         raw_path = Path(decoded_path)
@@ -113,66 +97,50 @@ def _extract_file_candidates(uri: str) -> tuple[list[str], Path | None]:
 
 
 def resolve_file_by_uri(
-    conn: sqlite3.Connection,
+    conn: Connection,
     uri: str,
     repo_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve a file record by URI, percent-decoded URI, or canonical resolved path.
-
-    Args:
-        conn: SQLite connection.
-        uri: File URI to look up.
-        repo_id: Optional repository ID to scope the query.
-
-    Returns:
-        File record dict or None if not found.
-    """
+    """Resolve a file record by URI, percent-decoded URI, or canonical resolved path."""
     if not uri:
         return None
 
     candidate_uris, resolved_path = _extract_file_candidates(uri)
-    placeholders = ",".join("?" for _ in candidate_uris)
-
+    stmt = select(files_table).where(files_table.c.uri.in_(candidate_uris))
     if repo_id is not None:
-        cursor = conn.execute(
-            f"SELECT * FROM files WHERE repo_id = ? AND uri IN ({placeholders}) LIMIT 1",
-            (repo_id, *candidate_uris),
-        )
-    else:
-        cursor = conn.execute(
-            f"SELECT * FROM files WHERE uri IN ({placeholders}) LIMIT 1",
-            tuple(candidate_uris),
-        )
-    row = cursor.fetchone()
+        stmt = stmt.where(files_table.c.repo_id == repo_id)
+    row = conn.execute(stmt.limit(1)).mappings().first()
     if row is not None:
-        return _row_to_dict(cursor, row)
+        return dict(row)
 
-    # Canonical path fallback via repos.root_path handles symlinked roots (e.g. /var -> /private/var)
     if resolved_path is not None:
+        repo_stmt = select(repos_table.c.id, repos_table.c.root_path)
         if repo_id is not None:
-            repo_cursor = conn.execute(
-                "SELECT id, root_path FROM repos WHERE id = ?",
-                (repo_id,),
-            )
-        else:
-            repo_cursor = conn.execute("SELECT id, root_path FROM repos")
+            repo_stmt = repo_stmt.where(repos_table.c.id == repo_id)
 
-        for repo_row in repo_cursor.fetchall():
-            repo_dict = _row_to_dict(repo_cursor, repo_row)
-            if not repo_dict or not repo_dict.get("root_path"):
+        for repo_row in conn.execute(repo_stmt).mappings().all():
+            root_val = repo_row["root_path"]
+            if not root_val:
                 continue
             try:
-                repo_root = Path(repo_dict["root_path"]).resolve()
+                repo_root = Path(root_val).resolve()
                 rel_path = resolved_path.relative_to(repo_root).as_posix()
             except (OSError, ValueError):
                 continue
 
-            file_cursor = conn.execute(
-                "SELECT * FROM files WHERE repo_id = ? AND file_path = ? LIMIT 1",
-                (repo_dict["id"], rel_path),
+            matched = (
+                conn.execute(
+                    select(files_table)
+                    .where(
+                        files_table.c.repo_id == repo_row["id"],
+                        files_table.c.file_path == rel_path,
+                    )
+                    .limit(1)
+                )
+                .mappings()
+                .first()
             )
-            matched = file_cursor.fetchone()
             if matched is not None:
-                return _row_to_dict(file_cursor, matched)
+                return dict(matched)
 
     return None

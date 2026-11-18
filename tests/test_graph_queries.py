@@ -2,9 +2,9 @@
 
 from collections.abc import Iterator
 from pathlib import Path
-import sqlite3
 
 import pytest
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import (
     EDGE_KIND_CALLS,
@@ -52,7 +52,7 @@ from repo_context.storage import (
 
 
 @pytest.fixture
-def query_db(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
+def query_db(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
     """Yield an initialized DB populated with real files on disk and rich graph edges."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -312,7 +312,7 @@ def query_db(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
         close_connection(conn)
 
 
-def test_symbol_and_hierarchy_lookups(query_db: tuple[sqlite3.Connection, Path]) -> None:
+def test_symbol_and_hierarchy_lookups(query_db: tuple[Connection, Path]) -> None:
     """Symbol lookups, batch ID fetches, and parent/child navigation work cleanly."""
     conn, _ = query_db
     repo_id = "repo:test:12345678"
@@ -334,7 +334,7 @@ def test_symbol_and_hierarchy_lookups(query_db: tuple[sqlite3.Connection, Path])
     assert len(batched_files) == 2
 
 
-def test_directed_edge_queries(query_db: tuple[sqlite3.Connection, Path]) -> None:
+def test_directed_edge_queries(query_db: tuple[Connection, Path]) -> None:
     """Directed edge queries return incoming/outgoing calls, imports, and inherits."""
     conn, _ = query_db
 
@@ -349,7 +349,7 @@ def test_directed_edge_queries(query_db: tuple[sqlite3.Connection, Path]) -> Non
     assert len(get_outgoing_inherits(conn, "sym:sub")) == 1
 
 
-def test_fts5_search_and_escaped_like(query_db: tuple[sqlite3.Connection, Path]) -> None:
+def test_fts5_search_and_escaped_like(query_db: tuple[Connection, Path]) -> None:
     """search_symbols_fts handles exact/prefix ranking, filters, and special tokens safely."""
     conn, _ = query_db
     repo_id = "repo:test:12345678"
@@ -378,7 +378,7 @@ def test_fts5_search_and_escaped_like(query_db: tuple[sqlite3.Connection, Path])
     assert search_symbols_fts(conn, repo_id, "NOT OR * \"bad\"") == []
 
 
-def test_outline_helpers_and_disk_freshness(query_db: tuple[sqlite3.Connection, Path]) -> None:
+def test_outline_helpers_and_disk_freshness(query_db: tuple[Connection, Path]) -> None:
     """Outline helpers and check_file_disk_freshness reflect live disk edits."""
     conn, repo_root = query_db
     repo_id = "repo:test:12345678"

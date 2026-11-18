@@ -1,4 +1,4 @@
-"""Handlers for `rc files` and `rc outline`."""
+"""Handlers for `rc files` and `rc outline` using SQLAlchemy Core."""
 
 from __future__ import annotations
 
@@ -8,16 +8,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import func, select
+
+from repo_context.cli.utils import format_freshness_label, resolve_db_path
 from repo_context.context import build_file_outline
 from repo_context.exceptions import ValidationError
 from repo_context.graph import check_file_disk_freshness
 from repo_context.storage import (
     connection_scope,
+    files_table,
     get_repo_by_id,
     initialize_database,
+    nodes_table,
     resolve_repo_id,
 )
-from repo_context.cli.utils import format_freshness_label, resolve_db_path
 
 
 def _matches_file_pattern(file_path: str, module_path: str, pattern: str | None) -> bool:
@@ -48,21 +52,21 @@ def cmd_files(args: argparse.Namespace) -> int:
         repo_id = resolve_repo_id(conn, repo_arg)
         repo = get_repo_by_id(conn, repo_id)
 
-        where_sql = "f.repo_id = ?" + ("" if include_tests else " AND f.is_test = 0")
-        rows = conn.execute(
-            f"""
-            SELECT f.id, f.repo_id, f.file_path, f.uri, f.module_path, f.language,
-                   f.content_hash, f.size_bytes, f.line_count, f.is_test,
-                   f.last_modified_at, f.last_indexed_at,
-                   COUNT(n.id) AS symbol_count
-            FROM files f
-            LEFT JOIN nodes n ON n.file_id = f.id
-            WHERE {where_sql}
-            GROUP BY f.id
-            ORDER BY f.file_path
-            """,
-            (repo_id,),
-        ).fetchall()
+        stmt = (
+            select(
+                files_table,
+                func.count(nodes_table.c.id).label("symbol_count"),
+            )
+            .select_from(
+                files_table.outerjoin(nodes_table, nodes_table.c.file_id == files_table.c.id)
+            )
+            .where(files_table.c.repo_id == repo_id)
+        )
+        if not include_tests:
+            stmt = stmt.where(files_table.c.is_test.is_(False))
+        stmt = stmt.group_by(files_table.c.id).order_by(files_table.c.file_path)
+
+        rows = conn.execute(stmt).mappings().all()
 
         matched: list[dict[str, Any]] = []
         for row in rows:
@@ -129,7 +133,9 @@ def cmd_outline(args: argparse.Namespace) -> int:
         candidate = Path(file_path_arg)
         if candidate.is_absolute() and repo is not None:
             try:
-                file_path_arg = candidate.resolve().relative_to(Path(repo.root_path).resolve()).as_posix()
+                file_path_arg = (
+                    candidate.resolve().relative_to(Path(repo.root_path).resolve()).as_posix()
+                )
             except ValueError:
                 pass
 

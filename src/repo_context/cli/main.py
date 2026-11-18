@@ -9,9 +9,10 @@ import logging
 import os
 from pathlib import Path
 import shlex
-import sqlite3
 import sys
 from typing import Any
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from repo_context import __version__
 from repo_context.constants import VALID_SYMBOL_KINDS
@@ -450,7 +451,13 @@ def dispatch_args(args: argparse.Namespace) -> int:
     except RepoContextError as exc:
         _print_cli_error(exc.error_code, exc.message, details=exc.context)
         return 1
-    except (FileNotFoundError, NotADirectoryError, sqlite3.Error, json.JSONDecodeError, ValueError) as exc:
+    except (
+        FileNotFoundError,
+        NotADirectoryError,
+        SQLAlchemyError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
         _print_cli_error("error", str(exc))
         return 1
     except BrokenPipeError:

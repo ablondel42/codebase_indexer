@@ -2,7 +2,8 @@
 
 import hashlib
 from pathlib import Path
-import sqlite3
+
+from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
 from repo_context.context.helpers import format_line_span
@@ -175,7 +176,7 @@ def _resolve_symbol_line_bounds(node: dict) -> tuple[int, int]:
 
 
 def read_symbol_source(
-    conn: sqlite3.Connection,
+    conn: Connection,
     symbol_id: str,
     *,
     max_lines: int = 120,

@@ -1,13 +1,19 @@
 """Freshness metadata and disk state verification for symbol context."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-import sqlite3
+from typing import Any
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.context.helpers import is_lsp_enriched
 from repo_context.graph.queries import check_file_disk_freshness
 from repo_context.models import SymbolContext
+from repo_context.storage.schema import edges_table
 
 
 def _latest_timestamp(timestamps: Sequence[str | None]) -> str | None:
@@ -27,9 +33,9 @@ def _latest_timestamp(timestamps: Sequence[str | None]) -> str | None:
 
 def _compute_edge_snapshot_timestamp(
     context: SymbolContext,
-    focus_node: dict,
-    conn: sqlite3.Connection | None,
-    raw_edges: Sequence[dict] | None,
+    focus_node: dict[str, Any],
+    conn: Connection | None,
+    raw_edges: Sequence[dict[str, Any]] | None,
 ) -> str | None:
     """Compute the latest ``last_indexed_at`` timestamp across edges for ``focus_node``."""
     if raw_edges is not None:
@@ -44,29 +50,27 @@ def _compute_edge_snapshot_timestamp(
         return _latest_timestamp(adapted_timestamps)
 
     if conn is not None and focus_node.get("id"):
-        row = conn.execute(
-            """
-            SELECT MAX(last_indexed_at) AS latest_ts
-            FROM edges
-            WHERE from_id = ? OR to_id = ?
-            """,
-            (focus_node["id"], focus_node["id"]),
-        ).fetchone()
-        if row is not None:
-            return row["latest_ts"]
+        fid = focus_node["id"]
+        latest = conn.execute(
+            select(func.max(edges_table.c.last_indexed_at)).where(
+                or_(edges_table.c.from_id == fid, edges_table.c.to_id == fid)
+            )
+        ).scalar_one_or_none()
+        if latest is not None:
+            return str(latest)
 
     return None
 
 
 def build_freshness(
     context: SymbolContext,
-    focus_node: dict,
-    conn: sqlite3.Connection | None = None,
+    focus_node: dict[str, Any],
+    conn: Connection | None = None,
     *,
-    raw_edges: Sequence[dict] | None = None,
-    file_record: dict | None = None,
+    raw_edges: Sequence[dict[str, Any]] | None = None,
+    file_record: dict[str, Any] | None = None,
     repo_root: str | Path | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Build freshness metadata with real disk hash/existence and edge snapshot checks."""
     node_last_indexed_at = focus_node.get("last_indexed_at")
     edge_snapshot_timestamp = _compute_edge_snapshot_timestamp(

@@ -4,9 +4,10 @@ import ast
 from collections.abc import Iterator
 import json
 from pathlib import Path
-import sqlite3
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import AppConfig
 from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_CONTAINS, EDGE_KIND_SCOPE_PARENT
@@ -19,8 +20,10 @@ from repo_context.parsing.ranges import make_declaration_lines, make_name_select
 from repo_context.parsing.scanner import build_file_record, build_repo_record, scan_repository
 from repo_context.storage import (
     close_connection,
+    edges_table,
     get_connection,
     initialize_database,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_repo,
@@ -30,7 +33,7 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 @pytest.fixture
-def initialized_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+def initialized_conn(tmp_path: Path) -> Iterator[Connection]:
     """Yield an initialized v2 SQLite connection and close it on teardown."""
     conn = get_connection(tmp_path / "ast.db")
     try:
@@ -41,7 +44,7 @@ def initialized_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _persist_single_file(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_root: Path,
     rel_path: str,
 ) -> tuple[str, list[dict], list[dict]]:
@@ -234,7 +237,7 @@ def test_assignments_constants_attributes_and_type_aliases(tmp_path: Path) -> No
 
 
 def test_relative_imports_calls_and_linker_resolution(
-    initialized_conn: sqlite3.Connection,
+    initialized_conn: Connection,
     tmp_path: Path,
 ) -> None:
     """Extracts relative imports & call qualifiers, and resolves intra-repo edges cleanly."""
@@ -282,49 +285,51 @@ def test_relative_imports_calls_and_linker_resolution(
     assert link_stats["inherits_resolved"] >= 1
     assert link_stats["calls_resolved"] >= 3
 
-    worker_cls = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'Worker'"
-    ).fetchone()["id"]
-    base_cls = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'BaseService'"
-    ).fetchone()["id"]
-    step_fn = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'step'"
-    ).fetchone()["id"]
-    compute_fn = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'compute'"
-    ).fetchone()["id"]
-    helper_fn = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'helper'"
-    ).fetchone()["id"]
-    run_fn = initialized_conn.execute(
-        "SELECT id FROM nodes WHERE name = 'run'"
-    ).fetchone()["id"]
+    def _node_id(name: str) -> str:
+        return str(
+            initialized_conn.execute(
+                select(nodes_table.c.id).where(nodes_table.c.name == name)
+            ).scalar_one()
+        )
 
-    inh_edge = initialized_conn.execute(
-        "SELECT to_id FROM edges WHERE kind = 'inherits' AND from_id = ?",
-        (worker_cls,),
-    ).fetchone()
-    assert inh_edge["to_id"] == base_cls
+    worker_cls = _node_id("Worker")
+    base_cls = _node_id("BaseService")
+    step_fn = _node_id("step")
+    compute_fn = _node_id("compute")
+    helper_fn = _node_id("helper")
+    run_fn = _node_id("run")
 
-    call_targets = {
-        row["to_id"]
-        for row in initialized_conn.execute(
-            "SELECT to_id FROM edges WHERE kind = ? AND from_id = ?",
-            (EDGE_KIND_CALLS, run_fn),
-        ).fetchall()
-    }
+    inh_to = initialized_conn.execute(
+        select(edges_table.c.to_id).where(
+            edges_table.c.kind == "inherits",
+            edges_table.c.from_id == worker_cls,
+        )
+    ).scalar_one()
+    assert inh_to == base_cls
+
+    call_targets = set(
+        initialized_conn.execute(
+            select(edges_table.c.to_id).where(
+                edges_table.c.kind == EDGE_KIND_CALLS,
+                edges_table.c.from_id == run_fn,
+            )
+        ).scalars()
+    )
     assert {step_fn, compute_fn, helper_fn}.issubset(call_targets)
 
 
 def test_edge_json_is_single_encoded_in_sqlite(
-    initialized_conn: sqlite3.Connection,
+    initialized_conn: Connection,
 ) -> None:
     """Persisted edge JSON columns parse once directly to dicts (never double-encoded strings)."""
     _persist_single_file(initialized_conn, FIXTURES_DIR / "simple_package", "services.py")
-    rows = initialized_conn.execute(
-        "SELECT payload_json, evidence_range_json FROM edges WHERE evidence_range_json IS NOT NULL"
-    ).fetchall()
+    rows = (
+        initialized_conn.exec_driver_sql(
+            "SELECT payload_json, evidence_range_json FROM edges WHERE evidence_range_json IS NOT NULL"
+        )
+        .mappings()
+        .all()
+    )
     assert len(rows) > 0
     for row in rows:
         payload = json.loads(row["payload_json"])

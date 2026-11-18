@@ -1,14 +1,18 @@
 """Intra-repository AST edge linker for imports, inheritance, and call-sites."""
 
-import json
-import sqlite3
 from collections import defaultdict, deque
+import json
+from typing import Any
+
+from sqlalchemy import bindparam, select, update
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import (
     EDGE_KIND_CALLS,
     EDGE_KIND_IMPORTS,
     EDGE_KIND_INHERITS,
 )
+from repo_context.storage.schema import edges_table, nodes_table, repos_table
 
 _CALLABLE_KINDS = frozenset(
     {
@@ -44,7 +48,7 @@ def _parse_payload(raw_payload: str | dict | None) -> dict:
 class _RepoGraphIndex:
     """In-memory index of repository nodes for fast intra-repo linking."""
 
-    def __init__(self, conn: sqlite3.Connection, repo_id: str) -> None:
+    def __init__(self, conn: Connection, repo_id: str) -> None:
         self.node_by_id: dict[str, dict] = {}
         self.nodes_by_qname: dict[str, list[dict]] = defaultdict(list)
         self.nodes_by_alt_qname: dict[str, list[dict]] = defaultdict(list)
@@ -53,19 +57,30 @@ class _RepoGraphIndex:
         self.module_by_alt_qname: dict[str, dict] = {}
         self.children_by_parent_and_name: dict[tuple[str, str], list[dict]] = defaultdict(list)
 
-        repo_row = conn.execute("SELECT name FROM repos WHERE id = ?", (repo_id,)).fetchone()
-        self.repo_name: str | None = repo_row[0] if repo_row is not None else None
+        repo_name = conn.execute(
+            select(repos_table.c.name).where(repos_table.c.id == repo_id)
+        ).scalar_one_or_none()
+        self.repo_name: str | None = str(repo_name) if repo_name is not None else None
 
-        cursor = conn.execute(
-            """
-            SELECT id, file_id, kind, name, qualified_name, parent_id, scope, lexical_parent_id
-            FROM nodes
-            WHERE repo_id = ?
-            ORDER BY kind, qualified_name, id
-            """,
-            (repo_id,),
+        rows = (
+            conn.execute(
+                select(
+                    nodes_table.c.id,
+                    nodes_table.c.file_id,
+                    nodes_table.c.kind,
+                    nodes_table.c.name,
+                    nodes_table.c.qualified_name,
+                    nodes_table.c.parent_id,
+                    nodes_table.c.scope,
+                    nodes_table.c.lexical_parent_id,
+                )
+                .where(nodes_table.c.repo_id == repo_id)
+                .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+            )
+            .mappings()
+            .all()
         )
-        for row in cursor.fetchall():
+        for row in rows:
             node = dict(row)
             node_id = node["id"]
             qname = node["qualified_name"]
@@ -238,66 +253,69 @@ def _resolve_prefixed_target(
 
 
 def _stage_edge_update(
-    edge: dict,
+    edge: dict[str, Any],
     resolved_id: str | None,
     placeholder_id: str,
     default_confidence: float,
-    updates: list[tuple[str, float, str]],
+    updates: list[dict[str, Any]],
 ) -> tuple[int, int]:
-    """Queue an edge UPDATE if resolved or if a stale broken link needs resetting.
-
-    Returns ``(resolved_delta, reset_delta)``.
-    """
+    """Queue an edge UPDATE if resolved or if a stale broken link needs resetting."""
     current_to = edge["to_id"]
     if resolved_id is not None:
         if current_to != resolved_id:
-            updates.append((resolved_id, _RESOLVED_CONFIDENCE, edge["id"]))
+            updates.append(
+                {
+                    "b_id": edge["id"],
+                    "b_to_id": resolved_id,
+                    "b_confidence": _RESOLVED_CONFIDENCE,
+                }
+            )
             return 1, 0
         return 0, 0
 
     if not current_to.startswith(_UNRESOLVED_PREFIXES):
-        # Previously resolved symbol no longer exists -> reset to placeholder cleanly.
         if current_to != placeholder_id:
-            updates.append((placeholder_id, default_confidence, edge["id"]))
+            updates.append(
+                {
+                    "b_id": edge["id"],
+                    "b_to_id": placeholder_id,
+                    "b_confidence": default_confidence,
+                }
+            )
             return 0, 1
     return 0, 0
 
 
 def resolve_repo_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     *,
     file_id: str | None = None,
-) -> dict:
-    """Resolve intra-repo ``imports``, ``inherits``, and ``calls`` edges against SQLite nodes.
-
-    Handles direct and aliased imports, package ``__init__.py`` re-exports,
-    ``src.`` layout module paths, same-file and enclosing-scope lookups,
-    inheritance-based ``self.method`` / ``cls.method`` / ``super().method`` calls,
-    and module-qualified calls. Executes ``UPDATE edges`` within the caller's
-    active transaction.
-
-    Args:
-        conn: Writable SQLite connection.
-        repo_id: Repository ID to link.
-        file_id: Optional file ID to restrict edge updates to one file (all repo
-            imports/inherits are still inspected for cross-file resolution context).
-
-    Returns:
-        Summary statistics dictionary with counts of resolved/reset edges.
-    """
+) -> dict[str, Any]:
+    """Resolve intra-repo ``imports``, ``inherits``, and ``calls`` edges against SQLite nodes."""
     index = _RepoGraphIndex(conn, repo_id)
 
-    all_edges_cursor = conn.execute(
-        """
-        SELECT id, kind, from_id, to_id, confidence, evidence_file_id, payload_json
-        FROM edges
-        WHERE repo_id = ? AND kind IN (?, ?, ?)
-        ORDER BY kind, id
-        """,
-        (repo_id, EDGE_KIND_IMPORTS, EDGE_KIND_INHERITS, EDGE_KIND_CALLS),
+    edge_rows = (
+        conn.execute(
+            select(
+                edges_table.c.id,
+                edges_table.c.kind,
+                edges_table.c.from_id,
+                edges_table.c.to_id,
+                edges_table.c.confidence,
+                edges_table.c.evidence_file_id,
+                edges_table.c.payload_json,
+            )
+            .where(
+                edges_table.c.repo_id == repo_id,
+                edges_table.c.kind.in_((EDGE_KIND_IMPORTS, EDGE_KIND_INHERITS, EDGE_KIND_CALLS)),
+            )
+            .order_by(edges_table.c.kind, edges_table.c.id)
+        )
+        .mappings()
+        .all()
     )
-    all_edges = [dict(row) for row in all_edges_cursor.fetchall()]
+    all_edges = [dict(row) for row in edge_rows]
 
     import_edges = [e for e in all_edges if e["kind"] == EDGE_KIND_IMPORTS]
     inherit_edges = [e for e in all_edges if e["kind"] == EDGE_KIND_INHERITS]
@@ -308,7 +326,7 @@ def resolve_repo_edges(
         and (file_id is None or e["evidence_file_id"] == file_id)
     ]
 
-    updates: list[tuple[str, float, str]] = []
+    updates: list[dict[str, Any]] = []
     file_bindings: dict[str, dict[str, str]] = defaultdict(dict)
     dotted_import_map: dict[str, dict[str, str]] = defaultdict(dict)
     imports_resolved = 0
@@ -554,8 +572,13 @@ def resolve_repo_edges(
         edges_reset += reset_delta
 
     if updates:
-        conn.executemany(
-            "UPDATE edges SET to_id = ?, confidence = ? WHERE id = ?",
+        conn.execute(
+            update(edges_table)
+            .where(edges_table.c.id == bindparam("b_id"))
+            .values(
+                to_id=bindparam("b_to_id"),
+                confidence=bindparam("b_confidence"),
+            ),
             updates,
         )
 

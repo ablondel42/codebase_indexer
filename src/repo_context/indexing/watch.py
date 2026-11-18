@@ -6,10 +6,10 @@ and scheduler, and processes incremental updates sequentially.
 
 import json
 from pathlib import Path
-import sqlite3
 import time
 from typing import Any, Callable
 
+from sqlalchemy.engine import Connection
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -58,11 +58,11 @@ class _RepoFileHandler(FileSystemEventHandler):
             self._scheduler.submit(normalized)
 
 
-def make_watch_connection_factory(db_path: Path | str) -> Callable[[], sqlite3.Connection]:
+def make_watch_connection_factory(db_path: Path | str) -> Callable[[], Connection]:
     """Create a connection factory bound to ``db_path`` without re-initializing schema."""
     resolved_db_path = Path(db_path)
 
-    def _open_connection() -> sqlite3.Connection:
+    def _open_connection() -> Connection:
         return get_connection(resolved_db_path)
 
     return _open_connection
@@ -164,7 +164,7 @@ def watch_repo(
 
 
 def _process_watch_batch(
-    conn_factory_func: Callable[[], sqlite3.Connection],
+    conn_factory_func: Callable[[], Connection],
     repo_root: Path,
     events: list[FileChangeEvent],
     config: AppConfig,

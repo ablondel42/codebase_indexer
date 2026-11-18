@@ -1,8 +1,13 @@
-"""Graph query layer for symbol, file outline, and edge retrieval."""
+"""Graph query layer for symbol, file outline, and edge retrieval using SQLAlchemy Core."""
+
+from __future__ import annotations
 
 from collections.abc import Iterable
 from pathlib import Path
-import sqlite3
+from typing import Any
+
+from sqlalchemy import case, func, select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
 from repo_context.constants import (
@@ -37,6 +42,7 @@ from repo_context.storage.nodes import (
     row_to_node,
     search_nodes_fts,
 )
+from repo_context.storage.schema import edges_table, files_table, nodes_table, repos_table
 
 CALLABLE_KINDS = {
     SYMBOL_KIND_FUNCTION,
@@ -52,65 +58,44 @@ LOCAL_CALLABLE_KINDS = {
     SYMBOL_KIND_LOCAL_ASYNC_FUNCTION,
 }
 
-_EDGE_SELECT_COLUMNS = (
-    "id, repo_id, kind, from_id, to_id, source, confidence, "
-    "evidence_file_id, evidence_uri, evidence_range_json, payload_json, last_indexed_at"
-)
-
-_NODE_SELECT_COLUMNS = (
-    "id, repo_id, file_id, language, kind, name, qualified_name, uri, "
-    "range_json, selection_range_json, start_line, end_line, signature, "
-    "parent_id, visibility_hint, doc_summary, content_hash, semantic_hash, "
-    "source, confidence, payload_json, scope, lexical_parent_id, last_indexed_at"
-)
-
 _BATCH_SIZE = 400
 
 
-def _limit_offset_clause(limit: int | None, offset: int) -> tuple[str, tuple[int, ...]]:
-    """Build SQLite LIMIT/OFFSET clause safely."""
-    if limit is not None:
-        return " LIMIT ? OFFSET ?", (int(limit), max(0, int(offset)))
-    if offset > 0:
-        return " LIMIT -1 OFFSET ?", (int(offset),)
-    return "", ()
-
-
-def get_symbol(conn: sqlite3.Connection, node_id: str) -> dict | None:
+def get_symbol(conn: Connection, node_id: str) -> dict[str, Any] | None:
     """Get a symbol by its ID."""
     return get_node_by_id(conn, node_id)
 
 
 def get_symbol_by_qualified_name(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     qualified_name: str,
     kind: str | None = None,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Get a symbol by exact qualified name (returns None if missing or ambiguous)."""
     return get_node_by_qualified_name(conn, repo_id, qualified_name, kind)
 
 
 def find_symbols_by_name(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     name_pattern: str,
     kind: str | None = None,
     limit: int = 50,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Find symbols by name or qualified name using escaped SQL LIKE."""
     return find_nodes_by_name(conn, repo_id, name_pattern, kind, limit)
 
 
 def search_symbols_fts(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     query: str,
     *,
     kind: str | None = None,
     file_path: str | None = None,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Search symbol nodes via FTS5 with exact/prefix ranking and LIKE fallback."""
     return search_nodes_fts(
         conn,
@@ -122,46 +107,40 @@ def search_symbols_fts(
     )
 
 
-def get_symbols_by_ids(conn: sqlite3.Connection, node_ids: Iterable[str]) -> dict[str, dict]:
+def get_symbols_by_ids(conn: Connection, node_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
     """Batch-load symbols keyed by node ID."""
     unique_ids = list(dict.fromkeys(nid for nid in node_ids if nid))
     if not unique_ids:
         return {}
 
-    result: dict[str, dict] = {}
+    result: dict[str, dict[str, Any]] = {}
     for start in range(0, len(unique_ids), _BATCH_SIZE):
         batch = unique_ids[start : start + _BATCH_SIZE]
-        placeholders = ",".join("?" * len(batch))
-        rows = conn.execute(
-            f"SELECT {_NODE_SELECT_COLUMNS} FROM nodes WHERE id IN ({placeholders})",
-            tuple(batch),
-        ).fetchall()
+        rows = (
+            conn.execute(select(nodes_table).where(nodes_table.c.id.in_(batch)))
+            .mappings()
+            .all()
+        )
         for row in rows:
             node = row_to_node(row)
             result[node["id"]] = node
     return result
 
 
-def get_files_by_ids(conn: sqlite3.Connection, file_ids: Iterable[str]) -> dict[str, dict]:
+def get_files_by_ids(conn: Connection, file_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
     """Batch-load file metadata rows keyed by file ID."""
     unique_ids = list(dict.fromkeys(fid for fid in file_ids if fid))
     if not unique_ids:
         return {}
 
-    result: dict[str, dict] = {}
+    result: dict[str, dict[str, Any]] = {}
     for start in range(0, len(unique_ids), _BATCH_SIZE):
         batch = unique_ids[start : start + _BATCH_SIZE]
-        placeholders = ",".join("?" * len(batch))
-        rows = conn.execute(
-            f"""
-            SELECT id, repo_id, file_path, uri, module_path, language,
-                   content_hash, size_bytes, line_count, is_test,
-                   last_modified_at, last_indexed_at
-            FROM files
-            WHERE id IN ({placeholders})
-            """,
-            tuple(batch),
-        ).fetchall()
+        rows = (
+            conn.execute(select(files_table).where(files_table.c.id.in_(batch)))
+            .mappings()
+            .all()
+        )
         for row in rows:
             item = dict(row)
             item["is_test"] = bool(item["is_test"])
@@ -169,7 +148,7 @@ def get_files_by_ids(conn: sqlite3.Connection, file_ids: Iterable[str]) -> dict[
     return result
 
 
-def get_parent_symbol(conn: sqlite3.Connection, node: dict) -> dict | None:
+def get_parent_symbol(conn: Connection, node: dict[str, Any]) -> dict[str, Any] | None:
     """Get the structural parent symbol of a node."""
     parent_id = node.get("parent_id")
     if parent_id is None:
@@ -177,12 +156,12 @@ def get_parent_symbol(conn: sqlite3.Connection, node: dict) -> dict | None:
     return get_node_by_id(conn, parent_id)
 
 
-def get_child_symbols(conn: sqlite3.Connection, node_id: str) -> list[dict]:
+def get_child_symbols(conn: Connection, node_id: str) -> list[dict[str, Any]]:
     """Get structural child symbols of a node ordered by source position."""
     return list_child_nodes(conn, node_id)
 
 
-def get_lexical_parent_symbol(conn: sqlite3.Connection, node: dict) -> dict | None:
+def get_lexical_parent_symbol(conn: Connection, node: dict[str, Any]) -> dict[str, Any] | None:
     """Get the lexical parent symbol of a node."""
     lexical_parent_id = node.get("lexical_parent_id")
     if lexical_parent_id is None:
@@ -190,68 +169,76 @@ def get_lexical_parent_symbol(conn: sqlite3.Connection, node: dict) -> dict | No
     return get_node_by_id(conn, lexical_parent_id)
 
 
-def get_lexical_child_symbols(conn: sqlite3.Connection, node_id: str) -> list[dict]:
+def get_lexical_child_symbols(conn: Connection, node_id: str) -> list[dict[str, Any]]:
     """Get lexical child symbols of a node ordered by source position."""
     return list_lexical_children(conn, node_id)
 
 
 def get_outgoing_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     kind: str | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Get outgoing edges from a node."""
     return list_outgoing_edges(conn, node_id, kind)
 
 
 def get_incoming_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     kind: str | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Get incoming edges to a node."""
     return list_incoming_edges(conn, node_id, kind)
 
 
 def _query_directed_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     kind: str,
     *,
     incoming: bool,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Query incoming or outgoing edges of a single kind with optional pagination."""
     if limit is not None and limit <= 0:
         return []
-    column = "to_id" if incoming else "from_id"
-    order_col = "from_id" if incoming else "to_id"
-    limit_sql, limit_params = _limit_offset_clause(limit, offset)
-    rows = conn.execute(
-        f"""
-        SELECT {_EDGE_SELECT_COLUMNS}
-        FROM edges
-        WHERE {column} = ? AND kind = ?
-        ORDER BY evidence_uri,
-                 COALESCE(json_extract(evidence_range_json, '$.start.line'), 0),
-                 COALESCE(json_extract(evidence_range_json, '$.start.character'), 0),
-                 {order_col},
-                 id
-        {limit_sql}
-        """,
-        (node_id, kind, *limit_params),
-    ).fetchall()
-    return [row_to_edge(row) for row in rows]
+    filter_col = edges_table.c.to_id if incoming else edges_table.c.from_id
+    order_col = edges_table.c.from_id if incoming else edges_table.c.to_id
+
+    stmt = (
+        select(edges_table)
+        .where(filter_col == node_id, edges_table.c.kind == kind)
+        .order_by(
+            edges_table.c.evidence_uri,
+            func.coalesce(
+                func.json_extract(edges_table.c.evidence_range_json, "$.start.line"),
+                0,
+            ),
+            func.coalesce(
+                func.json_extract(edges_table.c.evidence_range_json, "$.start.character"),
+                0,
+            ),
+            order_col,
+            edges_table.c.id,
+        )
+    )
+    if offset > 0:
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+
+    return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def get_incoming_calls(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List incoming AST ``calls`` edges targeting ``node_id``."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_CALLS, incoming=True, limit=limit, offset=offset
@@ -259,12 +246,12 @@ def get_incoming_calls(
 
 
 def get_outgoing_calls(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List outgoing AST ``calls`` edges originating from ``node_id``."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_CALLS, incoming=False, limit=limit, offset=offset
@@ -272,12 +259,12 @@ def get_outgoing_calls(
 
 
 def get_incoming_imports(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List incoming AST ``imports`` edges targeting ``node_id``."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_IMPORTS, incoming=True, limit=limit, offset=offset
@@ -285,12 +272,12 @@ def get_incoming_imports(
 
 
 def get_outgoing_imports(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List outgoing AST ``imports`` edges originating from ``node_id``."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_IMPORTS, incoming=False, limit=limit, offset=offset
@@ -298,12 +285,12 @@ def get_outgoing_imports(
 
 
 def get_incoming_inherits(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List incoming AST ``inherits`` edges (subclasses of ``node_id``)."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_INHERITS, incoming=True, limit=limit, offset=offset
@@ -311,28 +298,28 @@ def get_incoming_inherits(
 
 
 def get_outgoing_inherits(
-    conn: sqlite3.Connection,
+    conn: Connection,
     node_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List outgoing AST ``inherits`` edges (base classes of ``node_id``)."""
     return _query_directed_edges(
         conn, node_id, EDGE_KIND_INHERITS, incoming=False, limit=limit, offset=offset
     )
 
 
-def get_symbols_for_file(conn: sqlite3.Connection, file_id: str) -> list[dict]:
+def get_symbols_for_file(conn: Connection, file_id: str) -> list[dict[str, Any]]:
     """Get all symbols for a specific file ordered by source start_line."""
     return list_nodes_for_file(conn, file_id)
 
 
 def get_file_for_outline(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str,
     file_path: str,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Resolve a tracked file record by repo ID and repo-relative POSIX path."""
     normalized = file_path.strip()
     if normalized.startswith("./"):
@@ -343,32 +330,39 @@ def get_file_for_outline(
     return record
 
 
-def list_file_outline_symbols(conn: sqlite3.Connection, file_id: str) -> list[dict]:
+def list_file_outline_symbols(conn: Connection, file_id: str) -> list[dict[str, Any]]:
     """List symbol nodes for a file outline ordered by 1-based start_line."""
     return list_nodes_for_file(conn, file_id)
 
 
-def list_file_import_edges(conn: sqlite3.Connection, file_id: str) -> list[dict]:
+def list_file_import_edges(conn: Connection, file_id: str) -> list[dict[str, Any]]:
     """List import edges recorded in a specific file ordered by line."""
-    rows = conn.execute(
-        f"""
-        SELECT {_EDGE_SELECT_COLUMNS}
-        FROM edges
-        WHERE evidence_file_id = ? AND kind = ?
-        ORDER BY COALESCE(json_extract(evidence_range_json, '$.start.line'), 0),
-                 COALESCE(json_extract(evidence_range_json, '$.start.character'), 0),
-                 id
-        """,
-        (file_id, EDGE_KIND_IMPORTS),
-    ).fetchall()
-    return [row_to_edge(row) for row in rows]
+    stmt = (
+        select(edges_table)
+        .where(
+            edges_table.c.evidence_file_id == file_id,
+            edges_table.c.kind == EDGE_KIND_IMPORTS,
+        )
+        .order_by(
+            func.coalesce(
+                func.json_extract(edges_table.c.evidence_range_json, "$.start.line"),
+                0,
+            ),
+            func.coalesce(
+                func.json_extract(edges_table.c.evidence_range_json, "$.start.character"),
+                0,
+            ),
+            edges_table.c.id,
+        )
+    )
+    return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def check_file_disk_freshness(
-    conn: sqlite3.Connection | None,
+    conn: Connection | None,
     file_id: str,
     *,
-    file_record: dict | None = None,
+    file_record: dict[str, Any] | None = None,
     repo_root: str | Path | None = None,
 ) -> tuple[bool, str | None]:
     """Verify indexed file freshness against disk existence, confinement, and SHA-256 hash."""
@@ -380,12 +374,9 @@ def check_file_disk_freshness(
 
     raw_root = repo_root
     if raw_root is None and conn is not None:
-        repo_row = conn.execute(
-            "SELECT root_path FROM repos WHERE id = ? LIMIT 1",
-            (record["repo_id"],),
-        ).fetchone()
-        if repo_row is not None:
-            raw_root = repo_row["root_path"]
+        raw_root = conn.execute(
+            select(repos_table.c.root_path).where(repos_table.c.id == record["repo_id"]).limit(1)
+        ).scalar_one_or_none()
 
     if not raw_root:
         return False, "repo_record_missing"
@@ -415,42 +406,48 @@ def check_file_disk_freshness(
     return True, None
 
 
-def get_repo_graph_stats(conn: sqlite3.Connection, repo_id: str) -> dict:
+def get_repo_graph_stats(conn: Connection, repo_id: str) -> dict[str, Any]:
     """Get graph and file statistics for a repository."""
-    kind_rows = conn.execute(
-        """
-        SELECT kind, COUNT(*) AS count
-        FROM nodes
-        WHERE repo_id = ?
-        GROUP BY kind
-        """,
-        (repo_id,),
-    ).fetchall()
-    kind_counts = {row["kind"]: int(row["count"]) for row in kind_rows}
+    kind_rows = (
+        conn.execute(
+            select(nodes_table.c.kind, func.count().label("count"))
+            .where(nodes_table.c.repo_id == repo_id)
+            .group_by(nodes_table.c.kind)
+        )
+        .mappings()
+        .all()
+    )
+    kind_counts = {str(row["kind"]): int(row["count"]) for row in kind_rows}
     node_count = sum(kind_counts.values())
 
-    edge_kind_rows = conn.execute(
-        """
-        SELECT kind, COUNT(*) AS count
-        FROM edges
-        WHERE repo_id = ?
-        GROUP BY kind
-        """,
-        (repo_id,),
-    ).fetchall()
-    edge_kind_counts = {row["kind"]: int(row["count"]) for row in edge_kind_rows}
+    edge_kind_rows = (
+        conn.execute(
+            select(edges_table.c.kind, func.count().label("count"))
+            .where(edges_table.c.repo_id == repo_id)
+            .group_by(edges_table.c.kind)
+        )
+        .mappings()
+        .all()
+    )
+    edge_kind_counts = {str(row["kind"]): int(row["count"]) for row in edge_kind_rows}
     edge_count = sum(edge_kind_counts.values())
 
-    file_stats = conn.execute(
-        """
-        SELECT COUNT(*) AS file_count,
-               COALESCE(SUM(CASE WHEN is_test != 0 THEN 1 ELSE 0 END), 0) AS test_file_count,
-               COALESCE(SUM(line_count), 0) AS total_lines
-        FROM files
-        WHERE repo_id = ?
-        """,
-        (repo_id,),
-    ).fetchone()
+    file_stats = (
+        conn.execute(
+            select(
+                func.count().label("file_count"),
+                func.coalesce(
+                    func.sum(case((files_table.c.is_test.is_(True), 1), else_=0)),
+                    0,
+                ).label("test_file_count"),
+                func.coalesce(func.sum(files_table.c.line_count), 0).label("total_lines"),
+            )
+            .select_from(files_table)
+            .where(files_table.c.repo_id == repo_id)
+        )
+        .mappings()
+        .first()
+    )
 
     callable_count = sum(kind_counts.get(k, 0) for k in CALLABLE_KINDS)
     local_callable_count = sum(kind_counts.get(k, 0) for k in LOCAL_CALLABLE_KINDS)

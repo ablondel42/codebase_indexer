@@ -1,9 +1,16 @@
-"""SQLite connection and read-only SQL authorizer helpers."""
+"""SQLAlchemy SQLite connection and read-only SQL authorizer helpers."""
+
+from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+from typing import Any, Iterator
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import NullPool
 
 from repo_context.exceptions import DatabaseError, DatabaseNotFoundError
 
@@ -30,72 +37,98 @@ def _read_only_authorizer(
     return sqlite3.SQLITE_DENY
 
 
+def _build_engine(
+    db_path: Path | str,
+    *,
+    read_only: bool = False,
+    must_exist: bool = False,
+    with_authorizer: bool = False,
+) -> Engine:
+    """Create a short-lived ``NullPool`` SQLAlchemy Engine configured for SQLite."""
+    path = Path(db_path)
+    is_memory = str(db_path) == ":memory:"
+
+    if (read_only or must_exist) and not is_memory and not path.is_file():
+        raise DatabaseNotFoundError(
+            f"Database file not found: {path}",
+            context={"db_path": str(path)},
+        )
+
+    if not read_only and not is_memory:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _creator() -> sqlite3.Connection:
+        if read_only and not is_memory:
+            uri = f"file:{path.resolve().as_posix()}?mode=ro"
+            return sqlite3.connect(uri, uri=True)
+        return sqlite3.connect(":memory:" if is_memory else path)
+
+    engine = create_engine("sqlite://", creator=_creator, poolclass=NullPool)
+
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite(dbapi_conn: sqlite3.Connection, _record: Any) -> None:
+        cursor = dbapi_conn.cursor()
+        try:
+            if read_only:
+                cursor.execute("PRAGMA query_only = ON;")
+                cursor.execute("PRAGMA busy_timeout = 5000;")
+            else:
+                cursor.execute("PRAGMA journal_mode = WAL;")
+                cursor.execute("PRAGMA synchronous = NORMAL;")
+                cursor.execute("PRAGMA foreign_keys = ON;")
+                cursor.execute("PRAGMA busy_timeout = 5000;")
+        finally:
+            cursor.close()
+        if with_authorizer:
+            dbapi_conn.set_authorizer(_read_only_authorizer)
+
+    return engine
+
+
 def get_connection(
     db_path: Path | str,
     *,
     read_only: bool = False,
     must_exist: bool = False,
-) -> sqlite3.Connection:
-    """Open a configured SQLite database connection.
-
-    Args:
-        db_path: Path to the SQLite database file.
-        read_only: If True, open in SQLite read-only mode with ``query_only = ON``.
-        must_exist: If True (or when ``read_only=True``), verify the file exists first.
-
-    Returns:
-        Configured ``sqlite3.Connection`` with ``row_factory = sqlite3.Row``.
+) -> Connection:
+    """Open a configured SQLAlchemy SQLite ``Connection``.
 
     Raises:
         DatabaseNotFoundError: If ``read_only`` or ``must_exist`` and ``db_path`` does not exist.
         DatabaseError: If opening or configuring SQLite fails.
     """
     path = Path(db_path)
-    is_memory = str(db_path) == ":memory:"
-
-    if (read_only or must_exist) and not path.is_file():
-        raise DatabaseNotFoundError(
-            f"Database file not found: {path}",
-            context={"db_path": str(path)},
-        )
-
+    engine = _build_engine(db_path, read_only=read_only, must_exist=must_exist)
     try:
-        if read_only:
-            uri = f"file:{path.resolve().as_posix()}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA query_only = ON;")
-            conn.execute("PRAGMA busy_timeout = 5000;")
-            return conn
-
-        if not is_memory:
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-        conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
-        return conn
-    except sqlite3.Error as exc:
+        return engine.connect()
+    except (SQLAlchemyError, sqlite3.Error, OSError) as exc:
+        engine.dispose()
         raise DatabaseError(
             f"Failed to open SQLite database at {path}: {exc}",
             context={"db_path": str(path), "read_only": read_only},
         ) from exc
 
 
-def open_read_only_sql_connection(db_path: Path | str) -> sqlite3.Connection:
-    """Open a read-only SQLite connection guarded by a strict SQL authorizer."""
-    conn = get_connection(db_path, read_only=True)
-    conn.set_authorizer(_read_only_authorizer)
-    return conn
+def open_read_only_sql_connection(db_path: Path | str) -> Connection:
+    """Open a read-only SQLAlchemy connection guarded by SQLite's SELECT-only authorizer."""
+    path = Path(db_path)
+    engine = _build_engine(db_path, read_only=True, must_exist=True, with_authorizer=True)
+    try:
+        return engine.connect()
+    except (SQLAlchemyError, sqlite3.Error, OSError) as exc:
+        engine.dispose()
+        raise DatabaseError(
+            f"Failed to open read-only SQLite database at {path}: {exc}",
+            context={"db_path": str(path), "read_only": True},
+        ) from exc
 
 
-def close_connection(conn: sqlite3.Connection | None) -> None:
-    """Close a database connection safely."""
+def close_connection(conn: Connection | None) -> None:
+    """Close a SQLAlchemy connection and dispose its underlying ``NullPool`` engine."""
     if conn is not None:
+        engine = conn.engine
         conn.close()
+        engine.dispose()
 
 
 @contextmanager
@@ -104,15 +137,15 @@ def connection_scope(
     *,
     read_only: bool = False,
     must_exist: bool = False,
-) -> Iterator[sqlite3.Connection]:
-    """Context manager that opens, commits/rolls back, and closes a SQLite connection."""
+) -> Iterator[Connection]:
+    """Context manager that opens, commits/rolls back, and closes a SQLAlchemy connection."""
     conn = get_connection(db_path, read_only=read_only, must_exist=must_exist)
     try:
         yield conn
-        if not read_only and conn.in_transaction:
+        if not read_only and conn.in_transaction():
             conn.commit()
     except Exception:
-        if not read_only and conn.in_transaction:
+        if not read_only and conn.in_transaction():
             conn.rollback()
         raise
     finally:

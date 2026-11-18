@@ -4,11 +4,11 @@ import json
 import os
 from pathlib import Path
 import re
-import sqlite3
 import subprocess
 import sys
 
 import pytest
+from sqlalchemy import func, select
 
 from repo_context.config import AppConfig
 from repo_context.exceptions import ParseError, PathSecurityError
@@ -22,6 +22,8 @@ from repo_context.parsing.scanner import (
 )
 from repo_context.storage import (
     close_connection,
+    connection_scope,
+    files_table,
     get_connection,
     get_repo_by_id,
     initialize_database,
@@ -232,9 +234,6 @@ def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
     assert payload["files_indexed"] == 4
     assert db_path.exists()
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    with connection_scope(db_path, read_only=True) as conn:
+        count = int(conn.execute(select(func.count()).select_from(files_table)).scalar_one())
         assert count == 4
-    finally:
-        conn.close()

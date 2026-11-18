@@ -4,10 +4,11 @@ from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
 import repo_context.lsp.client as lsp_client_mod
 from repo_context.config import AppConfig
@@ -40,8 +41,10 @@ from repo_context.parsing.pipeline import extract_file_graph
 from repo_context.parsing.scanner import scan_repository
 from repo_context.storage import (
     close_connection,
+    files_table,
     get_connection,
     initialize_database,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_nodes,
@@ -50,7 +53,7 @@ from repo_context.storage import (
 
 
 @pytest.fixture
-def lsp_db(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path]]:
+def lsp_db(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
     """Yield an initialized v2 SQLite connection and temp directory."""
     conn = get_connection(tmp_path / "lsp.db")
     try:
@@ -158,7 +161,7 @@ class TestResolverAndPosition:
 
     def test_resolve_file_by_uri_percent_decoding_and_symlinked_root(
         self,
-        lsp_db: tuple[sqlite3.Connection, Path],
+        lsp_db: tuple[Connection, Path],
     ) -> None:
         conn, tmp_path = lsp_db
         real_root = tmp_path / "real_repo"
@@ -207,7 +210,7 @@ class TestReferenceEdgePersistenceAndStats:
 
     def test_replace_reference_edges_single_json_and_savepoint_safety(
         self,
-        lsp_db: tuple[sqlite3.Connection, Path],
+        lsp_db: tuple[Connection, Path],
     ) -> None:
         conn, tmp_path = lsp_db
         repo_id = "repo:test:12345678"
@@ -282,14 +285,18 @@ class TestReferenceEdgePersistenceAndStats:
         }
 
         # Run inside an active transaction to exercise SAVEPOINT path
-        conn.execute("BEGIN")
+        conn.execute(select(1))
         replace_reference_edges_for_target(conn, target_id, [edge], refresh_meta)
         conn.commit()
 
-        raw_row = conn.execute(
-            "SELECT payload_json, evidence_range_json FROM edges WHERE id = ?",
-            (edge["id"],),
-        ).fetchone()
+        raw_row = (
+            conn.exec_driver_sql(
+                "SELECT payload_json, evidence_range_json FROM edges WHERE id = ?",
+                (edge["id"],),
+            )
+            .mappings()
+            .one()
+        )
         assert isinstance(json.loads(raw_row["payload_json"]), dict)
         assert isinstance(json.loads(raw_row["evidence_range_json"]), dict)
 
@@ -425,7 +432,7 @@ while True:
 
     def test_lsp_session_pool_caches_by_resolved_root_and_enriches_utf16_references(
         self,
-        lsp_db: tuple[sqlite3.Connection, Path],
+        lsp_db: tuple[Connection, Path],
     ) -> None:
         """LspSessionPool caches sessions, tracks didOpen/didChange, and enriches UTF-16 refs."""
         conn, tmp_path = lsp_db
@@ -450,10 +457,17 @@ while True:
         resolve_repo_edges(conn, repo_rec.id)
         conn.commit()
 
-        target_row = conn.execute(
-            "SELECT n.*, f.file_path FROM nodes n JOIN files f ON f.id = n.file_id "
-            "WHERE n.name = 'target' AND n.kind = 'function'"
-        ).fetchone()
+        target_row = (
+            conn.execute(
+                select(nodes_table, files_table.c.file_path)
+                .select_from(
+                    nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
+                )
+                .where(nodes_table.c.name == "target", nodes_table.c.kind == "function")
+            )
+            .mappings()
+            .one()
+        )
         target_sym = dict(target_row)
 
         caller_line = caller_py.read_text(encoding="utf-8").splitlines()[3]

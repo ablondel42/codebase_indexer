@@ -5,7 +5,7 @@ Provides the primary API for risk analysis:
 - analyze_target_set_risk: Analyze multiple symbols
 """
 
-import sqlite3
+from sqlalchemy.engine import Connection
 
 from repo_context.graph.risk_types import RiskResult
 from repo_context.graph.risk_targets import load_risk_targets
@@ -14,20 +14,12 @@ from repo_context.graph.risk_rules import detect_risk_issues
 from repo_context.graph.risk_scoring import score_risk, decide_risk
 
 
-def analyze_symbol_risk(conn: sqlite3.Connection, symbol_id: str) -> RiskResult:
-    """Analyze risk for a single symbol.
-
-    Args:
-        conn: SQLite connection.
-        symbol_id: Symbol ID to analyze.
-
-    Returns:
-        RiskResult with analysis for the single symbol.
-    """
+def analyze_symbol_risk(conn: Connection, symbol_id: str) -> RiskResult:
+    """Analyze risk for a single symbol."""
     return analyze_target_set_risk(conn, [symbol_id])
 
 
-def analyze_target_set_risk(conn: sqlite3.Connection, symbol_ids: list[str]) -> RiskResult:
+def analyze_target_set_risk(conn: Connection, symbol_ids: list[str]) -> RiskResult:
     """Analyze risk for a set of symbols.
 
     Pipeline:

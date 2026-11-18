@@ -1,12 +1,15 @@
-"""Reference invalidation helpers.
+"""Reference invalidation helpers using SQLAlchemy Core."""
 
-When a file changes or is deleted, stored reference edges whose evidence comes
-from that file and reference refresh states for affected symbols must be
-invalidated inside the caller's transaction.
-"""
+from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-import sqlite3
+from typing import Any
+
+from sqlalchemy import delete, literal, or_, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
+
+from repo_context.storage.schema import edges_table, nodes_table, reference_refresh_table
 
 _SQLITE_IN_CHUNK_SIZE = 400
 
@@ -17,149 +20,128 @@ def _chunked(items: Sequence[str], size: int = _SQLITE_IN_CHUNK_SIZE) -> Iterato
         yield items[start : start + size]
 
 
-def mark_symbol_ids_stale(conn: sqlite3.Connection, symbol_ids: Iterable[str]) -> list[str]:
-    """Mark ``reference_refresh`` entries stale for any existing nodes in ``symbol_ids``.
+def _upsert_stale_from_node_select(conn: Connection, node_filter: Any) -> None:
+    """Execute ``INSERT INTO reference_refresh ... SELECT ... ON CONFLICT DO UPDATE``."""
+    source_select = select(
+        nodes_table.c.id,
+        literal(False),
+        literal(None),
+        literal("stale"),
+        literal(None),
+    ).where(node_filter)
 
-    Chunks queries into batches of at most 400 IDs and filters against ``nodes``
-    so foreign-key constraints are never violated and SQLite variable limits are
-    never exceeded. Does not commit.
-    """
+    ins = sqlite_insert(reference_refresh_table).from_select(
+        [
+            "target_symbol_id",
+            "available",
+            "last_refreshed_at",
+            "refresh_status",
+            "error_code",
+        ],
+        source_select,
+    )
+    stmt = ins.on_conflict_do_update(
+        index_elements=[reference_refresh_table.c.target_symbol_id],
+        set_={
+            "available": False,
+            "last_refreshed_at": None,
+            "refresh_status": "stale",
+            "error_code": None,
+        },
+    )
+    conn.execute(stmt)
+
+
+def mark_symbol_ids_stale(conn: Connection, symbol_ids: Iterable[str]) -> list[str]:
+    """Mark ``reference_refresh`` entries stale for any existing nodes in ``symbol_ids``."""
     unique_ids = sorted({sid for sid in symbol_ids if sid})
     if not unique_ids:
         return []
 
     marked: list[str] = []
     for chunk in _chunked(unique_ids):
-        placeholders = ",".join("?" * len(chunk))
-        params = tuple(chunk)
-        existing_rows = conn.execute(
-            f"SELECT id FROM nodes WHERE id IN ({placeholders}) ORDER BY id",
-            params,
-        ).fetchall()
-        if not existing_rows:
+        existing_ids = [
+            str(nid)
+            for nid in conn.execute(
+                select(nodes_table.c.id)
+                .where(nodes_table.c.id.in_(chunk))
+                .order_by(nodes_table.c.id)
+            )
+            .scalars()
+            .all()
+        ]
+        if not existing_ids:
             continue
 
-        conn.execute(
-            f"""
-            INSERT INTO reference_refresh (
-                target_symbol_id, available, last_refreshed_at, refresh_status, error_code
-            )
-            SELECT id, 0, NULL, 'stale', NULL
-            FROM nodes
-            WHERE id IN ({placeholders})
-            ON CONFLICT(target_symbol_id) DO UPDATE SET
-                available = 0,
-                last_refreshed_at = NULL,
-                refresh_status = 'stale',
-                error_code = NULL
-            """,
-            params,
-        )
-        marked.extend(row["id"] for row in existing_rows)
+        _upsert_stale_from_node_select(conn, nodes_table.c.id.in_(chunk))
+        marked.extend(existing_ids)
 
     return marked
 
 
-def mark_symbols_in_file_stale(conn: sqlite3.Connection, file_id: str) -> list[str]:
-    """Mark ``reference_refresh`` entries stale for all symbols declared in ``file_id``.
-
-    Uses single-statement ``INSERT ... SELECT ... ON CONFLICT DO UPDATE`` so there
-    is no SQLite bind-variable limit regardless of symbol count. Does not commit.
-
-    Args:
-        conn: SQLite connection.
-        file_id: ID of the changed file.
-
-    Returns:
-        Sorted list of symbol IDs marked stale.
-    """
-    cursor = conn.execute(
-        "SELECT id FROM nodes WHERE file_id = ? ORDER BY id",
-        (file_id,),
-    )
-    symbol_ids = [row["id"] for row in cursor.fetchall()]
+def mark_symbols_in_file_stale(conn: Connection, file_id: str) -> list[str]:
+    """Mark ``reference_refresh`` entries stale for all symbols declared in ``file_id``."""
+    symbol_ids = [
+        str(nid)
+        for nid in conn.execute(
+            select(nodes_table.c.id)
+            .where(nodes_table.c.file_id == file_id)
+            .order_by(nodes_table.c.id)
+        )
+        .scalars()
+        .all()
+    ]
     if not symbol_ids:
         return []
 
-    conn.execute(
-        """
-        INSERT INTO reference_refresh (
-            target_symbol_id, available, last_refreshed_at, refresh_status, error_code
-        )
-        SELECT id, 0, NULL, 'stale', NULL
-        FROM nodes
-        WHERE file_id = ?
-        ON CONFLICT(target_symbol_id) DO UPDATE SET
-            available = 0,
-            last_refreshed_at = NULL,
-            refresh_status = 'stale',
-            error_code = NULL
-        """,
-        (file_id,),
-    )
+    _upsert_stale_from_node_select(conn, nodes_table.c.file_id == file_id)
     return symbol_ids
 
 
-def invalidate_reference_summaries_for_file(conn: sqlite3.Connection, file_id: str) -> int:
-    """Invalidate reference refresh states and remove reference edges for ``file_id``.
+def invalidate_reference_summaries_for_file(conn: Connection, file_id: str) -> int:
+    """Invalidate reference refresh states and remove reference edges for ``file_id``."""
+    referenced_targets = select(edges_table.c.to_id).where(
+        edges_table.c.kind == "references",
+        edges_table.c.evidence_file_id == file_id,
+    )
+    _upsert_stale_from_node_select(
+        conn,
+        or_(
+            nodes_table.c.file_id == file_id,
+            nodes_table.c.id.in_(referenced_targets),
+        ),
+    )
 
-    Marks stale BOTH symbols defined in ``file_id`` AND external target symbols
-    whose incoming ``references`` edges have ``evidence_file_id = file_id``, then
-    deletes ``references`` edges whose ``evidence_file_id = file_id``.
-
-    Caller owns the transaction boundary (this function never calls ``conn.commit()``).
-
-    Args:
-        conn: SQLite connection.
-        file_id: ID of the changed file.
-
-    Returns:
-        Number of ``references`` edges removed.
-    """
-    conn.execute(
-        """
-        INSERT INTO reference_refresh (
-            target_symbol_id, available, last_refreshed_at, refresh_status, error_code
+    res = conn.execute(
+        delete(edges_table).where(
+            edges_table.c.kind == "references",
+            edges_table.c.evidence_file_id == file_id,
         )
-        SELECT id, 0, NULL, 'stale', NULL
-        FROM nodes
-        WHERE file_id = ?
-           OR id IN (
-               SELECT to_id
-               FROM edges
-               WHERE kind = 'references' AND evidence_file_id = ?
-           )
-        ON CONFLICT(target_symbol_id) DO UPDATE SET
-            available = 0,
-            last_refreshed_at = NULL,
-            refresh_status = 'stale',
-            error_code = NULL
-        """,
-        (file_id, file_id),
     )
-
-    cursor = conn.execute(
-        "DELETE FROM edges WHERE kind = 'references' AND evidence_file_id = ?",
-        (file_id,),
-    )
-    return cursor.rowcount
+    return max(res.rowcount or 0, 0)
 
 
-def collect_impacted_symbol_ids(conn: sqlite3.Connection, file_id: str) -> list[str]:
+def collect_impacted_symbol_ids(conn: Connection, file_id: str) -> list[str]:
     """Collect all symbol IDs declared in ``file_id`` or targeted by its ``references`` edges."""
-    cursor = conn.execute(
-        "SELECT id FROM nodes WHERE file_id = ?",
-        (file_id,),
-    )
-    declared_ids = {row["id"] for row in cursor.fetchall()}
-
-    cursor = conn.execute(
-        """
-        SELECT DISTINCT to_id FROM edges
-        WHERE kind = 'references' AND evidence_file_id = ?
-        """,
-        (file_id,),
-    )
-    referenced_ids = {row["to_id"] for row in cursor.fetchall()}
-
+    declared_ids = {
+        str(nid)
+        for nid in conn.execute(
+            select(nodes_table.c.id).where(nodes_table.c.file_id == file_id)
+        )
+        .scalars()
+        .all()
+    }
+    referenced_ids = {
+        str(tid)
+        for tid in conn.execute(
+            select(edges_table.c.to_id)
+            .distinct()
+            .where(
+                edges_table.c.kind == "references",
+                edges_table.c.evidence_file_id == file_id,
+            )
+        )
+        .scalars()
+        .all()
+    }
     return sorted(declared_ids | referenced_ids)

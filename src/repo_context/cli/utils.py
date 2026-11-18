@@ -5,16 +5,23 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from pathlib import Path
-import sqlite3
 from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
 from repo_context.context.helpers import format_line_span
 from repo_context.context.source_reader import _read_verified_file_text
-from repo_context.exceptions import ParseError, PathSecurityError, RepoContextError, SymbolNotFoundError
+from repo_context.exceptions import (
+    ParseError,
+    PathSecurityError,
+    RepoContextError,
+    SymbolNotFoundError,
+)
 from repo_context.graph.queries import get_files_by_ids
 from repo_context.parsing.pathing import ensure_safe_repo_file
-from repo_context.storage import get_node_by_id, resolve_repo_id
+from repo_context.storage import get_node_by_id, nodes_table, resolve_repo_id
 from repo_context.storage.nodes import row_to_node
 
 _MAX_PREVIEW_CHARS = 120
@@ -34,7 +41,7 @@ def _escape_like(value: str) -> str:
 
 
 def _build_candidate_entries(
-    conn: sqlite3.Connection,
+    conn: Connection,
     candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Format candidate symbols for ambiguity error reporting."""
@@ -57,7 +64,7 @@ def _build_candidate_entries(
 
 
 def resolve_repo_for_cli(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_arg: str | None = None,
 ) -> str:
     """Resolve ``--repo`` explicitly or auto-select when one repo is indexed."""
@@ -65,7 +72,7 @@ def resolve_repo_for_cli(
 
 
 def resolve_symbol_target(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str | None,
     symbol_ref: str,
 ) -> dict[str, Any]:
@@ -85,10 +92,18 @@ def resolve_symbol_target(
 
     resolved_repo_id = repo_id if repo_id is not None else resolve_repo_id(conn, None)
 
-    exact_qname_rows = conn.execute(
-        "SELECT * FROM nodes WHERE repo_id = ? AND qualified_name = ? ORDER BY kind, id",
-        (resolved_repo_id, cleaned),
-    ).fetchall()
+    exact_qname_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == resolved_repo_id,
+                nodes_table.c.qualified_name == cleaned,
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.id)
+        )
+        .mappings()
+        .all()
+    )
     if len(exact_qname_rows) == 1:
         return row_to_node(exact_qname_rows[0])
     if len(exact_qname_rows) > 1:
@@ -99,10 +114,18 @@ def resolve_symbol_target(
             context={"candidates": _build_candidate_entries(conn, candidates)},
         )
 
-    exact_name_rows = conn.execute(
-        "SELECT * FROM nodes WHERE repo_id = ? AND name = ? ORDER BY kind, qualified_name, id",
-        (resolved_repo_id, cleaned),
-    ).fetchall()
+    exact_name_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == resolved_repo_id,
+                nodes_table.c.name == cleaned,
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+        )
+        .mappings()
+        .all()
+    )
     if len(exact_name_rows) == 1:
         return row_to_node(exact_name_rows[0])
     if len(exact_name_rows) > 1:
@@ -114,15 +137,19 @@ def resolve_symbol_target(
         )
 
     suffix_pattern = f"%.{_escape_like(cleaned)}"
-    suffix_rows = conn.execute(
-        """
-        SELECT * FROM nodes
-        WHERE repo_id = ? AND qualified_name LIKE ? ESCAPE '\\'
-        ORDER BY kind, qualified_name, id
-        LIMIT 25
-        """,
-        (resolved_repo_id, suffix_pattern),
-    ).fetchall()
+    suffix_rows = (
+        conn.execute(
+            select(nodes_table)
+            .where(
+                nodes_table.c.repo_id == resolved_repo_id,
+                nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
+            )
+            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+            .limit(25)
+        )
+        .mappings()
+        .all()
+    )
     if len(suffix_rows) == 1:
         return row_to_node(suffix_rows[0])
     if len(suffix_rows) > 1:
@@ -140,7 +167,7 @@ def resolve_symbol_target(
 
 
 def resolve_symbol_targets(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_arg: str | None,
     symbol_refs: Sequence[str],
 ) -> tuple[str | None, list[dict[str, Any]]]:

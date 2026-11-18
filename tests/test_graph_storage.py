@@ -3,9 +3,9 @@
 from collections.abc import Iterator
 import json
 from pathlib import Path
-import sqlite3
 
 import pytest
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_SCOPE_PARENT
 from repo_context.graph import get_repo_graph_stats
@@ -49,7 +49,7 @@ from repo_context.exceptions import DatabaseError
 
 
 @pytest.fixture
-def initialized_db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+def initialized_db(tmp_path: Path) -> Iterator[Connection]:
     """Yield an initialized v2 SQLite DB with a default repo and file row."""
     conn = get_connection(tmp_path / "storage.db")
     try:
@@ -147,7 +147,7 @@ def _edge(
     }
 
 
-def test_node_upsert_read_and_delete(initialized_db: sqlite3.Connection) -> None:
+def test_node_upsert_read_and_delete(initialized_db: Connection) -> None:
     """Node CRUD, structural/lexical children, and file node deletion work with v2 fields."""
     conn = initialized_db
     mod = _node("sym:mod", "module", "test", start_line=1, end_line=20)
@@ -183,7 +183,7 @@ def test_node_upsert_read_and_delete(initialized_db: sqlite3.Connection) -> None
 
 
 def test_edge_upsert_single_json_encoding_and_full_file_delete(
-    initialized_db: sqlite3.Connection,
+    initialized_db: Connection,
 ) -> None:
     """Edges store single-encoded JSON and delete_edges_for_file clears from/to/evidence matches."""
     conn = initialized_db
@@ -212,9 +212,13 @@ def test_edge_upsert_single_json_encoding_and_full_file_delete(
     upsert_edge(conn, e1)
     upsert_edges(conn, [e2])
 
-    raw_row = conn.execute(
-        "SELECT payload_json, evidence_range_json FROM edges WHERE id = 'edge:1'"
-    ).fetchone()
+    raw_row = (
+        conn.exec_driver_sql(
+            "SELECT payload_json, evidence_range_json FROM edges WHERE id = 'edge:1'"
+        )
+        .mappings()
+        .one()
+    )
     assert isinstance(json.loads(raw_row["payload_json"]), dict)
     assert isinstance(json.loads(raw_row["evidence_range_json"]), dict)
 
@@ -231,7 +235,7 @@ def test_edge_upsert_single_json_encoding_and_full_file_delete(
 
 
 def test_replace_file_graph_is_savepoint_safe_without_commit(
-    initialized_db: sqlite3.Connection,
+    initialized_db: Connection,
 ) -> None:
     """replace_file_graph does not auto-commit and preserves outer transaction state on failure."""
     conn = initialized_db
@@ -252,7 +256,6 @@ def test_replace_file_graph_is_savepoint_safe_without_commit(
         line_count=1,
         last_modified_at="2026-01-01T00:00:00Z",
     )
-    conn.execute("BEGIN")
     upsert_files(conn, [other_file])
 
     with pytest.raises(Exception):
@@ -264,7 +267,7 @@ def test_replace_file_graph_is_savepoint_safe_without_commit(
     conn.commit()
 
 
-def test_prune_stale_files_batched_over_500_files(initialized_db: sqlite3.Connection) -> None:
+def test_prune_stale_files_batched_over_500_files(initialized_db: Connection) -> None:
     """prune_stale_files deletes >500 stale files cleanly in batches."""
     conn = initialized_db
     repo_id = "repo:test:12345678"
@@ -298,7 +301,7 @@ def test_prune_stale_files_batched_over_500_files(initialized_db: sqlite3.Connec
     assert {r.id for r in remaining} == keep
 
 
-def test_repos_runs_and_graph_stats(initialized_db: sqlite3.Connection, tmp_path: Path) -> None:
+def test_repos_runs_and_graph_stats(initialized_db: Connection, tmp_path: Path) -> None:
     """list_repos, resolve_repo_id, index_runs, and get_repo_graph_stats work end-to-end."""
     conn = initialized_db
     repo_id = "repo:test:12345678"

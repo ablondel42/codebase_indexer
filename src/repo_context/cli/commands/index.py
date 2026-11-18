@@ -189,7 +189,6 @@ def cmd_index(args: argparse.Namespace) -> int:
                     logger.warning("Failed extracting %s: %s", file_record.file_path, exc)
 
             # Persist file records, per-file graph replacements, pruning, and linking atomically.
-            conn.execute("BEGIN")
             try:
                 upsert_files(conn, [rec for rec, _, _ in extracted])
                 for rec, nodes, edges in extracted:
@@ -201,7 +200,7 @@ def cmd_index(args: argparse.Namespace) -> int:
                 upsert_repo(conn, repo)
                 conn.commit()
             except Exception:
-                if conn.in_transaction:
+                if conn.in_transaction():
                     conn.rollback()
                 raise
 
@@ -219,7 +218,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             )
             conn.commit()
         except Exception as exc:
-            if conn.in_transaction:
+            if conn.in_transaction():
                 conn.rollback()
             record_index_run_finish(
                 conn,

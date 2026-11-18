@@ -2,9 +2,10 @@
 
 from collections.abc import Iterator
 from pathlib import Path
-import sqlite3
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.engine import Connection
 
 from repo_context.config import AppConfig
 from repo_context.context import (
@@ -21,6 +22,7 @@ from repo_context.storage import (
     close_connection,
     get_connection,
     initialize_database,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_repo,
@@ -28,7 +30,7 @@ from repo_context.storage import (
 
 
 @pytest.fixture
-def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, Path, str]]:
+def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[Connection, Path, str]]:
     """Index a realistic multi-file repository in ``tmp_path`` and yield ``(conn, root, repo_id)``."""
     repo_root = tmp_path / "ctx_repo"
     repo_root.mkdir()
@@ -87,19 +89,17 @@ def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[sqlite3.Connection, P
         close_connection(conn)
 
 
-def _find_node_id(conn: sqlite3.Connection, name: str, kind: str | None = None) -> str:
+def _find_node_id(conn: Connection, name: str, kind: str | None = None) -> str:
+    stmt = select(nodes_table.c.id).where(nodes_table.c.name == name)
     if kind is not None:
-        row = conn.execute(
-            "SELECT id FROM nodes WHERE name = ? AND kind = ?", (name, kind)
-        ).fetchone()
-    else:
-        row = conn.execute("SELECT id FROM nodes WHERE name = ?", (name,)).fetchone()
-    assert row is not None, f"Node not found: {name} ({kind})"
-    return row["id"]
+        stmt = stmt.where(nodes_table.c.kind == kind)
+    node_id = conn.execute(stmt.limit(1)).scalar_one_or_none()
+    assert node_id is not None, f"Node not found: {name} ({kind})"
+    return str(node_id)
 
 
 def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
-    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+    indexed_context_repo: tuple[Connection, Path, str],
 ) -> None:
     """Class context has structural children only; method has no bogus lexical_parent."""
     conn, _, _ = indexed_context_repo
@@ -134,7 +134,7 @@ def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
 
 
 def test_build_symbol_context_edge_limit_and_missing(
-    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+    indexed_context_repo: tuple[Connection, Path, str],
 ) -> None:
     """build_symbol_context respects edge_limit, validates negative limits, and returns None when missing."""
     conn, _, _ = indexed_context_repo
@@ -144,7 +144,7 @@ def test_build_symbol_context_edge_limit_and_missing(
 
 
 def test_build_file_outline_structure_and_filters(
-    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+    indexed_context_repo: tuple[Connection, Path, str],
 ) -> None:
     """build_file_outline returns hierarchical start_line-ordered symbols and deduplicated imports."""
     conn, _, repo_id = indexed_context_repo
@@ -176,7 +176,7 @@ def test_build_file_outline_structure_and_filters(
 
 
 def test_read_symbol_source_pagination_staleness_and_path_security(
-    indexed_context_repo: tuple[sqlite3.Connection, Path, str],
+    indexed_context_repo: tuple[Connection, Path, str],
     tmp_path: Path,
 ) -> None:
     """read_symbol_source slices 1-based lines, paginates, detects staleness, and rejects escapes."""

@@ -1,4 +1,4 @@
-"""Handlers for `rc symbols {search,list,show}` and `rc source`."""
+"""Handlers for `rc symbols {search,list,show}` and `rc source` using SQLAlchemy Core."""
 
 from __future__ import annotations
 
@@ -6,20 +6,24 @@ import argparse
 import json
 from typing import Any
 
+from sqlalchemy import func, or_, select
+
+from repo_context.cli.utils import (
+    _escape_like,
+    resolve_db_path,
+    resolve_symbol_target,
+)
 from repo_context.context import build_symbol_context, read_symbol_source
 from repo_context.exceptions import SymbolNotFoundError, ValidationError
 from repo_context.graph import get_files_by_ids
 from repo_context.storage import (
     connection_scope,
+    files_table,
     initialize_database,
+    nodes_table,
     resolve_repo_id,
+    row_to_node,
     search_nodes_fts,
-)
-from repo_context.storage.nodes import row_to_node
-from repo_context.cli.utils import (
-    _escape_like,
-    resolve_db_path,
-    resolve_symbol_target,
 )
 
 
@@ -106,44 +110,45 @@ def cmd_symbols_list(args: argparse.Namespace) -> int:
         initialize_database(conn)
         repo_id = resolve_repo_id(conn, repo_arg)
 
-        where_clauses = ["n.repo_id = ?"]
-        params: list[Any] = [repo_id]
+        filters: list[Any] = [nodes_table.c.repo_id == repo_id]
         if kind is not None:
-            where_clauses.append("n.kind = ?")
-            params.append(kind)
+            filters.append(nodes_table.c.kind == kind)
         if file_filter is not None:
             cleaned = _normalize_file_filter(file_filter)
-            where_clauses.append("(f.file_path = ? OR f.file_path LIKE ? ESCAPE '\\')")
-            params.extend([cleaned, f"{_escape_like(cleaned)}/%"])
+            filters.append(
+                or_(
+                    files_table.c.file_path == cleaned,
+                    files_table.c.file_path.like(f"{_escape_like(cleaned)}/%", escape="\\"),
+                )
+            )
 
-        where_sql = " AND ".join(where_clauses)
+        joined = nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
         total_count = int(
-            conn.execute(
-                f"""
-                SELECT COUNT(*)
-                FROM nodes n
-                JOIN files f ON f.id = n.file_id
-                WHERE {where_sql}
-                """,
-                tuple(params),
-            ).fetchone()[0]
+            conn.execute(select(func.count()).select_from(joined).where(*filters)).scalar_one()
         )
 
-        rows = conn.execute(
-            f"""
-            SELECT n.id, n.repo_id, n.file_id, n.language, n.kind, n.name, n.qualified_name, n.uri,
-                   n.range_json, n.selection_range_json, n.start_line, n.end_line, n.signature,
-                   n.parent_id, n.visibility_hint, n.doc_summary, n.content_hash, n.semantic_hash,
-                   n.source, n.confidence, n.payload_json, n.scope, n.lexical_parent_id, n.last_indexed_at,
-                   f.file_path AS _file_path, f.module_path AS _module_path
-            FROM nodes n
-            JOIN files f ON f.id = n.file_id
-            WHERE {where_sql}
-            ORDER BY f.file_path, COALESCE(n.start_line, 0), n.kind, n.qualified_name, n.id
-            LIMIT ? OFFSET ?
-            """,
-            (*params, limit, offset),
-        ).fetchall()
+        rows = (
+            conn.execute(
+                select(
+                    nodes_table,
+                    files_table.c.file_path.label("_file_path"),
+                    files_table.c.module_path.label("_module_path"),
+                )
+                .select_from(joined)
+                .where(*filters)
+                .order_by(
+                    files_table.c.file_path,
+                    func.coalesce(nodes_table.c.start_line, 0),
+                    nodes_table.c.kind,
+                    nodes_table.c.qualified_name,
+                    nodes_table.c.id,
+                )
+                .limit(limit)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
 
         nodes = [row_to_node(r) for r in rows]
         file_meta = {

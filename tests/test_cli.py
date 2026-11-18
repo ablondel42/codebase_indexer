@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 import repo_context.logging_config as logging_config
 from repo_context.cli.main import build_parser, main
@@ -15,6 +16,7 @@ from repo_context.storage import (
     close_connection,
     get_connection,
     initialize_database,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_repo,
@@ -110,9 +112,14 @@ def test_symbols_show_module_with_none_structural_parent_and_ambiguous_json_erro
             nodes, edges, _ = extract_file_graph(repo.id, f, repo_root)
             replace_file_graph(conn, f.id, nodes, edges)
         conn.commit()
-        mod_id = conn.execute(
-            "SELECT id FROM nodes WHERE kind = 'module' ORDER BY id LIMIT 1"
-        ).fetchone()["id"]
+        mod_id = str(
+            conn.execute(
+                select(nodes_table.c.id)
+                .where(nodes_table.c.kind == "module")
+                .order_by(nodes_table.c.id.asc())
+                .limit(1)
+            ).scalar_one()
+        )
     finally:
         close_connection(conn)
 

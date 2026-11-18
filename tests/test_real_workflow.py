@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 import pytest
+from sqlalchemy import select
 
 from repo_context.config import AppConfig
 from repo_context.context import build_file_outline, build_symbol_context, read_symbol_source
@@ -37,6 +38,7 @@ from repo_context.storage import (
     close_connection,
     get_connection,
     initialize_database,
+    nodes_table,
     replace_file_graph,
     upsert_files,
     upsert_repo,
@@ -91,12 +93,14 @@ def test_python_api_end_to_end_workflow(copied_workflow_repo: Path, tmp_path: Pa
         assert stats["file_count"] == 2
         assert stats["node_count"] >= 4
 
-        helper_row = conn.execute(
-            "SELECT id FROM nodes WHERE repo_id = ? AND name = 'helper' AND kind = 'function'",
-            (repo.id,),
-        ).fetchone()
-        assert helper_row is not None
-        helper_id = helper_row["id"]
+        helper_id = conn.execute(
+            select(nodes_table.c.id).where(
+                nodes_table.c.repo_id == repo.id,
+                nodes_table.c.name == "helper",
+                nodes_table.c.kind == "function",
+            )
+        ).scalar_one_or_none()
+        assert helper_id is not None
 
         outline = build_file_outline(conn, repo.id, "module_b.py")
         assert [s["name"] for s in outline["symbols"]] == ["helper"]

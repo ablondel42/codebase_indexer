@@ -1,13 +1,15 @@
-"""Handlers for `rc db {status,repos,tables,runs,sql}`."""
+"""Handlers for `rc db {status,repos,tables,runs,sql}` using SQLAlchemy Core."""
 
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
 import json
 from pathlib import Path
-import sqlite3
 from typing import Any
+
+from sqlalchemy import MetaData, Table, func, inspect, select
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
 from repo_context.cli.utils import resolve_db_path
 from repo_context.exceptions import DatabaseError, RepoContextError, ValidationError
@@ -15,12 +17,17 @@ from repo_context.logging_config import get_logger
 from repo_context.models.repo import RepoRecord
 from repo_context.storage import (
     SCHEMA_VERSION,
+    close_connection,
     connection_scope,
+    edges_table,
+    files_table,
     get_repo_by_id,
     initialize_database,
     list_index_runs,
     list_repos,
+    nodes_table,
     open_read_only_sql_connection,
+    reference_refresh_table,
     resolve_repo_id,
 )
 
@@ -31,9 +38,10 @@ _REQUIRED_STATUS_TABLES = frozenset(
 )
 
 
-def _quote_identifier(identifier: str) -> str:
-    """Safely double-quote a SQLite table identifier."""
-    return '"' + identifier.replace('"', '""') + '"'
+def _db_error_text(exc: SQLAlchemyError) -> str:
+    """Return the underlying DBAPI message when present for concise error reporting."""
+    orig = getattr(exc, "orig", None)
+    return str(orig) if orig is not None else str(exc)
 
 
 def _empty_lsp_coverage() -> dict[str, Any]:
@@ -60,54 +68,46 @@ def _get_db_size_bytes(db_path: Path) -> int:
         ) from exc
 
 
-def _read_schema_version(conn: sqlite3.Connection) -> int:
+def _read_schema_version(conn: Connection) -> int:
     """Read ``PRAGMA user_version`` from an open SQLite connection."""
     try:
-        row = conn.execute("PRAGMA user_version").fetchone()
-        version = int(row[0]) if row else 0
+        raw = conn.exec_driver_sql("PRAGMA user_version").scalar_one_or_none()
+        version = int(raw) if raw is not None else 0
         logger.debug("Read SQLite PRAGMA user_version=%d", version)
         return version
-    except sqlite3.Error as exc:
-        logger.error("Failed reading SQLite PRAGMA user_version: %s", exc)
-        raise DatabaseError(f"Failed to read SQLite schema version: {exc}") from exc
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed reading SQLite PRAGMA user_version: %s", msg)
+        raise DatabaseError(f"Failed to read SQLite schema version: {msg}") from exc
 
 
-def _list_table_counts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _list_table_counts(conn: Connection) -> list[dict[str, Any]]:
     """Return exact row counts for all user tables and FTS virtual tables."""
     current_table: str | None = None
     try:
-        rows = conn.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-              AND name NOT LIKE 'sqlite_%'
-              AND name NOT LIKE 'nodes_fts_%'
-            ORDER BY name
-            """
-        ).fetchall()
+        table_names = [
+            name
+            for name in sorted(inspect(conn).get_table_names())
+            if not name.startswith("nodes_fts_")
+        ]
+        temp_meta = MetaData()
         tables: list[dict[str, Any]] = []
-        for row in rows:
-            current_table = str(row["name"])
-            count_row = conn.execute(
-                f"SELECT COUNT(*) FROM {_quote_identifier(current_table)}"
-            ).fetchone()
-            tables.append(
-                {
-                    "table": current_table,
-                    "row_count": int(count_row[0]) if count_row else 0,
-                }
-            )
+        for name in table_names:
+            current_table = name
+            tbl = Table(name, temp_meta)
+            count = int(conn.execute(select(func.count()).select_from(tbl)).scalar_one())
+            tables.append({"table": name, "row_count": count})
         logger.debug("Collected row counts for %d tables", len(tables))
         return tables
-    except sqlite3.Error as exc:
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
         logger.error(
             "Failed reading table row counts (table=%s): %s",
-            current_table or "<sqlite_master>",
-            exc,
+            current_table or "<inspect>",
+            msg,
         )
         raise DatabaseError(
-            f"Failed to read table row counts: {exc}",
+            f"Failed to read table row counts: {msg}",
             context={"table": current_table},
         ) from exc
 
@@ -129,7 +129,7 @@ def _has_compatible_schema(user_version: int, tables: list[dict[str, Any]]) -> b
 
 
 def _resolve_status_repo(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_arg: str | None,
 ) -> tuple[list[RepoRecord], RepoRecord | None]:
     """Load all indexed repositories and resolve the active repository if unambiguous."""
@@ -150,31 +150,29 @@ def _resolve_status_repo(
     except RepoContextError as exc:
         logger.debug("Repository resolution failed (repo=%r): %s", repo_arg, exc)
         raise
-    except sqlite3.Error as exc:
-        logger.error("Database failure resolving repository (repo=%r): %s", repo_arg, exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Database failure resolving repository (repo=%r): %s", repo_arg, msg)
         raise DatabaseError(
-            f"Failed to resolve repository from database: {exc}",
+            f"Failed to resolve repository from database: {msg}",
             context={"repo": repo_arg},
         ) from exc
 
 
 def _fetch_edge_counts_by_kind(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str | None,
 ) -> dict[str, int]:
     """Query edge counts grouped by ``kind``, optionally scoped to ``repo_id``."""
     try:
+        cnt_col = func.count().label("cnt")
+        stmt = select(edges_table.c.kind, cnt_col)
         if repo_id is not None:
-            rows = conn.execute(
-                "SELECT kind, COUNT(*) AS cnt FROM edges "
-                "WHERE repo_id = ? GROUP BY kind ORDER BY cnt DESC, kind ASC",
-                (repo_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT kind, COUNT(*) AS cnt FROM edges "
-                "GROUP BY kind ORDER BY cnt DESC, kind ASC"
-            ).fetchall()
+            stmt = stmt.where(edges_table.c.repo_id == repo_id)
+        stmt = stmt.group_by(edges_table.c.kind).order_by(
+            cnt_col.desc(), edges_table.c.kind.asc()
+        )
+        rows = conn.execute(stmt).mappings().all()
         counts = {str(r["kind"]): int(r["cnt"]) for r in rows}
         logger.debug(
             "Fetched edge counts across %d kinds (repo_id=%s)",
@@ -182,52 +180,57 @@ def _fetch_edge_counts_by_kind(
             repo_id,
         )
         return counts
-    except sqlite3.Error as exc:
-        logger.error("Failed querying edge counts (repo_id=%s): %s", repo_id, exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed querying edge counts (repo_id=%s): %s", repo_id, msg)
         raise DatabaseError(
-            f"Failed to query edge counts by kind: {exc}",
+            f"Failed to query edge counts by kind: {msg}",
             context={"repo_id": repo_id},
         ) from exc
 
 
 def _fetch_lsp_coverage(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str | None,
 ) -> dict[str, Any]:
     """Compute non-module symbol LSP refresh coverage, optionally scoped to ``repo_id``."""
     try:
+        sym_stmt = (
+            select(func.count())
+            .select_from(nodes_table)
+            .where(nodes_table.c.kind != "module")
+        )
+        edge_stmt = (
+            select(func.count())
+            .select_from(edges_table)
+            .where(edges_table.c.kind == "references")
+        )
         if repo_id is not None:
-            sym_row = conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE repo_id = ? AND kind != 'module'",
-                (repo_id,),
-            ).fetchone()
-            refreshed_row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM reference_refresh rr
-                JOIN nodes n ON n.id = rr.target_symbol_id
-                WHERE n.repo_id = ? AND rr.available = 1
-                """,
-                (repo_id,),
-            ).fetchone()
-            lsp_edge_row = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE repo_id = ? AND kind = 'references'",
-                (repo_id,),
-            ).fetchone()
+            sym_stmt = sym_stmt.where(nodes_table.c.repo_id == repo_id)
+            edge_stmt = edge_stmt.where(edges_table.c.repo_id == repo_id)
+            ref_stmt = (
+                select(func.count())
+                .select_from(
+                    reference_refresh_table.join(
+                        nodes_table,
+                        nodes_table.c.id == reference_refresh_table.c.target_symbol_id,
+                    )
+                )
+                .where(
+                    nodes_table.c.repo_id == repo_id,
+                    reference_refresh_table.c.available.is_(True),
+                )
+            )
         else:
-            sym_row = conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE kind != 'module'"
-            ).fetchone()
-            refreshed_row = conn.execute(
-                "SELECT COUNT(*) FROM reference_refresh WHERE available = 1"
-            ).fetchone()
-            lsp_edge_row = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE kind = 'references'"
-            ).fetchone()
+            ref_stmt = (
+                select(func.count())
+                .select_from(reference_refresh_table)
+                .where(reference_refresh_table.c.available.is_(True))
+            )
 
-        total_syms = int(sym_row[0]) if sym_row else 0
-        refreshed_syms = int(refreshed_row[0]) if refreshed_row else 0
-        lsp_edges = int(lsp_edge_row[0]) if lsp_edge_row else 0
+        total_syms = int(conn.execute(sym_stmt).scalar_one())
+        refreshed_syms = int(conn.execute(ref_stmt).scalar_one())
+        lsp_edges = int(conn.execute(edge_stmt).scalar_one())
         pct = round((refreshed_syms / total_syms) * 100.0, 1) if total_syms > 0 else 0.0
         coverage = {
             "non_module_symbols": total_syms,
@@ -244,16 +247,17 @@ def _fetch_lsp_coverage(
             repo_id,
         )
         return coverage
-    except sqlite3.Error as exc:
-        logger.error("Failed querying LSP coverage (repo_id=%s): %s", repo_id, exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed querying LSP coverage (repo_id=%s): %s", repo_id, msg)
         raise DatabaseError(
-            f"Failed to compute LSP coverage metrics: {exc}",
+            f"Failed to compute LSP coverage metrics: {msg}",
             context={"repo_id": repo_id},
         ) from exc
 
 
 def _fetch_latest_run(
-    conn: sqlite3.Connection,
+    conn: Connection,
     repo_id: str | None,
 ) -> dict[str, Any] | None:
     """Fetch the most recent indexing run, optionally scoped to ``repo_id``."""
@@ -266,10 +270,11 @@ def _fetch_latest_run(
             repo_id,
         )
         return latest
-    except sqlite3.Error as exc:
-        logger.error("Failed querying latest index run (repo_id=%s): %s", repo_id, exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed querying latest index run (repo_id=%s): %s", repo_id, msg)
         raise DatabaseError(
-            f"Failed to query latest index run: {exc}",
+            f"Failed to query latest index run: {msg}",
             context={"repo_id": repo_id},
         ) from exc
 
@@ -350,35 +355,32 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _collect_repo_summaries(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _count_by_repo(conn: Connection, table: Table) -> dict[str, int]:
+    rows = (
+        conn.execute(
+            select(table.c.repo_id, func.count().label("cnt")).group_by(table.c.repo_id)
+        )
+        .mappings()
+        .all()
+    )
+    return {str(r["repo_id"]): int(r["cnt"]) for r in rows}
+
+
+def _collect_repo_summaries(conn: Connection) -> list[dict[str, Any]]:
     """Collect per-repository file, node, and edge counts."""
     try:
         initialize_database(conn)
         repos = list_repos(conn)
-        file_counts = {
-            r["repo_id"]: int(r["cnt"])
-            for r in conn.execute(
-                "SELECT repo_id, COUNT(*) AS cnt FROM files GROUP BY repo_id"
-            ).fetchall()
-        }
-        node_counts = {
-            r["repo_id"]: int(r["cnt"])
-            for r in conn.execute(
-                "SELECT repo_id, COUNT(*) AS cnt FROM nodes GROUP BY repo_id"
-            ).fetchall()
-        }
-        edge_counts = {
-            r["repo_id"]: int(r["cnt"])
-            for r in conn.execute(
-                "SELECT repo_id, COUNT(*) AS cnt FROM edges GROUP BY repo_id"
-            ).fetchall()
-        }
+        file_counts = _count_by_repo(conn, files_table)
+        node_counts = _count_by_repo(conn, nodes_table)
+        edge_counts = _count_by_repo(conn, edges_table)
         logger.debug("Collected summaries for %d repositories", len(repos))
     except RepoContextError:
         raise
-    except sqlite3.Error as exc:
-        logger.error("Failed collecting repository summaries: %s", exc)
-        raise DatabaseError(f"Failed to query repository summaries: {exc}") from exc
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed collecting repository summaries: %s", msg)
+        raise DatabaseError(f"Failed to query repository summaries: {msg}") from exc
 
     return [
         {
@@ -450,10 +452,11 @@ def cmd_db_runs(args: argparse.Namespace) -> int:
             runs = list_index_runs(conn, repo_id=repo_id, limit=limit)
     except RepoContextError:
         raise
-    except sqlite3.Error as exc:
-        logger.error("Failed querying index runs (repo=%r): %s", repo_arg, exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Failed querying index runs (repo=%r): %s", repo_arg, msg)
         raise DatabaseError(
-            f"Failed to query index runs: {exc}",
+            f"Failed to query index runs: {msg}",
             context={"db_path": str(db_path), "repo": repo_arg},
         ) from exc
 
@@ -472,21 +475,29 @@ def cmd_db_sql(args: argparse.Namespace) -> int:
         raise ValidationError("SQL query must not be empty.")
     logger.debug("Executing read-only SQL query (db_path=%s, limit=%d)", db_path, limit)
 
+    conn = open_read_only_sql_connection(db_path)
     try:
-        with closing(open_read_only_sql_connection(db_path)) as conn:
-            cursor = conn.execute(query)
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            fetched = cursor.fetchmany(limit + 1) if cursor.description else []
+        result = conn.exec_driver_sql(query)
+        if result.returns_rows:
+            columns = list(result.keys())
+            fetched = result.fetchmany(limit + 1)
             truncated = len(fetched) > limit
             rows = [list(row) for row in fetched[:limit]]
+        else:
+            columns = []
+            truncated = False
+            rows = []
     except RepoContextError:
         raise
-    except sqlite3.Error as exc:
-        logger.error("Read-only SQL query failed: %s", exc)
+    except SQLAlchemyError as exc:
+        msg = _db_error_text(exc)
+        logger.error("Read-only SQL query failed: %s", msg)
         raise DatabaseError(
-            f"Read-only SQL query failed: {exc}",
+            f"Read-only SQL query failed: {msg}",
             context={"db_path": str(db_path)},
         ) from exc
+    finally:
+        close_connection(conn)
 
     print(
         json.dumps(

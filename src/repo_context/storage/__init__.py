@@ -1,4 +1,4 @@
-"""Storage layer for SQLite persistence."""
+"""Storage layer for SQLite persistence via SQLAlchemy Core."""
 
 from repo_context.storage.db import (
     close_connection,
@@ -61,10 +61,28 @@ from repo_context.storage.runs import (
     record_index_run_finish,
     record_index_run_start,
 )
+from repo_context.storage.schema import (
+    edges_table,
+    files_table,
+    index_runs_table,
+    metadata,
+    nodes_fts_table,
+    nodes_table,
+    reference_refresh_table,
+    repos_table,
+)
 
 __all__ = [
-    # Database
+    # Database & Schema
     "SCHEMA_VERSION",
+    "metadata",
+    "repos_table",
+    "files_table",
+    "nodes_table",
+    "edges_table",
+    "index_runs_table",
+    "reference_refresh_table",
+    "nodes_fts_table",
     "get_connection",
     "open_read_only_sql_connection",
     "close_connection",

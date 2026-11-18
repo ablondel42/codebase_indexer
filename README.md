@@ -28,7 +28,7 @@ Local Repo
    - Resolves intra-repo links (`resolve_repo_edges`) across imports (including aliases, `src.` layouts, and `__init__.py` re-exports), class inheritance hierarchies, and `self`/`cls`/`super()`/module/local calls.
 
 3. **SQLite Storage v2 (`repo_context.storage`)**
-   - Schema `user_version = 2` with `repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and `nodes_fts` (FTS5 with `unicode61` tokenizer and automatic insert/update/delete triggers).
+   - SQLAlchemy 2.x Core persistence (`MetaData` and `Table` definitions in `storage/schema.py`, `NullPool` connections) over SQLite schema `user_version = 2` with `repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and `nodes_fts` (FTS5 with `unicode61` tokenizer and automatic insert/update/delete triggers).
    - Writable connections enable WAL mode, `foreign_keys = ON`, and `busy_timeout = 5000`.
    - Read-only inspection and query commands use `read_only=True` (`mode=ro`, `query_only=ON`); `rc db sql` additionally enforces a SQLite authorizer allowing only `SELECT`, `READ`, `FUNCTION`, and `PRAGMA` actions.
 
@@ -50,7 +50,7 @@ Local Repo
 
 ## Quickstart
 
-Use the root `./rc` bootstrap script (automatically sets up `.venv` on first run, falling back cleanly to Python 3.11+ with `PYTHONPATH=src` when offline):
+Use the root `./rc` bootstrap script (automatically sets up `venv/` on first run, falling back cleanly to Python 3.11+ with `PYTHONPATH=src` when offline):
 
 ```bash
 # Show the quickstart commands

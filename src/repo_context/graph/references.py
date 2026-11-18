@@ -1,7 +1,12 @@
-"""Graph queries for LSP references and AST dependency edges."""
+"""Graph queries for LSP references and AST dependency edges using SQLAlchemy Core."""
+
+from __future__ import annotations
 
 from collections.abc import Sequence
-import sqlite3
+from typing import Any
+
+from sqlalchemy import and_, case, distinct, func, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.constants import (
     EDGE_KIND_CALLS,
@@ -11,6 +16,7 @@ from repo_context.constants import (
 )
 from repo_context.storage.edges import row_to_edge
 from repo_context.storage.reference_refresh import get_reference_refresh_state
+from repo_context.storage.schema import edges_table, files_table, nodes_table
 
 AST_DEPENDENCY_EDGE_KINDS: tuple[str, ...] = (
     EDGE_KIND_CALLS,
@@ -25,19 +31,13 @@ REFERENCE_AND_DEPENDENCY_EDGE_KINDS: tuple[str, ...] = (
     EDGE_KIND_INHERITS,
 )
 
-_EDGE_COLUMNS = (
-    "id, repo_id, kind, from_id, to_id, source, confidence, "
-    "evidence_file_id, evidence_uri, evidence_range_json, payload_json, last_indexed_at"
-)
 
-
-def _limit_offset_clause(limit: int | None, offset: int) -> tuple[str, tuple[int, ...]]:
-    """Build SQLite LIMIT/OFFSET clause safely."""
-    if limit is not None:
-        return " LIMIT ? OFFSET ?", (int(limit), max(0, int(offset)))
+def _apply_pagination(stmt: Any, limit: int | None, offset: int) -> Any:
     if offset > 0:
-        return " LIMIT -1 OFFSET ?", (int(offset),)
-    return "", ()
+        stmt = stmt.offset(offset)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return stmt
 
 
 def _normalize_kinds(kinds: Sequence[str] | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -47,101 +47,132 @@ def _normalize_kinds(kinds: Sequence[str] | None, default: tuple[str, ...]) -> t
     return tuple(dict.fromkeys(k for k in kinds if k))
 
 
+def _evidence_line_expr() -> Any:
+    return func.coalesce(
+        func.json_extract(edges_table.c.evidence_range_json, "$.start.line"),
+        0,
+    )
+
+
+def _evidence_char_expr() -> Any:
+    return func.coalesce(
+        func.json_extract(edges_table.c.evidence_range_json, "$.start.character"),
+        0,
+    )
+
+
 def list_reference_edges_for_target(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List LSP reference edges targeting a symbol ordered by site location."""
     if limit is not None and limit <= 0:
         return []
-    limit_sql, limit_params = _limit_offset_clause(limit, offset)
-    cursor = conn.execute(
-        f"""
-        SELECT {_EDGE_COLUMNS}
-        FROM edges
-        WHERE kind = ? AND to_id = ?
-        ORDER BY evidence_uri,
-                 COALESCE(json_extract(evidence_range_json, '$.start.line'), 0),
-                 COALESCE(json_extract(evidence_range_json, '$.start.character'), 0),
-                 id
-        {limit_sql}
-        """,
-        (EDGE_KIND_REFERENCES, target_id, *limit_params),
+    stmt = (
+        select(edges_table)
+        .where(
+            edges_table.c.kind == EDGE_KIND_REFERENCES,
+            edges_table.c.to_id == target_id,
+        )
+        .order_by(
+            edges_table.c.evidence_uri,
+            _evidence_line_expr(),
+            _evidence_char_expr(),
+            edges_table.c.id,
+        )
     )
-    return [row_to_edge(row) for row in cursor.fetchall()]
+    stmt = _apply_pagination(stmt, limit, offset)
+    return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def list_referenced_by(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_id: str,
     *,
     kinds: Sequence[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List distinct source symbols referencing a target symbol."""
     if limit is not None and limit <= 0:
         return []
     resolved_kinds = _normalize_kinds(kinds, (EDGE_KIND_REFERENCES,))
     if not resolved_kinds:
         return []
-    placeholders = ",".join("?" * len(resolved_kinds))
-    limit_sql, limit_params = _limit_offset_clause(limit, offset)
-    cursor = conn.execute(
-        f"""
-        SELECT DISTINCT n.id, n.repo_id, n.file_id, n.language, n.kind, n.name,
-               n.qualified_name, n.uri, n.start_line, n.end_line, n.signature,
-               n.scope, n.lexical_parent_id, f.file_path, f.module_path
-        FROM edges e
-        JOIN nodes n ON e.from_id = n.id
-        LEFT JOIN files f ON f.id = n.file_id
-        WHERE e.kind IN ({placeholders}) AND e.to_id = ?
-        ORDER BY n.kind, n.qualified_name, n.id
-        {limit_sql}
-        """,
-        (*resolved_kinds, target_id, *limit_params),
+
+    stmt = (
+        select(
+            nodes_table.c.id,
+            nodes_table.c.repo_id,
+            nodes_table.c.file_id,
+            nodes_table.c.language,
+            nodes_table.c.kind,
+            nodes_table.c.name,
+            nodes_table.c.qualified_name,
+            nodes_table.c.uri,
+            nodes_table.c.start_line,
+            nodes_table.c.end_line,
+            nodes_table.c.signature,
+            nodes_table.c.scope,
+            nodes_table.c.lexical_parent_id,
+            files_table.c.file_path,
+            files_table.c.module_path,
+        )
+        .distinct()
+        .select_from(
+            edges_table.join(nodes_table, edges_table.c.from_id == nodes_table.c.id).outerjoin(
+                files_table, files_table.c.id == nodes_table.c.file_id
+            )
+        )
+        .where(
+            edges_table.c.kind.in_(resolved_kinds),
+            edges_table.c.to_id == target_id,
+        )
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
     )
-    return [dict(row) for row in cursor.fetchall()]
+    stmt = _apply_pagination(stmt, limit, offset)
+    return [dict(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def list_references_from_symbol(
-    conn: sqlite3.Connection,
+    conn: Connection,
     source_id: str,
     *,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List LSP reference edges originating from a source symbol."""
     if limit is not None and limit <= 0:
         return []
-    limit_sql, limit_params = _limit_offset_clause(limit, offset)
-    cursor = conn.execute(
-        f"""
-        SELECT {_EDGE_COLUMNS}
-        FROM edges
-        WHERE kind = ? AND from_id = ?
-        ORDER BY to_id, evidence_uri,
-                 COALESCE(json_extract(evidence_range_json, '$.start.line'), 0),
-                 COALESCE(json_extract(evidence_range_json, '$.start.character'), 0),
-                 id
-        {limit_sql}
-        """,
-        (EDGE_KIND_REFERENCES, source_id, *limit_params),
+    stmt = (
+        select(edges_table)
+        .where(
+            edges_table.c.kind == EDGE_KIND_REFERENCES,
+            edges_table.c.from_id == source_id,
+        )
+        .order_by(
+            edges_table.c.to_id,
+            edges_table.c.evidence_uri,
+            _evidence_line_expr(),
+            _evidence_char_expr(),
+            edges_table.c.id,
+        )
     )
-    return [row_to_edge(row) for row in cursor.fetchall()]
+    stmt = _apply_pagination(stmt, limit, offset)
+    return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def list_incoming_symbol_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_id: str,
     *,
     kinds: Sequence[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List incoming reference/dependency edges targeting ``target_id``."""
     return list_symbol_reference_edges(
         conn,
@@ -154,13 +185,13 @@ def list_incoming_symbol_edges(
 
 
 def list_outgoing_symbol_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     source_id: str,
     *,
     kinds: Sequence[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List outgoing reference/dependency edges originating from ``source_id``."""
     return list_symbol_reference_edges(
         conn,
@@ -172,34 +203,34 @@ def list_outgoing_symbol_edges(
     )
 
 
-def _direction_where(
+def _direction_condition(
     symbol_id: str,
     direction: str,
     kinds: tuple[str, ...],
-) -> tuple[str, tuple[str, ...]]:
-    """Build parameterized WHERE clause for directed reference/dependency queries."""
-    placeholders = ",".join("?" * len(kinds))
+) -> Any:
+    """Build SQLAlchemy filter expression for directed reference/dependency queries."""
+    kind_cond = edges_table.c.kind.in_(kinds)
     if direction == "incoming":
-        return f"to_id = ? AND kind IN ({placeholders})", (symbol_id, *kinds)
+        return and_(edges_table.c.to_id == symbol_id, kind_cond)
     if direction == "outgoing":
-        return f"from_id = ? AND kind IN ({placeholders})", (symbol_id, *kinds)
+        return and_(edges_table.c.from_id == symbol_id, kind_cond)
     if direction == "both":
-        return (
-            f"(to_id = ? OR from_id = ?) AND kind IN ({placeholders})",
-            (symbol_id, symbol_id, *kinds),
+        return and_(
+            or_(edges_table.c.to_id == symbol_id, edges_table.c.from_id == symbol_id),
+            kind_cond,
         )
     raise ValueError(f"Invalid direction {direction!r}; expected 'incoming', 'outgoing', or 'both'")
 
 
 def list_symbol_reference_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     symbol_id: str,
     *,
     direction: str = "incoming",
     kinds: Sequence[str] | None = None,
     limit: int | None = None,
     offset: int = 0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """List paginated LSP references and/or AST calls/imports/inherits edges for a symbol."""
     if limit is not None and limit <= 0:
         return []
@@ -207,33 +238,30 @@ def list_symbol_reference_edges(
     if not resolved_kinds:
         return []
 
-    where_sql, where_params = _direction_where(symbol_id, direction, resolved_kinds)
-    limit_sql, limit_params = _limit_offset_clause(limit, offset)
-    cursor = conn.execute(
-        f"""
-        SELECT {_EDGE_COLUMNS}
-        FROM edges
-        WHERE {where_sql}
-        ORDER BY CASE kind
-                     WHEN 'references' THEN 0
-                     WHEN 'calls' THEN 1
-                     WHEN 'imports' THEN 2
-                     WHEN 'inherits' THEN 3
-                     ELSE 4
-                 END ASC,
-                 evidence_uri,
-                 COALESCE(json_extract(evidence_range_json, '$.start.line'), 0),
-                 COALESCE(json_extract(evidence_range_json, '$.start.character'), 0),
-                 id
-        {limit_sql}
-        """,
-        (*where_params, *limit_params),
+    kind_priority = case(
+        (edges_table.c.kind == "references", 0),
+        (edges_table.c.kind == "calls", 1),
+        (edges_table.c.kind == "imports", 2),
+        (edges_table.c.kind == "inherits", 3),
+        else_=4,
     )
-    return [row_to_edge(row) for row in cursor.fetchall()]
+    stmt = (
+        select(edges_table)
+        .where(_direction_condition(symbol_id, direction, resolved_kinds))
+        .order_by(
+            kind_priority.asc(),
+            edges_table.c.evidence_uri,
+            _evidence_line_expr(),
+            _evidence_char_expr(),
+            edges_table.c.id,
+        )
+    )
+    stmt = _apply_pagination(stmt, limit, offset)
+    return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
 def count_symbol_reference_edges(
-    conn: sqlite3.Connection,
+    conn: Connection,
     symbol_id: str,
     *,
     direction: str = "incoming",
@@ -243,16 +271,16 @@ def count_symbol_reference_edges(
     resolved_kinds = _normalize_kinds(kinds, REFERENCE_AND_DEPENDENCY_EDGE_KINDS)
     if not resolved_kinds:
         return 0
-    where_sql, where_params = _direction_where(symbol_id, direction, resolved_kinds)
-    row = conn.execute(
-        f"SELECT COUNT(*) FROM edges WHERE {where_sql}",
-        where_params,
-    ).fetchone()
-    return int(row[0]) if row else 0
+    stmt = (
+        select(func.count())
+        .select_from(edges_table)
+        .where(_direction_condition(symbol_id, direction, resolved_kinds))
+    )
+    return int(conn.execute(stmt).scalar_one())
 
 
 def get_referencing_modules_for_target(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_id: str,
     *,
     kinds: Sequence[str] | None = None,
@@ -261,62 +289,75 @@ def get_referencing_modules_for_target(
     resolved_kinds = _normalize_kinds(kinds, (EDGE_KIND_REFERENCES,))
     if not resolved_kinds:
         return []
-    placeholders = ",".join("?" * len(resolved_kinds))
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT f.module_path
-        FROM edges e
-        LEFT JOIN nodes n ON e.from_id = n.id
-        JOIN files f ON f.id = COALESCE(e.evidence_file_id, n.file_id)
-        WHERE e.kind IN ({placeholders}) AND e.to_id = ?
-        ORDER BY f.module_path
-        """,
-        (*resolved_kinds, target_id),
-    ).fetchall()
-    return [row["module_path"] for row in rows if row["module_path"]]
+
+    resolved_file_id = func.coalesce(edges_table.c.evidence_file_id, nodes_table.c.file_id)
+    stmt = (
+        select(files_table.c.module_path)
+        .distinct()
+        .select_from(
+            edges_table.outerjoin(
+                nodes_table, edges_table.c.from_id == nodes_table.c.id
+            ).join(files_table, files_table.c.id == resolved_file_id)
+        )
+        .where(
+            edges_table.c.kind.in_(resolved_kinds),
+            edges_table.c.to_id == target_id,
+        )
+        .order_by(files_table.c.module_path)
+    )
+    return [str(mod) for mod in conn.execute(stmt).scalars().all() if mod]
 
 
 def _compute_edge_stats_for_kinds(
-    conn: sqlite3.Connection,
+    conn: Connection,
     target_id: str,
     kinds: tuple[str, ...],
 ) -> tuple[int, int, int]:
     """Compute (edge_count, file_count, module_count) using ``files.module_path``."""
-    placeholders = ",".join("?" * len(kinds))
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*) AS ref_count,
-               COUNT(DISTINCT COALESCE(e.evidence_file_id, n.file_id)) AS file_count,
-               COUNT(DISTINCT COALESCE(f.module_path, e.evidence_file_id, n.file_id)) AS module_count
-        FROM edges e
-        LEFT JOIN nodes n ON e.from_id = n.id
-        LEFT JOIN files f ON f.id = COALESCE(e.evidence_file_id, n.file_id)
-        WHERE e.kind IN ({placeholders}) AND e.to_id = ?
-        """,
-        (*kinds, target_id),
-    ).fetchone()
+    resolved_file_id = func.coalesce(edges_table.c.evidence_file_id, nodes_table.c.file_id)
+    resolved_mod_key = func.coalesce(
+        files_table.c.module_path,
+        edges_table.c.evidence_file_id,
+        nodes_table.c.file_id,
+    )
+    stmt = (
+        select(
+            func.count().label("ref_count"),
+            func.count(distinct(resolved_file_id)).label("file_count"),
+            func.count(distinct(resolved_mod_key)).label("module_count"),
+        )
+        .select_from(
+            edges_table.outerjoin(
+                nodes_table, edges_table.c.from_id == nodes_table.c.id
+            ).outerjoin(files_table, files_table.c.id == resolved_file_id)
+        )
+        .where(
+            edges_table.c.kind.in_(kinds),
+            edges_table.c.to_id == target_id,
+        )
+    )
+    row = conn.execute(stmt).mappings().first()
     if row is None:
         return 0, 0, 0
     return int(row["ref_count"]), int(row["file_count"]), int(row["module_count"])
 
 
-def build_reference_stats(conn: sqlite3.Connection, target_id: str) -> dict:
-    """Build reference statistics for a target symbol with AST fallback.
-
-    Uses LSP ``references`` edges when LSP refresh is available (or when LSP
-    reference edges are already stored); otherwise transparently falls back to
-    AST ``calls``, ``imports``, and ``inherits`` edge counts.
-    """
+def build_reference_stats(conn: Connection, target_id: str) -> dict[str, Any]:
+    """Build reference statistics for a target symbol with AST fallback."""
     refresh_state = get_reference_refresh_state(conn, target_id)
     if refresh_state["available"]:
         reference_source = "lsp"
         kinds: tuple[str, ...] = (EDGE_KIND_REFERENCES,)
     else:
-        lsp_row = conn.execute(
-            "SELECT 1 FROM edges WHERE kind = ? AND to_id = ? LIMIT 1",
-            (EDGE_KIND_REFERENCES, target_id),
-        ).fetchone()
-        if lsp_row is not None:
+        has_lsp = conn.execute(
+            select(edges_table.c.id)
+            .where(
+                edges_table.c.kind == EDGE_KIND_REFERENCES,
+                edges_table.c.to_id == target_id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if has_lsp is not None:
             reference_source = "lsp"
             kinds = (EDGE_KIND_REFERENCES,)
         else:
