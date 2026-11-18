@@ -62,8 +62,7 @@ if [ "$1" = "dev" ]; then
     cd "$DIR"
     export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
     rm -f "$DIR/repo_context.db" "$DIR/repo_context.db-wal" "$DIR/repo_context.db-shm" "$DIR/repo_context.db-journal"
-    "$PY" -m repo_context.cli.main index . --include-tests --force --lsp ${@+"$@"}
-    exec "$PY" -m repo_context.cli.main db status
+    exec "$PY" -m repo_context.cli.main index . --include-tests --force --lsp ${@+"$@"}
 fi
 
 if [ "$1" = "tests" ]; then
