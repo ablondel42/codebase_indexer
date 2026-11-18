@@ -155,12 +155,14 @@ class TestRepoRecordLanguageValidation:
     def test_reject_unsupported_language(self) -> None:
         """Test that unsupported language is rejected."""
         with pytest.raises(PydanticValidationError) as exc_info:
-            RepoRecord(
-                id="repo:test",
-                root_path="/path/to/repo",
-                name="test-repo",
-                default_language="cobol",
-                created_at="2026-01-01T00:00:00Z",
+            RepoRecord.model_validate(
+                {
+                    "id": "repo:test",
+                    "root_path": "/path/to/repo",
+                    "name": "test-repo",
+                    "default_language": "cobol",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
             )
         # Error should mention invalid enum value
         assert "python" in str(exc_info.value).lower()
@@ -168,12 +170,14 @@ class TestRepoRecordLanguageValidation:
     def test_reject_empty_language(self) -> None:
         """Test that empty language is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord(
-                id="repo:test",
-                root_path="/path/to/repo",
-                name="test-repo",
-                default_language="",
-                created_at="2026-01-01T00:00:00Z",
+            RepoRecord.model_validate(
+                {
+                    "id": "repo:test",
+                    "root_path": "/path/to/repo",
+                    "name": "test-repo",
+                    "default_language": "",
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
             )
 
 

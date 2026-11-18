@@ -45,7 +45,7 @@ def _build_candidate_entries(
     candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Format candidate symbols for ambiguity error reporting."""
-    file_ids = [c.get("file_id") for c in candidates if c.get("file_id")]
+    file_ids = [fid for c in candidates if isinstance((fid := c.get("file_id")), str) and fid]
     files_by_id = get_files_by_ids(conn, file_ids)
     items: list[dict[str, Any]] = []
     for cand in candidates[:25]:

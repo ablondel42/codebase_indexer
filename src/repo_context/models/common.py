@@ -53,7 +53,7 @@ def to_json(value: Any) -> str:
             raise TypeError("to_json expects an instance, not a class")
     if isinstance(value, BaseModel):
         return json.dumps(value.model_dump(mode="json"), sort_keys=True, default=_json_default)
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return json.dumps(asdict(value), sort_keys=True, default=_json_default)
     return json.dumps(value, sort_keys=True, default=_json_default)
 

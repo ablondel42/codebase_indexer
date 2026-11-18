@@ -107,6 +107,7 @@ def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
     cls_id = _find_node_id(conn, "Service", "class")
     cls_ctx = build_symbol_context(conn, cls_id, edge_limit=20, include_source=True)
     assert cls_ctx is not None
+    assert cls_ctx.structural_parent is not None
     assert cls_ctx.structural_parent["kind"] == "module"
     assert cls_ctx.lexical_parent is None
     assert [c["name"] for c in cls_ctx.structural_children] == ["run", "_private_method"]
@@ -118,6 +119,7 @@ def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
     run_id = _find_node_id(conn, "run", "method")
     run_ctx = build_symbol_context(conn, run_id)
     assert run_ctx is not None
+    assert run_ctx.structural_parent is not None
     assert run_ctx.structural_parent["id"] == cls_id
     # Class methods are structural class members, NOT lexical declarations
     assert run_ctx.lexical_parent is None
@@ -128,6 +130,7 @@ def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
     inner_id = _find_node_id(conn, "inner_fn", "local_function")
     inner_ctx = build_symbol_context(conn, inner_id)
     assert inner_ctx is not None
+    assert inner_ctx.lexical_parent is not None
     assert inner_ctx.lexical_parent["name"] == "outer_fn"
     assert inner_ctx.structural_summary["is_local_declaration"] is True
     assert inner_ctx.structural_summary["is_nested_declaration"] is True

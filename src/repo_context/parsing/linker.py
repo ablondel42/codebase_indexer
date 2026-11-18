@@ -349,17 +349,18 @@ def resolve_repo_edges(
             placeholder_id = f"external_or_unresolved:{mod_name}"
             mod_node = index.find_module(mod_name)
             if mod_node is not None:
-                resolved_id = mod_node["id"]
+                mod_id = str(mod_node["id"])
+                resolved_id = mod_id
                 if ev_file_id:
                     if alias:
-                        file_bindings[ev_file_id][alias] = resolved_id
-                        dotted_import_map[ev_file_id][alias] = resolved_id
+                        file_bindings[ev_file_id][alias] = mod_id
+                        dotted_import_map[ev_file_id][alias] = mod_id
                     else:
-                        dotted_import_map[ev_file_id][mod_name] = resolved_id
+                        dotted_import_map[ev_file_id][mod_name] = mod_id
                         top_name = mod_name.split(".")[0]
                         top_mod = index.find_module(top_name)
                         if top_mod is not None:
-                            file_bindings[ev_file_id][top_name] = top_mod["id"]
+                            file_bindings[ev_file_id][top_name] = str(top_mod["id"])
         else:
             sym_name = payload.get("symbol")
             if not sym_name:

@@ -202,14 +202,17 @@ def test_schemas_validation_and_aliases() -> None:
     assert GetFileOutlineInput(file_path="a.py").max_depth == 3
     assert SearchSymbolsInput(query="Worker", kind="class").kind == "class"
 
-    src_in = GetSymbolSourceInput(symbol="Worker", max_lines=100)
+    src_in = GetSymbolSourceInput.model_validate({"symbol": "Worker", "max_lines": 100})
     assert src_in.symbol_id_or_name == "Worker"
     assert GetSymbolSourceInput(symbol_id_or_name="Worker").symbol_id_or_name == "Worker"
 
-    assert GetSymbolContextInput(symbol="Worker").edge_limit == 20
-    assert GetSymbolReferencesInput(symbol="Worker", direction="both").direction == "both"
+    assert GetSymbolContextInput.model_validate({"symbol": "Worker"}).edge_limit == 20
+    assert (
+        GetSymbolReferencesInput.model_validate({"symbol": "Worker", "direction": "both"}).direction
+        == "both"
+    )
 
-    risk_in = AnalyzeRiskInput(symbol_ids=["a", "b"])
+    risk_in = AnalyzeRiskInput.model_validate({"symbol_ids": ["a", "b"]})
     assert risk_in.symbols == ["a", "b"]
     with pytest.raises(Exception):
         AnalyzeRiskInput(symbols=["x"] * 51)

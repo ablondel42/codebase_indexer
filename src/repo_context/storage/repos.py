@@ -7,14 +7,14 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 
 from repo_context.exceptions import DatabaseError
 from repo_context.models.repo import RepoRecord
 from repo_context.storage.schema import repos_table
 
 
-def _row_to_repo(row: Mapping[str, Any]) -> RepoRecord:
+def _row_to_repo(row: RowMapping | Mapping[str, Any]) -> RepoRecord:
     """Convert a database mapping row into a ``RepoRecord``."""
     return RepoRecord(
         id=row["id"],

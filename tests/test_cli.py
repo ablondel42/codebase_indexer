@@ -1,5 +1,6 @@
 """Unit tests for grouped ``rc`` CLI argument parsing, error handling, and missing-DB safety."""
 
+from collections.abc import Iterator
 import json
 import logging
 from pathlib import Path
@@ -24,7 +25,7 @@ from repo_context.storage import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_logging() -> None:
+def _reset_logging() -> Iterator[None]:
     """Allow repeated main() invocations to reconfigure logging cleanly."""
     logging_config.LOGGING_INITIALIZED = False
     yield

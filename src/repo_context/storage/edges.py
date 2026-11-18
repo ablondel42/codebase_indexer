@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 import json
 from typing import Any
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 
 from repo_context.exceptions import DatabaseError, ValidationError
@@ -35,17 +35,17 @@ def _deserialize_json(value: Any) -> Any:
     return json.loads(value)
 
 
-def _validate_and_normalize_edge(edge: dict[str, Any] | Edge) -> Edge:
+def _validate_and_normalize_edge(edge: Mapping[str, Any] | Edge) -> Edge:
     """Validate and normalize an edge input."""
     if isinstance(edge, Edge):
         return edge
     try:
-        return Edge(**edge)
+        return Edge.model_validate(dict(edge))
     except Exception as exc:
         logger.error(
             "Edge validation failed",
             extra={
-                "edge_id": edge.get("id") if isinstance(edge, dict) else None,
+                "edge_id": edge.get("id") if isinstance(edge, Mapping) else None,
                 "error": str(exc),
             },
         )
@@ -70,7 +70,7 @@ def edge_to_row(edge: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def row_to_edge(row: Mapping[str, Any]) -> dict[str, Any]:
+def row_to_edge(row: RowMapping | Mapping[str, Any]) -> dict[str, Any]:
     """Convert a database mapping row to an edge dictionary with decoded JSON fields."""
     return {
         "id": row["id"],
@@ -100,7 +100,7 @@ def _build_upsert_edge_stmt() -> Any:
     )
 
 
-def upsert_edge(conn: Connection, edge: dict[str, Any] | Edge) -> None:
+def upsert_edge(conn: Connection, edge: Mapping[str, Any] | Edge) -> None:
     """Insert or update a single edge."""
     validated = _validate_and_normalize_edge(edge)
     logger.debug("Upserting edge", extra={"edge_id": validated.id})
@@ -115,7 +115,7 @@ def upsert_edge(conn: Connection, edge: dict[str, Any] | Edge) -> None:
         raise DatabaseError(f"Failed to upsert edge {validated.id}: {exc}") from exc
 
 
-def upsert_edges(conn: Connection, edges: list[dict[str, Any] | Edge]) -> None:
+def upsert_edges(conn: Connection, edges: Sequence[Mapping[str, Any] | Edge]) -> None:
     """Insert or update multiple edges in a single batch."""
     if not edges:
         return

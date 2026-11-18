@@ -111,7 +111,7 @@ def _normalize_path_prefix(path_prefix: str) -> str:
 
 def _format_ambiguous_candidates(conn: Connection, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build compact disambiguation candidate entries for ambiguous symbol lookups."""
-    file_ids = [c.get("file_id") for c in candidates if c.get("file_id")]
+    file_ids = [fid for c in candidates if isinstance((fid := c.get("file_id")), str) and fid]
     files_by_id = get_files_by_ids(conn, file_ids)
     items: list[dict[str, Any]] = []
     for cand in candidates[:20]:
@@ -473,7 +473,7 @@ def _sync_get_symbol_source(
 ) -> dict[str, Any]:
     """Synchronous implementation for ``get_symbol_source``."""
     inp = GetSymbolSourceInput(
-        symbol=symbol,
+        symbol_id_or_name=symbol,
         repo_id=repo_id,
         max_lines=max_lines,
         offset=offset,
@@ -504,7 +504,7 @@ def _sync_get_symbol_context(
 ) -> dict[str, Any]:
     """Synchronous implementation for ``get_symbol_context``."""
     inp = GetSymbolContextInput(
-        symbol=symbol,
+        symbol_id_or_name=symbol,
         repo_id=repo_id,
         edge_limit=edge_limit,
         include_source=include_source,
@@ -620,7 +620,7 @@ def _sync_get_symbol_references(
 ) -> dict[str, Any]:
     """Synchronous implementation for ``get_symbol_references``."""
     inp = GetSymbolReferencesInput(
-        symbol=symbol,
+        symbol_id_or_name=symbol,
         repo_id=repo_id,
         direction=direction,  # type: ignore[arg-type]
         refresh_lsp=refresh_lsp,

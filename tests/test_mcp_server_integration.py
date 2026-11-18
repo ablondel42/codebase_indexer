@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+from mcp.types import CallToolResult, TextContent
 import pytest
 
 from repo_context.config import AppConfig
@@ -119,8 +120,10 @@ def test_registered_tools_integration_flow(indexed_integration_db: tuple[Path, P
             }
         if hasattr(mcp_obj, "call_tool"):
             call_res = asyncio.run(mcp_obj.call_tool("get_repo_overview", {}))
-            first_text = call_res.content[0].text
-            assert json.loads(first_text)["data"]["repo"]["id"] == repo_id
+            assert isinstance(call_res, CallToolResult)
+            first_block = call_res.content[0]
+            assert isinstance(first_block, TextContent)
+            assert json.loads(first_block.text)["data"]["repo"]["id"] == repo_id
 
     fake = _FakeFastMCP()
     register_tools(fake, db_path=db_path)

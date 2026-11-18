@@ -26,15 +26,15 @@ def replace_file_graph(
         with conn.begin_nested():
             delete_owned_edges_for_file(conn, file_id)
             delete_nodes_for_file(conn, file_id)
-            upsert_nodes(conn, nodes)  # type: ignore[arg-type]
-            upsert_edges(conn, edges)  # type: ignore[arg-type]
+            upsert_nodes(conn, nodes)
+            upsert_edges(conn, edges)
         return
 
     try:
         delete_owned_edges_for_file(conn, file_id)
         delete_nodes_for_file(conn, file_id)
-        upsert_nodes(conn, nodes)  # type: ignore[arg-type]
-        upsert_edges(conn, edges)  # type: ignore[arg-type]
+        upsert_nodes(conn, nodes)
+        upsert_edges(conn, edges)
     except Exception:
         if conn.in_transaction():
             conn.rollback()

@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 
 from repo_context.models.file import FileRecord
 from repo_context.storage.schema import edges_table, files_table, nodes_table
@@ -44,7 +44,7 @@ def _build_upsert_file_stmt() -> Any:
     )
 
 
-def _row_to_file_record(row: Mapping[str, Any]) -> FileRecord:
+def _row_to_file_record(row: RowMapping | Mapping[str, Any]) -> FileRecord:
     return FileRecord(
         id=row["id"],
         repo_id=row["repo_id"],
@@ -61,8 +61,8 @@ def _row_to_file_record(row: Mapping[str, Any]) -> FileRecord:
     )
 
 
-def _row_to_file_dict(row: Mapping[str, Any]) -> dict[str, Any]:
-    data = dict(row)
+def _row_to_file_dict(row: RowMapping | Mapping[str, Any]) -> dict[str, Any]:
+    data: dict[str, Any] = {str(k): v for k, v in row.items()}
     if "is_test" in data:
         data["is_test"] = bool(data["is_test"])
     return data

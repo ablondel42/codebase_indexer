@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import json
 import re
 from typing import Any
 
 from sqlalchemy import case, delete, func, literal_column, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from repo_context.exceptions import DatabaseError, ValidationError
@@ -43,17 +43,17 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _validate_and_normalize_node(node: dict[str, Any] | SymbolNode) -> SymbolNode:
+def _validate_and_normalize_node(node: Mapping[str, Any] | SymbolNode) -> SymbolNode:
     """Validate and normalize a node input."""
     if isinstance(node, SymbolNode):
         return node
     try:
-        return SymbolNode(**node)
+        return SymbolNode.model_validate(dict(node))
     except Exception as exc:
         logger.error(
             "Node validation failed",
             extra={
-                "node_id": node.get("id") if isinstance(node, dict) else None,
+                "node_id": node.get("id") if isinstance(node, Mapping) else None,
                 "error": str(exc),
             },
         )
@@ -90,7 +90,7 @@ def node_to_row(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def row_to_node(row: Mapping[str, Any]) -> dict[str, Any]:
+def row_to_node(row: RowMapping | Mapping[str, Any]) -> dict[str, Any]:
     """Convert a database mapping row to a node dictionary with decoded JSON fields."""
     return {
         "id": row["id"],
@@ -132,7 +132,7 @@ def _build_upsert_node_stmt() -> Any:
     )
 
 
-def upsert_node(conn: Connection, node: dict[str, Any] | SymbolNode) -> None:
+def upsert_node(conn: Connection, node: Mapping[str, Any] | SymbolNode) -> None:
     """Insert or update a single node."""
     validated = _validate_and_normalize_node(node)
     logger.debug("Upserting node", extra={"node_id": validated.id})
@@ -147,7 +147,7 @@ def upsert_node(conn: Connection, node: dict[str, Any] | SymbolNode) -> None:
         raise DatabaseError(f"Failed to upsert node {validated.id}: {exc}") from exc
 
 
-def upsert_nodes(conn: Connection, nodes: list[dict[str, Any] | SymbolNode]) -> None:
+def upsert_nodes(conn: Connection, nodes: Sequence[Mapping[str, Any] | SymbolNode]) -> None:
     """Insert or update multiple nodes in a single batch."""
     if not nodes:
         return

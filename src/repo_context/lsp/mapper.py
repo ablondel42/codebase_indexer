@@ -20,6 +20,8 @@ def normalize_location(location: Any) -> dict[str, Any]:
                 or location.get("targetRange")
                 or location.get("range")
             )
+        if not isinstance(raw_range, dict):
+            raise ValueError(f"Invalid LSP location range: {location!r}")
         return {
             "uri": uri,
             "range": {
@@ -40,6 +42,8 @@ def normalize_location(location: Any) -> dict[str, Any]:
         or getattr(location, "target_selection_range", None)
         or getattr(location, "target_range", None)
     )
+    if rng is None:
+        raise ValueError(f"Invalid LSP location object (missing range): {location!r}")
     return {
         "uri": uri,
         "range": {

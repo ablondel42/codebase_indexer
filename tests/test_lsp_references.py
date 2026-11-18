@@ -123,7 +123,8 @@ class TestMapperAndUtf16Conversions:
         ]
         picked = pick_smallest_containing_symbol(symbols, outer)
         assert picked is not None and picked["id"] == "sym:fn"
-        assert find_module_node_for_file(symbols)["id"] == "sym:mod"
+        mod_node = find_module_node_for_file(symbols)
+        assert mod_node is not None and mod_node["id"] == "sym:mod"
 
     def test_normalize_location_location_and_location_link(self) -> None:
         loc = {
@@ -419,6 +420,7 @@ while True:
 
         client = PyrightLspClient([sys.executable, "-u", str(server_script)], timeout=0.3)
         client.start(tmp_path)
+        assert client.proc is not None
         pid = client.proc.pid
         with pytest.raises(LspError, match="timed out"):
             client.find_references((tmp_path / "a.py").as_uri(), 0, 0)

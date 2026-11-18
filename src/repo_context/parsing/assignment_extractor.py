@@ -3,6 +3,7 @@
 import ast
 import hashlib
 import json
+import sys
 from collections.abc import Sequence
 
 from repo_context.constants import (
@@ -24,8 +25,6 @@ from repo_context.parsing.ranges import (
     make_name_selection_range,
     make_range,
 )
-
-_TYPE_ALIAS_AST = getattr(ast, "TypeAlias", None)
 
 
 def _is_type_alias_annotation(annotation_str: str) -> bool:
@@ -140,7 +139,7 @@ def _extract_from_body(
     nodes: list[dict] = []
 
     for stmt in body:
-        if _TYPE_ALIAS_AST is not None and isinstance(stmt, _TYPE_ALIAS_AST):
+        if sys.version_info >= (3, 12) and isinstance(stmt, ast.TypeAlias):
             name_node = stmt.name
             if not isinstance(name_node, ast.Name) or name_node.id == "_":
                 continue

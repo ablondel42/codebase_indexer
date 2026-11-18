@@ -319,11 +319,15 @@ def test_symbol_and_hierarchy_lookups(query_db: tuple[Connection, Path]) -> None
 
     cls1 = get_symbol(conn, "sym:cls1")
     assert cls1 is not None
-    assert get_symbol_by_qualified_name(conn, repo_id, "mod1.Class1", "class")["id"] == "sym:cls1"
-    assert get_parent_symbol(conn, cls1)["id"] == "sym:mod1"
+    by_qname = get_symbol_by_qualified_name(conn, repo_id, "mod1.Class1", "class")
+    assert by_qname is not None and by_qname["id"] == "sym:cls1"
+    parent_sym = get_parent_symbol(conn, cls1)
+    assert parent_sym is not None and parent_sym["id"] == "sym:mod1"
 
     inner = get_symbol(conn, "sym:inner")
-    assert get_lexical_parent_symbol(conn, inner)["id"] == "sym:func_pct"
+    assert inner is not None
+    lex_parent = get_lexical_parent_symbol(conn, inner)
+    assert lex_parent is not None and lex_parent["id"] == "sym:func_pct"
     assert [c["id"] for c in get_lexical_child_symbols(conn, "sym:func_pct")] == ["sym:inner"]
     assert {c["id"] for c in get_child_symbols(conn, "sym:mod1")} == {"sym:cls1", "sym:func_pct"}
 

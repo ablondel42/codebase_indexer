@@ -10,6 +10,7 @@ import pytest
 from repo_context.constants import (
     EDGE_KIND_CALLS,
     EDGE_KIND_SCOPE_PARENT,
+    Language,
     SYMBOL_KIND_ATTRIBUTE,
     SYMBOL_KIND_CONSTANT,
     SYMBOL_KIND_TYPE_ALIAS,
@@ -53,7 +54,7 @@ def test_repo_and_file_record_v2_fields() -> None:
         id="repo:test:1234abcd",
         root_path="/path/to/repo",
         name="test-repo",
-        default_language="python",
+        default_language=Language.PYTHON,
         created_at="2026-03-23T00:00:00Z",
     )
     assert repo.id == "repo:test:1234abcd"
@@ -109,20 +110,22 @@ def test_symbol_node_supports_all_v2_kinds_and_fields(kind: str) -> None:
     """SymbolNode validates all v2 symbol kinds, long names (<=1024), and line/signature fields."""
     assert kind in VALID_SYMBOL_KINDS
     long_name = "S" * 512
-    node = SymbolNode(
-        id=f"sym:repo:test:{kind}:app.{long_name}",
-        repo_id="repo:test:1234abcd",
-        file_id="file:repo:test:1234abcd:app/service.py",
-        kind=kind,  # type: ignore[arg-type]
-        name=long_name,
-        qualified_name=f"app.{long_name}",
-        uri="file:///path/to/repo/app/service.py",
-        range_json={"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
-        selection_range_json={"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
-        start_line=1,
-        end_line=3,
-        signature="MAX_RETRIES: int = 3",
-        payload_json={"value_hint": "3"},
+    node = SymbolNode.model_validate(
+        {
+            "id": f"sym:repo:test:{kind}:app.{long_name}",
+            "repo_id": "repo:test:1234abcd",
+            "file_id": "file:repo:test:1234abcd:app/service.py",
+            "kind": kind,
+            "name": long_name,
+            "qualified_name": f"app.{long_name}",
+            "uri": "file:///path/to/repo/app/service.py",
+            "range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
+            "selection_range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "start_line": 1,
+            "end_line": 3,
+            "signature": "MAX_RETRIES: int = 3",
+            "payload_json": {"value_hint": "3"},
+        }
     )
     assert node.kind == kind
     assert node.start_line == 1
@@ -164,14 +167,16 @@ def test_symbol_node_rejects_malformed_json_and_oversized_name() -> None:
 def test_edge_supports_normalized_v2_kinds_and_json_validation(kind: str) -> None:
     """Edge accepts normalized v2 kinds (scope_parent, calls, etc.) and rejects bad JSON."""
     assert kind in VALID_EDGE_KINDS
-    edge = Edge(
-        id=f"edge:repo:test:{kind}:a->b",
-        repo_id="repo:test:1234abcd",
-        kind=kind,  # type: ignore[arg-type]
-        from_id="sym:a",
-        to_id="sym:b",
-        payload_json={"target": "b"},
-        evidence_range_json={"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}},
+    edge = Edge.model_validate(
+        {
+            "id": f"edge:repo:test:{kind}:a->b",
+            "repo_id": "repo:test:1234abcd",
+            "kind": kind,
+            "from_id": "sym:a",
+            "to_id": "sym:b",
+            "payload_json": {"target": "b"},
+            "evidence_range_json": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}},
+        }
     )
     assert edge.kind == kind
     assert json.loads(edge.payload_json) == {"target": "b"}

@@ -300,7 +300,7 @@ def _coerce_path_str(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, (bytes, bytearray)):
-        return os.fsdecode(value)
+        return os.fsdecode(bytes(value))
     return os.fspath(value) if isinstance(value, Path) else str(value)
 
 

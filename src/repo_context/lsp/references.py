@@ -87,7 +87,7 @@ def replace_reference_edges_for_target(
             )
         )
         if edges:
-            upsert_edges(conn, edges)  # type: ignore[arg-type]
+            upsert_edges(conn, edges)
         upsert_reference_refresh(
             conn,
             refresh_metadata["target_symbol_id"],

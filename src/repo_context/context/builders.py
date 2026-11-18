@@ -344,7 +344,7 @@ def build_symbol_context(
         adapt_edge_to_context_edge(
             e,
             peer_symbol=peers_by_id.get(e["from_id"]),
-            file_info=files_by_id.get(e.get("evidence_file_id")),
+            file_info=files_by_id.get(e.get("evidence_file_id") or ""),
             direction="incoming",
         )
         for e in bounded_incoming_raw
@@ -353,7 +353,7 @@ def build_symbol_context(
         adapt_edge_to_context_edge(
             e,
             peer_symbol=peers_by_id.get(e["to_id"]),
-            file_info=files_by_id.get(e.get("evidence_file_id")),
+            file_info=files_by_id.get(e.get("evidence_file_id") or ""),
             direction="outgoing",
         )
         for e in bounded_outgoing_raw
