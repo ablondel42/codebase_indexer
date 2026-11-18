@@ -1,3 +1,5 @@
+.agents
+pyright-errors.json
 .DS_Store
 *.db
 *.db-wal

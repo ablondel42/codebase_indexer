@@ -42,6 +42,8 @@ class AppConfig:
         # IDE
         ".idea",
         ".vscode",
+        ".agents",
+        ".agent",
     )
     test_dir_names: tuple[str, ...] = ("tests", "test")
     supported_extensions: tuple[str, ...] = (".py",)
