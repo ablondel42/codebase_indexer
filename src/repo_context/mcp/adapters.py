@@ -50,9 +50,15 @@ def adapt_node(node: dict[str, Any], *, file_info: dict[str, Any] | None = None)
     if not isinstance(payload, dict):
         payload = {}
 
-    file_path = (file_info or {}).get("file_path") or node.get("file_path") or payload.get("file_path")
+    file_path = (
+        (file_info or {}).get("file_path")
+        or node.get("file_path")
+        or payload.get("file_path")
+    )
     module_path = (
-        (file_info or {}).get("module_path") or node.get("module_path") or payload.get("module_path")
+        (file_info or {}).get("module_path")
+        or node.get("module_path")
+        or payload.get("module_path")
     )
 
     return _omit_none(
@@ -227,9 +233,9 @@ def _adapt_context_edge_item(edge: dict[str, Any], *, is_incoming: bool) -> dict
     )
 
 
-def adapt_context(ctx: Any) -> dict[str, Any]:
-    """Adapt a SymbolContext into a compact, grouped, token-lean MCP payload."""
-    focus = dict(ctx.focus_symbol)
+def _adapt_focus_symbol(focus_symbol: dict[str, Any]) -> dict[str, Any]:
+    """Compact the focus symbol dict by replacing raw start/end/parent keys with ``lines``."""
+    focus = dict(focus_symbol)
     lines = focus.get("lines") or format_line_span(focus)
     focus.pop("start_line", None)
     focus.pop("end_line", None)
@@ -237,26 +243,28 @@ def adapt_context(ctx: Any) -> dict[str, Any]:
     focus.pop("lexical_parent_id", None)
     if lines is not None:
         focus["lines"] = lines
+    return _omit_none(focus)
 
-    structural_summary = dict(ctx.structural_summary or {})
-    rel_counts = dict(structural_summary.pop("relationship_counts", {}) or {})
 
-    in_by_kind: dict[str, list[dict[str, Any]]] = {}
-    for edge in ctx.incoming_edges or []:
+def _group_context_edges(
+    edges: list[dict[str, Any]] | None,
+    *,
+    is_incoming: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    """Group incoming or outgoing context edges by edge kind."""
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for edge in edges or []:
         kind = edge.get("kind") or "references"
-        in_by_kind.setdefault(kind, []).append(
-            _adapt_context_edge_item(edge, is_incoming=True)
+        by_kind.setdefault(kind, []).append(
+            _adapt_context_edge_item(edge, is_incoming=is_incoming)
         )
+    return by_kind
 
-    out_by_kind: dict[str, list[dict[str, Any]]] = {}
-    for edge in ctx.outgoing_edges or []:
-        kind = edge.get("kind") or "references"
-        out_by_kind.setdefault(kind, []).append(
-            _adapt_context_edge_item(edge, is_incoming=False)
-        )
 
-    include_struct_child_docs = len(ctx.structural_children or []) <= 10
-    include_lex_child_docs = len(ctx.lexical_children or []) <= 10
+def _build_hierarchy_fields(ctx: Any) -> dict[str, Any]:
+    """Build deduplicated structural and lexical parent/child entries for ``ctx``."""
+    struct_children = ctx.structural_children or []
+    lex_children = ctx.lexical_children or []
 
     struct_parent_id = (ctx.structural_parent or {}).get("id")
     lex_parent_id = (ctx.lexical_parent or {}).get("id")
@@ -265,19 +273,18 @@ def adapt_context(ctx: Any) -> dict[str, Any]:
         and (struct_parent_id is None or lex_parent_id != struct_parent_id)
     )
 
-    struct_child_ids = [c.get("id") for c in (ctx.structural_children or [])]
-    lex_child_ids = [c.get("id") for c in (ctx.lexical_children or [])]
-    include_lexical_children = bool(ctx.lexical_children) and lex_child_ids != struct_child_ids
+    struct_child_ids = [c.get("id") for c in struct_children]
+    lex_child_ids = [c.get("id") for c in lex_children]
+    include_lexical_children = bool(lex_children) and lex_child_ids != struct_child_ids
 
-    payload: dict[str, Any] = {
-        "focus_symbol": _omit_none(focus),
+    return {
         "structural_parent": _adapt_parent_stub(ctx.structural_parent),
         "structural_children": (
             [
-                _adapt_child_stub(c, include_doc=include_struct_child_docs)
-                for c in ctx.structural_children
+                _adapt_child_stub(c, include_doc=len(struct_children) <= 10)
+                for c in struct_children
             ]
-            if ctx.structural_children
+            if struct_children
             else None
         ),
         "lexical_parent": (
@@ -285,14 +292,22 @@ def adapt_context(ctx: Any) -> dict[str, Any]:
         ),
         "lexical_children": (
             [
-                _adapt_child_stub(c, include_doc=include_lex_child_docs)
-                for c in ctx.lexical_children
+                _adapt_child_stub(c, include_doc=len(lex_children) <= 10)
+                for c in lex_children
             ]
             if include_lexical_children
             else None
         ),
     }
 
+
+def _populate_relationship_buckets(
+    payload: dict[str, Any],
+    in_by_kind: dict[str, list[dict[str, Any]]],
+    out_by_kind: dict[str, list[dict[str, Any]]],
+    rel_counts: dict[str, Any],
+) -> None:
+    """Attach non-empty caller/callee/import/inheritance/reference buckets to ``payload``."""
     bucket_specs = (
         ("callers", in_by_kind.get(EDGE_KIND_CALLS, []), rel_counts.get("callers")),
         ("callees", out_by_kind.get(EDGE_KIND_CALLS, []), rel_counts.get("callees")),
@@ -300,20 +315,32 @@ def adapt_context(ctx: Any) -> dict[str, Any]:
         ("imports", out_by_kind.get(EDGE_KIND_IMPORTS, []), rel_counts.get("imports")),
         ("subclasses", in_by_kind.get(EDGE_KIND_INHERITS, []), rel_counts.get("subclasses")),
         ("bases", out_by_kind.get(EDGE_KIND_INHERITS, []), rel_counts.get("bases")),
-        ("references_in", in_by_kind.get(EDGE_KIND_REFERENCES, []), rel_counts.get("references_in")),
-        ("references_out", out_by_kind.get(EDGE_KIND_REFERENCES, []), rel_counts.get("references_out")),
+        (
+            "references_in",
+            in_by_kind.get(EDGE_KIND_REFERENCES, []),
+            rel_counts.get("references_in"),
+        ),
+        (
+            "references_out",
+            out_by_kind.get(EDGE_KIND_REFERENCES, []),
+            rel_counts.get("references_out"),
+        ),
     )
     for key, items, total in bucket_specs:
         count = total if total is not None else len(items)
         if count > 0 or items:
             payload[key] = {"total": count, "items": items}
 
-    compact_summary = _omit_none(
+
+def _adapt_structural_summary(structural_summary: dict[str, Any]) -> dict[str, Any]:
+    """Strip zero/false structural summary flags into a compact dict."""
+    return _omit_none(
         {
             "scope": structural_summary.get("scope"),
             "structural_child_count": structural_summary.get("structural_child_count"),
-            "structural_children_truncated": structural_summary.get("structural_children_truncated")
-            or None,
+            "structural_children_truncated": (
+                structural_summary.get("structural_children_truncated") or None
+            ),
             "lexical_child_count": structural_summary.get("lexical_child_count") or None,
             "incoming_edge_count": structural_summary.get("incoming_edge_count"),
             "outgoing_edge_count": structural_summary.get("outgoing_edge_count"),
@@ -323,11 +350,26 @@ def adapt_context(ctx: Any) -> dict[str, Any]:
         }
     )
 
-    payload["structural_summary"] = compact_summary
+
+def adapt_context(ctx: Any) -> dict[str, Any]:
+    """Adapt a SymbolContext into a compact, grouped, token-lean MCP payload."""
+    structural_summary = dict(ctx.structural_summary or {})
+    rel_counts = dict(structural_summary.pop("relationship_counts", {}) or {})
+
+    payload: dict[str, Any] = {
+        "focus_symbol": _adapt_focus_symbol(ctx.focus_symbol),
+        **_build_hierarchy_fields(ctx),
+    }
+    _populate_relationship_buckets(
+        payload,
+        _group_context_edges(ctx.incoming_edges, is_incoming=True),
+        _group_context_edges(ctx.outgoing_edges, is_incoming=False),
+        rel_counts,
+    )
+    payload["structural_summary"] = _adapt_structural_summary(structural_summary)
     payload["reference_summary"] = _omit_none(dict(ctx.reference_summary or {}))
     payload["freshness"] = _omit_none(dict(ctx.freshness or {}))
     payload["confidence"] = _omit_none(dict(ctx.confidence or {}))
-
     return _omit_none(payload)
 
 

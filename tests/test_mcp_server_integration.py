@@ -4,12 +4,14 @@ import asyncio
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
-from mcp.types import CallToolResult, TextContent
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 from repo_context.config import AppConfig
 from repo_context.mcp.errors import (
@@ -46,10 +48,12 @@ class _FakeFastMCP:
     """Lightweight FastMCP stub capturing tool registrations for integration tests."""
 
     def __init__(self) -> None:
-        self.tools: dict[str, object] = {}
+        self.tools: dict[str, Callable[..., Any]] = {}
 
-    def tool(self, name: str | None = None):
-        def decorator(fn):
+    def tool(
+        self, name: str | None = None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[name or fn.__name__] = fn
             return fn
 
@@ -129,35 +133,35 @@ def test_registered_tools_integration_flow(indexed_integration_db: tuple[Path, P
     register_tools(fake, db_path=db_path)
     tools = fake.tools
 
-    ov = json.loads(asyncio.run(tools["get_repo_overview"]()))  # type: ignore[operator]
+    ov = json.loads(asyncio.run(tools["get_repo_overview"]()))
     assert ov["ok"] is True
     assert ov["data"]["repo"]["id"] == repo_id
 
-    files_res = json.loads(asyncio.run(tools["list_files"]()))  # type: ignore[operator]
+    files_res = json.loads(asyncio.run(tools["list_files"]()))
     assert [f["file_path"] for f in files_res["data"]["files"]] == ["alpha.py", "beta.py"]
 
-    outline_res = json.loads(asyncio.run(tools["get_file_outline"]("alpha.py")))  # type: ignore[operator]
+    outline_res = json.loads(asyncio.run(tools["get_file_outline"]("alpha.py")))
     assert [s["name"] for s in outline_res["data"]["symbols"]] == ["shared", "compute"]
 
-    search_res = json.loads(asyncio.run(tools["search_symbols"]("compute")))  # type: ignore[operator]
+    search_res = json.loads(asyncio.run(tools["search_symbols"]("compute")))
     assert search_res["data"]["count"] >= 1
 
-    src_res = json.loads(asyncio.run(tools["get_symbol_source"]("alpha.compute")))  # type: ignore[operator]
+    src_res = json.loads(asyncio.run(tools["get_symbol_source"]("alpha.compute")))
     assert "def compute(" in src_res["data"]["source"]
 
-    ctx_res = json.loads(asyncio.run(tools["get_symbol_context"]("alpha.compute")))  # type: ignore[operator]
+    ctx_res = json.loads(asyncio.run(tools["get_symbol_context"]("alpha.compute")))
     assert ctx_res["data"]["context"]["callers"]["total"] >= 1
 
-    refs_res = json.loads(asyncio.run(tools["get_symbol_references"]("alpha.compute")))  # type: ignore[operator]
+    refs_res = json.loads(asyncio.run(tools["get_symbol_references"]("alpha.compute")))
     assert refs_res["data"]["total_count"] >= 1
 
-    risk_res = json.loads(asyncio.run(tools["analyze_risk"](["alpha.compute"])))  # type: ignore[operator]
+    risk_res = json.loads(asyncio.run(tools["analyze_risk"](["alpha.compute"])))
     assert risk_res["data"]["risk"]["facts"]["cross_module_impact"] is True
 
-    ambig = json.loads(asyncio.run(tools["get_symbol_context"]("shared")))  # type: ignore[operator]
+    ambig = json.loads(asyncio.run(tools["get_symbol_context"]("shared")))
     assert ambig["error"]["code"] == ERROR_AMBIGUOUS_SYMBOL
 
-    missing = json.loads(asyncio.run(tools["get_symbol_source"]("does_not_exist")))  # type: ignore[operator]
+    missing = json.loads(asyncio.run(tools["get_symbol_source"]("does_not_exist")))
     assert missing["error"]["code"] == ERROR_SYMBOL_NOT_FOUND
 
 
@@ -229,7 +233,7 @@ def test_cli_mcp_call_shorthand_and_key_value_args(
     indexed_integration_db: tuple[Path, Path, str],
     tmp_path: Path,
 ) -> None:
-    """`rc mcp-call` accepts shorthand symbol/file/query args, key=value pairs, and unquoted JSON."""
+    """`rc mcp-call` accepts shorthand args, key=value pairs, and unquoted JSON."""
     db_path, _, _ = indexed_integration_db
     env = _subprocess_env()
 

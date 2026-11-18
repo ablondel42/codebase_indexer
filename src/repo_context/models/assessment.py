@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 @dataclass
 class PlanAssessment:
     """Represents a risk assessment for a change plan.
-    
+
     Attributes:
         plan_summary: Human-readable description of the proposed change.
         target_symbols: List of symbol IDs that the plan intends to modify.

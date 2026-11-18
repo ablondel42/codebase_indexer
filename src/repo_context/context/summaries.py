@@ -1,6 +1,7 @@
 """Summary builders for symbol context."""
 
 from collections.abc import Sequence
+from typing import TypedDict, Unpack
 
 from repo_context.constants import (
     SYMBOL_KIND_ASYNC_METHOD,
@@ -21,77 +22,69 @@ LOCAL_CALLABLE_KINDS = {
 }
 
 
+class _StructuralCounts(TypedDict, total=False):
+    total_structural_child_count: int | None
+    total_lexical_child_count: int | None
+    total_incoming_count: int | None
+    total_outgoing_count: int | None
+    total_sibling_count: int | None
+    relationship_counts: dict[str, int] | None
+
+
 def _is_local_declaration(focus_symbol: dict) -> bool:
     """Check if symbol is a function-local declaration."""
     kind = focus_symbol.get("kind", "")
     scope = focus_symbol.get("scope", "")
-
-    if kind in LOCAL_CALLABLE_KINDS:
-        return True
-    if kind == "class" and scope == "function":
-        return True
-    return False
+    return bool(kind in LOCAL_CALLABLE_KINDS or (kind == "class" and scope == "function"))
 
 
 def _is_nested_declaration(focus_symbol: dict) -> bool:
     """Return True strictly for lexically nested function-scoped declarations."""
-    lexical_parent_id = focus_symbol.get("lexical_parent_id")
-    if lexical_parent_id is None:
+    if focus_symbol.get("lexical_parent_id") is None:
         return False
     # Normal class methods are structural class members, never lexical nested declarations.
-    if (
+    return not (
         focus_symbol.get("kind") in (SYMBOL_KIND_METHOD, SYMBOL_KIND_ASYNC_METHOD)
         and focus_symbol.get("scope") == "class"
-    ):
-        return False
-    return True
+    )
+
+
+def _resolve_total(override: int | None, items: Sequence[object]) -> int:
+    """Return explicit count override if provided, otherwise length of items."""
+    return override if override is not None else len(items)
 
 
 def build_structural_summary(
     context: SymbolContext,
-    *,
-    total_structural_child_count: int | None = None,
-    total_lexical_child_count: int | None = None,
-    total_incoming_count: int | None = None,
-    total_outgoing_count: int | None = None,
-    total_sibling_count: int | None = None,
-    relationship_counts: dict[str, int] | None = None,
+    **counts: Unpack[_StructuralCounts],
 ) -> dict:
     """Build a compact structural and relationship summary from symbol context."""
     focus = context.focus_symbol
-    structural_child_total = (
-        total_structural_child_count
-        if total_structural_child_count is not None
-        else len(context.structural_children)
+    structural_child_total = _resolve_total(
+        counts.get("total_structural_child_count"), context.structural_children
     )
-    lexical_child_total = (
-        total_lexical_child_count
-        if total_lexical_child_count is not None
-        else len(context.lexical_children)
-    )
-    incoming_total = (
-        total_incoming_count if total_incoming_count is not None else len(context.incoming_edges)
-    )
-    outgoing_total = (
-        total_outgoing_count if total_outgoing_count is not None else len(context.outgoing_edges)
-    )
-    sibling_total = (
-        total_sibling_count if total_sibling_count is not None else len(context.file_siblings)
-    )
-
-    summary = {
+    summary: dict = {
         "has_structural_parent": context.structural_parent is not None,
         "structural_child_count": structural_child_total,
         "structural_children_truncated": structural_child_total > len(context.structural_children),
         "has_lexical_parent": context.lexical_parent is not None,
-        "lexical_child_count": lexical_child_total,
-        "incoming_edge_count": incoming_total,
-        "outgoing_edge_count": outgoing_total,
-        "same_file_sibling_count": sibling_total,
+        "lexical_child_count": _resolve_total(
+            counts.get("total_lexical_child_count"), context.lexical_children
+        ),
+        "incoming_edge_count": _resolve_total(
+            counts.get("total_incoming_count"), context.incoming_edges
+        ),
+        "outgoing_edge_count": _resolve_total(
+            counts.get("total_outgoing_count"), context.outgoing_edges
+        ),
+        "same_file_sibling_count": _resolve_total(
+            counts.get("total_sibling_count"), context.file_siblings
+        ),
         "scope": focus.get("scope"),
         "is_local_declaration": _is_local_declaration(focus),
         "is_nested_declaration": _is_nested_declaration(focus),
     }
+    relationship_counts = counts.get("relationship_counts")
     if relationship_counts:
         summary["relationship_counts"] = relationship_counts
     return summary

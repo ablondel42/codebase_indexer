@@ -1,9 +1,9 @@
 """Constants and enums for the application."""
 
-from enum import Enum
+from enum import StrEnum
 
 
-class Language(str, Enum):
+class Language(StrEnum):
     """Supported programming languages."""
 
     PYTHON = "python"

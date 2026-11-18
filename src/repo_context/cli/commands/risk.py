@@ -6,9 +6,9 @@ import argparse
 import json
 from typing import Any
 
+from repo_context.cli.utils import resolve_db_path, resolve_symbol_targets
 from repo_context.graph import RiskResult, analyze_target_set_risk
 from repo_context.storage import connection_scope, initialize_database
-from repo_context.cli.utils import resolve_db_path, resolve_symbol_targets
 
 
 def _serialize_risk_result(result: RiskResult) -> dict[str, Any]:

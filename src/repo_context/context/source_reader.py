@@ -2,6 +2,7 @@
 
 import hashlib
 from pathlib import Path
+from typing import TypedDict, Unpack
 
 from sqlalchemy.engine import Connection
 
@@ -17,6 +18,13 @@ from repo_context.parsing.pathing import ensure_safe_repo_file
 from repo_context.storage.files import get_file_by_id
 from repo_context.storage.nodes import get_node_by_id
 from repo_context.storage.repos import get_repo_by_id
+
+
+class _SnippetOptions(TypedDict, total=False):
+    max_lines: int
+    offset: int
+    expected_content_hash: str | None
+    max_file_size_bytes: int | None
 
 
 def _read_verified_file_text(
@@ -65,22 +73,14 @@ def _read_verified_file_text(
     return text, content_hash
 
 
-def read_file_snippet(
-    repo_root: Path | str,
-    file_path: str,
+def _validate_snippet_bounds(
     start_line: int,
     end_line: int,
     *,
-    max_lines: int = 120,
-    offset: int = 0,
-    expected_content_hash: str | None = None,
-    max_file_size_bytes: int | None = None,
-) -> dict:
-    """Safely read a line-numbered 1-based slice from a repository file.
-
-    Enforces symlink/root confinement via ``ensure_safe_repo_file`` and verifies
-    disk freshness against ``expected_content_hash`` when provided.
-    """
+    max_lines: int,
+    offset: int,
+) -> None:
+    """Validate 1-based line range and pagination bounds."""
     if start_line < 1:
         raise ValidationError("start_line must be >= 1", context={"start_line": start_line})
     if end_line < start_line:
@@ -93,60 +93,84 @@ def read_file_snippet(
     if offset < 0:
         raise ValidationError("offset must be >= 0", context={"offset": offset})
 
-    safe_path = ensure_safe_repo_file(Path(repo_root), file_path)
-    limit = (
-        max_file_size_bytes
-        if max_file_size_bytes is not None
-        else get_config().max_file_size_bytes
-    )
-    text, actual_hash = _read_verified_file_text(safe_path, max_file_size_bytes=limit)
 
-    if expected_content_hash is not None:
-        is_fresh = actual_hash == expected_content_hash
-        stale_reason = None if is_fresh else "content_hash_mismatch"
-    else:
-        is_fresh = True
-        stale_reason = None
+def _check_hash_freshness(
+    actual_hash: str,
+    expected_content_hash: str | None,
+) -> tuple[bool, str | None]:
+    """Compare on-disk hash with expected index hash when provided."""
+    if expected_content_hash is None:
+        return True, None
+    is_fresh = actual_hash == expected_content_hash
+    return is_fresh, None if is_fresh else "content_hash_mismatch"
 
-    all_lines = text.splitlines()
+
+def _slice_numbered_window(
+    all_lines: list[str],
+    start_line: int,
+    end_line: int,
+    *,
+    max_lines: int,
+    offset: int,
+) -> dict:
+    """Slice 1-based lines and format line-numbered window metadata."""
+    clamped_end = min(end_line, len(all_lines))
     if not all_lines or start_line > len(all_lines):
         return {
-            "file_path": file_path,
             "start_line": start_line,
-            "end_line": min(end_line, len(all_lines)),
+            "end_line": clamped_end,
             "source": "",
             "truncated": False,
             "total_lines": 0,
             "returned_lines": 0,
             "next_offset": None,
-            "is_fresh": is_fresh,
-            "stale_reason": stale_reason,
         }
 
-    clamped_start = max(1, start_line)
-    clamped_end = min(end_line, len(all_lines))
-    slice_lines = all_lines[clamped_start - 1 : clamped_end]
-    total_lines = len(slice_lines)
-
+    slice_lines = all_lines[start_line - 1 : clamped_end]
     window = slice_lines[offset : offset + max_lines]
-    returned_lines = len(window)
-    truncated = (offset + returned_lines) < total_lines
-    next_offset = (offset + returned_lines) if truncated else None
-
-    numbered = [
-        f"{clamped_start + offset + idx}: {line}"
-        for idx, line in enumerate(window)
-    ]
-
+    next_idx = offset + len(window)
+    truncated = next_idx < len(slice_lines)
+    numbered = [f"{start_line + offset + idx}: {line}" for idx, line in enumerate(window)]
     return {
-        "file_path": file_path,
-        "start_line": clamped_start,
+        "start_line": start_line,
         "end_line": clamped_end,
         "source": "\n".join(numbered),
         "truncated": truncated,
-        "total_lines": total_lines,
-        "returned_lines": returned_lines,
-        "next_offset": next_offset,
+        "total_lines": len(slice_lines),
+        "returned_lines": len(window),
+        "next_offset": next_idx if truncated else None,
+    }
+
+
+def read_file_snippet(
+    repo_root: Path | str,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    **options: Unpack[_SnippetOptions],
+) -> dict:
+    """Safely read a line-numbered 1-based slice from a repository file.
+
+    Enforces symlink/root confinement via ``ensure_safe_repo_file`` and verifies
+    disk freshness against ``expected_content_hash`` when provided.
+    """
+    max_lines = options.get("max_lines", 120)
+    offset = options.get("offset", 0)
+    _validate_snippet_bounds(start_line, end_line, max_lines=max_lines, offset=offset)
+
+    safe_path = ensure_safe_repo_file(Path(repo_root), file_path)
+    max_size = options.get("max_file_size_bytes")
+    limit = max_size if max_size is not None else get_config().max_file_size_bytes
+    text, actual_hash = _read_verified_file_text(safe_path, max_file_size_bytes=limit)
+    is_fresh, stale_reason = _check_hash_freshness(
+        actual_hash, options.get("expected_content_hash")
+    )
+    window_data = _slice_numbered_window(
+        text.splitlines(), start_line, end_line, max_lines=max_lines, offset=offset
+    )
+    return {
+        "file_path": file_path,
+        **window_data,
         "is_fresh": is_fresh,
         "stale_reason": stale_reason,
     }
@@ -222,7 +246,7 @@ def read_symbol_source(
         expected_content_hash=file_record["content_hash"],
     )
 
-    result = {
+    return {
         "symbol_id": node["id"],
         "qualified_name": node["qualified_name"],
         "kind": node["kind"],
@@ -231,4 +255,3 @@ def read_symbol_source(
         "signature": node.get("signature"),
         **snippet,
     }
-    return result

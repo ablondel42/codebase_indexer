@@ -1,13 +1,14 @@
 """Graph storage tests for v0.2.0 SQLite persistence, batch pruning, and transactions."""
 
-from collections.abc import Iterator
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from sqlalchemy.engine import Connection
 
 from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_SCOPE_PARENT
+from repo_context.exceptions import DatabaseError, ValidationError
 from repo_context.graph import get_repo_graph_stats
 from repo_context.models.file import FileRecord
 from repo_context.models.repo import RepoRecord
@@ -45,7 +46,6 @@ from repo_context.storage import (
     upsert_nodes,
     upsert_repo,
 )
-from repo_context.exceptions import DatabaseError
 
 
 @pytest.fixture
@@ -105,7 +105,10 @@ def _node(
         "qualified_name": qualified_name,
         "uri": "file:///tmp/test.py",
         "range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 0}},
-        "selection_range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}},
+        "selection_range_json": {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 4},
+        },
         "start_line": start_line,
         "end_line": end_line,
         "signature": signature,
@@ -141,7 +144,10 @@ def _edge(
         "confidence": 1.0,
         "evidence_file_id": file_id,
         "evidence_uri": "file:///tmp/test.py",
-        "evidence_range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+        "evidence_range_json": {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 1, "character": 0},
+        },
         "payload_json": {"test": "edge_data"},
         "last_indexed_at": "2026-01-01T00:00:00Z",
     }
@@ -151,8 +157,24 @@ def test_node_upsert_read_and_delete(initialized_db: Connection) -> None:
     """Node CRUD, structural/lexical children, and file node deletion work with v2 fields."""
     conn = initialized_db
     mod = _node("sym:mod", "module", "test", start_line=1, end_line=20)
-    cls = _node("sym:cls", "class", "test.Svc", parent_id="sym:mod", start_line=2, end_line=10, signature="class Svc")
-    fn = _node("sym:fn", "function", "test.outer", parent_id="sym:mod", start_line=12, end_line=20, signature="def outer()")
+    cls = _node(
+        "sym:cls",
+        "class",
+        "test.Svc",
+        parent_id="sym:mod",
+        start_line=2,
+        end_line=10,
+        signature="class Svc",
+    )
+    fn = _node(
+        "sym:fn",
+        "function",
+        "test.outer",
+        parent_id="sym:mod",
+        start_line=12,
+        end_line=20,
+        signature="def outer()",
+    )
     local = _node(
         "sym:local",
         "local_function",
@@ -207,7 +229,9 @@ def test_edge_upsert_single_json_encoding_and_full_file_delete(
         ],
     )
 
-    e1 = _edge("edge:1", EDGE_KIND_CALLS, "sym:a", "sym:b", file_id="file:repo:test:12345678:test.py")
+    e1 = _edge(
+        "edge:1", EDGE_KIND_CALLS, "sym:a", "sym:b", file_id="file:repo:test:12345678:test.py"
+    )
     e2 = _edge("edge:2", EDGE_KIND_SCOPE_PARENT, "sym:b", "sym:a", file_id=other_file.id)
     upsert_edge(conn, e1)
     upsert_edges(conn, [e2])
@@ -258,7 +282,7 @@ def test_replace_file_graph_is_savepoint_safe_without_commit(
     )
     upsert_files(conn, [other_file])
 
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         replace_file_graph(conn, file_id, [{"id": "invalid_node"}], [])
 
     # Outer transaction work (keep.py) and prior file graph (sym:initial) must both survive
@@ -289,7 +313,8 @@ def test_prune_stale_files_batched_over_500_files(initialized_db: Connection) ->
     upsert_files(conn, records)
     conn.commit()
 
-    assert len(list_files_for_repo(conn, repo_id, include_tests=False)) == 326  # 1 initial + 325 odd
+    # 1 initial + 325 odd
+    assert len(list_files_for_repo(conn, repo_id, include_tests=False)) == 326
     assert len(list_files_for_repo(conn, repo_id, include_tests=True)) == 651
 
     keep = {"file:repo:test:12345678:test.py", f"file:{repo_id}:mod_0.py"}

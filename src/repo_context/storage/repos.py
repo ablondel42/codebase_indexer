@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -73,23 +73,54 @@ def list_repos(conn: Connection) -> list[RepoRecord]:
     return [_row_to_repo(row) for row in rows]
 
 
+def _select_sole_repo_id(conn: Connection) -> str:
+    """Return the sole repository ID or raise if zero or multiple exist."""
+    repos = list_repos(conn)
+    if not repos:
+        raise DatabaseError(
+            "No repositories found in database; run `rc index` first.",
+            error_code="repo_not_found",
+        )
+    if len(repos) > 1:
+        ids = ", ".join(r.id for r in repos)
+        raise DatabaseError(
+            f"Multiple repositories found ({ids}); specify a repository ID or name.",
+            error_code="ambiguous_repo",
+            context={"repo_ids": [r.id for r in repos]},
+        )
+    return repos[0].id
+
+
+def _match_unique_repo_column(
+    conn: Connection,
+    column: ColumnElement[Any],
+    target: str,
+    field_name: str,
+) -> str | None:
+    """Return the single matching repo ID for ``column == target`` or raise if ambiguous."""
+    matched_ids = [
+        str(rid)
+        for rid in conn.execute(select(repos_table.c.id).where(column == target))
+        .scalars()
+        .all()
+    ]
+    if len(matched_ids) == 1:
+        return matched_ids[0]
+    if len(matched_ids) > 1:
+        joined = ", ".join(matched_ids)
+        raise DatabaseError(
+            f"Multiple repositories match {field_name} {target!r}: {joined}. "
+            "Specify the full repo ID.",
+            error_code="ambiguous_repo",
+            context={field_name: target, "repo_ids": matched_ids},
+        )
+    return None
+
+
 def resolve_repo_id(conn: Connection, repo_id_or_name: str | None = None) -> str:
     """Resolve an explicit repo ID/name/path or auto-select the sole indexed repository."""
     if repo_id_or_name is None or not str(repo_id_or_name).strip():
-        repos = list_repos(conn)
-        if not repos:
-            raise DatabaseError(
-                "No repositories found in database; run `rc index` first.",
-                error_code="repo_not_found",
-            )
-        if len(repos) > 1:
-            ids = ", ".join(r.id for r in repos)
-            raise DatabaseError(
-                f"Multiple repositories found ({ids}); specify a repository ID or name.",
-                error_code="ambiguous_repo",
-                context={"repo_ids": [r.id for r in repos]},
-            )
-        return repos[0].id
+        return _select_sole_repo_id(conn)
 
     target = str(repo_id_or_name).strip()
 
@@ -99,35 +130,13 @@ def resolve_repo_id(conn: Connection, repo_id_or_name: str | None = None) -> str
     if exact_id is not None:
         return str(exact_id)
 
-    name_ids = [
-        str(rid)
-        for rid in conn.execute(select(repos_table.c.id).where(repos_table.c.name == target))
-        .scalars()
-        .all()
-    ]
-    if len(name_ids) == 1:
-        return name_ids[0]
-    if len(name_ids) > 1:
-        raise DatabaseError(
-            f"Multiple repositories match name {target!r}: {', '.join(name_ids)}. Specify the full repo ID.",
-            error_code="ambiguous_repo",
-            context={"name": target, "repo_ids": name_ids},
-        )
+    name_match = _match_unique_repo_column(conn, repos_table.c.name, target, "name")
+    if name_match is not None:
+        return name_match
 
-    path_ids = [
-        str(rid)
-        for rid in conn.execute(select(repos_table.c.id).where(repos_table.c.root_path == target))
-        .scalars()
-        .all()
-    ]
-    if len(path_ids) == 1:
-        return path_ids[0]
-    if len(path_ids) > 1:
-        raise DatabaseError(
-            f"Multiple repositories match root_path {target!r}: {', '.join(path_ids)}. Specify the full repo ID.",
-            error_code="ambiguous_repo",
-            context={"root_path": target, "repo_ids": path_ids},
-        )
+    path_match = _match_unique_repo_column(conn, repos_table.c.root_path, target, "root_path")
+    if path_match is not None:
+        return path_match
 
     raise DatabaseError(
         f"Repository not found: {target!r}",

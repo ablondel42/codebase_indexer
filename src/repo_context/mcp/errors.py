@@ -72,41 +72,47 @@ def _log_internal_exception(operation: str, exc: Exception) -> None:
         traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
 
 
+_REPO_ERROR_RULES: tuple[
+    tuple[type[RepoContextError], str | None, str | None, bool],
+    ...,
+] = (
+    (ValidationError, ERROR_INVALID_INPUT, None, True),
+    (
+        DatabaseNotFoundError,
+        ERROR_DATABASE_NOT_FOUND,
+        "Indexed database not found; run `rc index` first.",
+        False,
+    ),
+    (DatabaseError, None, None, True),
+    (SymbolNotFoundError, ERROR_SYMBOL_NOT_FOUND, None, True),
+    (
+        PathSecurityError,
+        ERROR_PATH_SECURITY,
+        "Access denied: file path is missing, symlinked, or outside repository root.",
+        False,
+    ),
+    (LspError, ERROR_LSP_FAILURE, None, False),
+    (ParseError, ERROR_PARSE_ERROR, None, False),
+)
+
+
+def _map_repo_context_error(exc: RepoContextError) -> dict[str, Any]:
+    """Convert a ``RepoContextError`` subclass into a structured MCP error envelope."""
+    for cls, fixed_code, fixed_msg, include_details in _REPO_ERROR_RULES:
+        if isinstance(exc, cls):
+            code = fixed_code or exc.error_code or ERROR_DATABASE_ERROR
+            msg = fixed_msg if fixed_msg is not None else exc.message
+            details = exc.context if include_details else None
+            return error_result(code, msg, details=details)
+    return error_result(exc.error_code, exc.message, details=exc.context)
+
+
 def map_exception_to_error_result(exc: Exception, *, operation: str) -> dict[str, Any]:
     """Map domain and unexpected exceptions to safe structured MCP error responses."""
     if isinstance(exc, PydanticValidationError):
         return error_result(ERROR_INVALID_INPUT, str(exc))
-
-    if isinstance(exc, ValidationError):
-        return error_result(ERROR_INVALID_INPUT, exc.message, details=exc.context)
-
-    if isinstance(exc, DatabaseNotFoundError):
-        return error_result(
-            ERROR_DATABASE_NOT_FOUND,
-            "Indexed database not found; run `rc index` first.",
-        )
-
-    if isinstance(exc, DatabaseError):
-        code = exc.error_code or ERROR_DATABASE_ERROR
-        return error_result(code, exc.message, details=exc.context)
-
-    if isinstance(exc, SymbolNotFoundError):
-        return error_result(ERROR_SYMBOL_NOT_FOUND, exc.message, details=exc.context)
-
-    if isinstance(exc, PathSecurityError):
-        return error_result(
-            ERROR_PATH_SECURITY,
-            "Access denied: file path is missing, symlinked, or outside repository root.",
-        )
-
-    if isinstance(exc, LspError):
-        return error_result(ERROR_LSP_FAILURE, exc.message)
-
-    if isinstance(exc, ParseError):
-        return error_result(ERROR_PARSE_ERROR, exc.message)
-
     if isinstance(exc, RepoContextError):
-        return error_result(exc.error_code, exc.message, details=exc.context)
+        return _map_repo_context_error(exc)
 
     _log_internal_exception(operation, exc)
     return error_result(

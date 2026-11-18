@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
@@ -71,6 +71,25 @@ def resolve_repo_for_cli(
     return resolve_repo_id(conn, repo_arg)
 
 
+def _find_unique_symbol_rows(
+    conn: Connection,
+    stmt: Select[Any],
+    symbol_ref: str,
+) -> dict[str, Any] | None:
+    """Execute a symbol lookup query, returning the sole match or raising if ambiguous."""
+    rows = conn.execute(stmt).mappings().all()
+    if len(rows) == 1:
+        return row_to_node(rows[0])
+    if len(rows) > 1:
+        candidates = [row_to_node(r) for r in rows]
+        raise RepoContextError(
+            f"Ambiguous symbol '{symbol_ref}' ({len(candidates)} matches).",
+            error_code="ambiguous_symbol",
+            context={"candidates": _build_candidate_entries(conn, candidates)},
+        )
+    return None
+
+
 def resolve_symbol_target(
     conn: Connection,
     repo_id: str | None,
@@ -91,74 +110,32 @@ def resolve_symbol_target(
         return node
 
     resolved_repo_id = repo_id if repo_id is not None else resolve_repo_id(conn, None)
-
-    exact_qname_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == resolved_repo_id,
-                nodes_table.c.qualified_name == cleaned,
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.id)
-        )
-        .mappings()
-        .all()
-    )
-    if len(exact_qname_rows) == 1:
-        return row_to_node(exact_qname_rows[0])
-    if len(exact_qname_rows) > 1:
-        candidates = [row_to_node(r) for r in exact_qname_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
-            error_code="ambiguous_symbol",
-            context={"candidates": _build_candidate_entries(conn, candidates)},
-        )
-
-    exact_name_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == resolved_repo_id,
-                nodes_table.c.name == cleaned,
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
-        )
-        .mappings()
-        .all()
-    )
-    if len(exact_name_rows) == 1:
-        return row_to_node(exact_name_rows[0])
-    if len(exact_name_rows) > 1:
-        candidates = [row_to_node(r) for r in exact_name_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
-            error_code="ambiguous_symbol",
-            context={"candidates": _build_candidate_entries(conn, candidates)},
-        )
-
     suffix_pattern = f"%.{_escape_like(cleaned)}"
-    suffix_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == resolved_repo_id,
-                nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
-            .limit(25)
+    queries = (
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == resolved_repo_id,
+            nodes_table.c.qualified_name == cleaned,
         )
-        .mappings()
-        .all()
+        .order_by(nodes_table.c.kind, nodes_table.c.id),
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == resolved_repo_id,
+            nodes_table.c.name == cleaned,
+        )
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id),
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == resolved_repo_id,
+            nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
+        )
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+        .limit(25),
     )
-    if len(suffix_rows) == 1:
-        return row_to_node(suffix_rows[0])
-    if len(suffix_rows) > 1:
-        candidates = [row_to_node(r) for r in suffix_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{cleaned}' ({len(candidates)} matches).",
-            error_code="ambiguous_symbol",
-            context={"candidates": _build_candidate_entries(conn, candidates)},
-        )
+    for stmt in queries:
+        matched = _find_unique_symbol_rows(conn, stmt, cleaned)
+        if matched is not None:
+            return matched
 
     raise SymbolNotFoundError(
         f"Symbol not found: {cleaned}",
@@ -172,7 +149,9 @@ def resolve_symbol_targets(
     symbol_refs: Sequence[str],
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Resolve one or more symbol references, preserving order and deduplicating IDs."""
-    needs_repo = repo_arg is not None or any(not ref.strip().startswith("sym:") for ref in symbol_refs)
+    needs_repo = repo_arg is not None or any(
+        not ref.strip().startswith("sym:") for ref in symbol_refs
+    )
     resolved_repo_id: str | None = resolve_repo_id(conn, repo_arg) if needs_repo else None
 
     targets: list[dict[str, Any]] = []
@@ -224,6 +203,16 @@ def _load_safe_file_lines(
     return lines
 
 
+def _extract_evidence_line_index(edge: dict[str, Any]) -> int | None:
+    """Return 0-based evidence start line index if valid, else None."""
+    rng = edge.get("evidence_range_json")
+    start = rng.get("start") if isinstance(rng, dict) else None
+    line_idx = start.get("line") if isinstance(start, dict) else None
+    if isinstance(line_idx, int) and line_idx >= 0:
+        return line_idx
+    return None
+
+
 def extract_site_preview(
     edge: dict[str, Any],
     repo_root: Path | None,
@@ -234,14 +223,8 @@ def extract_site_preview(
     max_chars: int = _MAX_PREVIEW_CHARS,
 ) -> str | None:
     """Extract a 1-line trimmed source preview at an edge's evidence line."""
-    rng = edge.get("evidence_range_json")
-    if not isinstance(rng, dict):
-        return None
-    start = rng.get("start")
-    if not isinstance(start, dict):
-        return None
-    line_idx = start.get("line")
-    if not isinstance(line_idx, int) or line_idx < 0:
+    line_idx = _extract_evidence_line_index(edge)
+    if line_idx is None:
         return None
 
     lines = _load_safe_file_lines(repo_root, file_info, max_bytes, cache)
@@ -251,9 +234,7 @@ def extract_site_preview(
     trimmed = lines[line_idx].strip()
     if not trimmed:
         return None
-    if len(trimmed) > max_chars:
-        return trimmed[: max_chars - 3] + "..."
-    return trimmed
+    return trimmed[: max_chars - 3] + "..." if len(trimmed) > max_chars else trimmed
 
 
 def format_freshness_label(is_fresh: bool, stale_reason: str | None) -> str:

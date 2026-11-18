@@ -8,10 +8,13 @@ class SymbolContext(BaseModel):
 
     Attributes:
         focus_symbol: The symbol being inspected.
-        structural_parent: The containing symbol in the code hierarchy (e.g., class for a method, module for a class).
+        structural_parent: The containing symbol in the code hierarchy (e.g., class for a
+            method, module for a class).
         structural_children: Symbols directly contained by this symbol (e.g., methods in a class).
-        lexical_parent: The enclosing scope for nested declarations (e.g., outer function for a nested function).
-        lexical_children: Symbols lexically nested inside this symbol (e.g., nested functions, local classes).
+        lexical_parent: The enclosing scope for nested declarations (e.g., outer function for
+            a nested function).
+        lexical_children: Symbols lexically nested inside this symbol (e.g., nested functions,
+            local classes).
         incoming_edges: Relationships where other symbols reference this symbol.
         outgoing_edges: Relationships where this symbol references other symbols.
         file_siblings: Other symbols defined in the same source file.

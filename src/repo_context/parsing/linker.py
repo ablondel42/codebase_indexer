@@ -1,7 +1,8 @@
 """Intra-repository AST edge linker for imports, inheritance, and call-sites."""
 
-from collections import defaultdict, deque
 import json
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import bindparam, select, update
@@ -81,23 +82,26 @@ class _RepoGraphIndex:
             .all()
         )
         for row in rows:
-            node = dict(row)
-            node_id = node["id"]
-            qname = node["qualified_name"]
-            self.node_by_id[node_id] = node
-            self.nodes_by_qname[qname].append(node)
+            self._register_node(dict(row))
+
+    def _register_node(self, node: dict) -> None:
+        """Index one repository symbol row into lookup tables."""
+        node_id = node["id"]
+        qname = node["qualified_name"]
+        self.node_by_id[node_id] = node
+        self.nodes_by_qname[qname].append(node)
+        if qname.startswith("src."):
+            self.nodes_by_alt_qname[qname[4:]].append(node)
+
+        if node["kind"] == "module":
+            self.module_by_file_id[node["file_id"]] = node
+            self.module_by_qname[qname] = node
             if qname.startswith("src."):
-                self.nodes_by_alt_qname[qname[4:]].append(node)
+                self.module_by_alt_qname.setdefault(qname[4:], node)
 
-            if node["kind"] == "module":
-                self.module_by_file_id[node["file_id"]] = node
-                self.module_by_qname[qname] = node
-                if qname.startswith("src."):
-                    self.module_by_alt_qname.setdefault(qname[4:], node)
-
-            parent_id = node.get("parent_id")
-            if parent_id is not None:
-                self.children_by_parent_and_name[(parent_id, node["name"])].append(node)
+        parent_id = node.get("parent_id")
+        if parent_id is not None:
+            self.children_by_parent_and_name[(parent_id, node["name"])].append(node)
 
     def find_module(self, qname: str) -> dict | None:
         """Find a module node by qualified name (falling back to ``src.`` and ``repo_name.``)."""
@@ -143,6 +147,27 @@ class _RepoGraphIndex:
                 if cand["kind"] in prefer_kinds:
                     return cand
         return candidates[0]
+
+
+@dataclass
+class _LinkerState:
+    """Mutable state shared across import, inheritance, and call resolution passes."""
+
+    index: _RepoGraphIndex
+    file_id: str | None
+    updates: list[dict[str, Any]] = field(default_factory=list)
+    file_bindings: dict[str, dict[str, str]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    dotted_import_map: dict[str, dict[str, str]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
+    class_bases: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    imports_resolved: int = 0
+    inherits_resolved: int = 0
+    calls_resolved: int = 0
+    edges_reset: int = 0
+    checked_count: int = 0
 
 
 def _pick_member_on_class_hierarchy(
@@ -194,13 +219,56 @@ def _find_enclosing_class_id(index: _RepoGraphIndex, node_id: str) -> str | None
     return None
 
 
+def _lookup_bound_prefix(
+    state: _LinkerState,
+    ev_file_id: str,
+    prefix: str,
+    is_single_part: bool,
+) -> dict | None:
+    """Resolve a dotted-name prefix in ``ev_file_id`` to a bound module or symbol node."""
+    bound_id = (
+        state.dotted_import_map.get(ev_file_id, {}).get(prefix)
+        or state.file_bindings.get(ev_file_id, {}).get(prefix)
+    )
+    if not bound_id and is_single_part:
+        ev_module = state.index.module_by_file_id.get(ev_file_id)
+        if ev_module is not None:
+            same_file_child = state.index.find_direct_child(ev_module["id"], prefix)
+            if same_file_child is not None:
+                bound_id = same_file_child["id"]
+    return state.index.node_by_id.get(bound_id) if bound_id else None
+
+
+def _resolve_from_bound_node(
+    state: _LinkerState,
+    bound_node: dict,
+    remainder: list[str],
+    prefer_kind: str | None,
+) -> str | None:
+    """Resolve trailing attribute parts starting from a bound module or class node."""
+    if bound_node["kind"] == "module":
+        target_qname = f"{bound_node['qualified_name']}.{'.'.join(remainder)}"
+        target = state.index.find_node(target_qname, prefer_kind=prefer_kind)
+        if target is not None:
+            return target["id"]
+        if len(remainder) == 1:
+            return state.file_bindings.get(bound_node["file_id"], {}).get(remainder[0]) or None
+    elif bound_node["kind"] == "class" and len(remainder) == 1:
+        member_prefer = {prefer_kind} if prefer_kind else _CALLABLE_KINDS
+        return _pick_member_on_class_hierarchy(
+            state.index,
+            bound_node["id"],
+            remainder[0],
+            state.class_bases,
+            prefer_kinds=member_prefer,
+        )
+    return None
+
+
 def _resolve_prefixed_target(
-    index: _RepoGraphIndex,
+    state: _LinkerState,
     ev_file_id: str | None,
     dotted_name: str,
-    file_bindings: dict[str, dict[str, str]],
-    dotted_import_map: dict[str, dict[str, str]],
-    class_bases: dict[str, list[str]],
     *,
     prefer_kind: str | None = None,
 ) -> str | None:
@@ -208,47 +276,16 @@ def _resolve_prefixed_target(
     if not ev_file_id or "." not in dotted_name:
         return None
     parts = dotted_name.split(".")
-    file_dotted = dotted_import_map.get(ev_file_id, {})
-    file_syms = file_bindings.get(ev_file_id, {})
-
-    ev_module = index.module_by_file_id.get(ev_file_id)
-
     for prefix_len in range(len(parts) - 1, 0, -1):
         prefix = ".".join(parts[:prefix_len])
-        remainder = parts[prefix_len:]
-        bound_id = file_dotted.get(prefix) or file_syms.get(prefix)
-        if not bound_id and prefix_len == 1 and ev_module is not None:
-            same_file_child = index.find_direct_child(ev_module["id"], prefix)
-            if same_file_child is not None:
-                bound_id = same_file_child["id"]
-        if not bound_id:
-            continue
-        bound_node = index.node_by_id.get(bound_id)
+        bound_node = _lookup_bound_prefix(state, ev_file_id, prefix, prefix_len == 1)
         if bound_node is None:
             continue
-
-        if bound_node["kind"] == "module":
-            target_qname = f"{bound_node['qualified_name']}.{'.'.join(remainder)}"
-            target = index.find_node(target_qname, prefer_kind=prefer_kind)
-            if target is not None:
-                return target["id"]
-            if len(remainder) == 1:
-                reexported = file_bindings.get(bound_node["file_id"], {}).get(remainder[0])
-                if reexported:
-                    return reexported
-
-        elif bound_node["kind"] == "class" and len(remainder) == 1:
-            member_prefer = {prefer_kind} if prefer_kind else _CALLABLE_KINDS
-            member_id = _pick_member_on_class_hierarchy(
-                index,
-                bound_id,
-                remainder[0],
-                class_bases,
-                prefer_kinds=member_prefer,
-            )
-            if member_id is not None:
-                return member_id
-
+        resolved = _resolve_from_bound_node(
+            state, bound_node, parts[prefix_len:], prefer_kind
+        )
+        if resolved is not None:
+            return resolved
     return None
 
 
@@ -273,28 +310,365 @@ def _stage_edge_update(
             return 1, 0
         return 0, 0
 
-    if not current_to.startswith(_UNRESOLVED_PREFIXES):
-        if current_to != placeholder_id:
-            updates.append(
-                {
-                    "b_id": edge["id"],
-                    "b_to_id": placeholder_id,
-                    "b_confidence": default_confidence,
-                }
-            )
-            return 0, 1
+    if not current_to.startswith(_UNRESOLVED_PREFIXES) and current_to != placeholder_id:
+        updates.append(
+            {
+                "b_id": edge["id"],
+                "b_to_id": placeholder_id,
+                "b_confidence": default_confidence,
+            }
+        )
+        return 0, 1
     return 0, 0
 
 
-def resolve_repo_edges(
-    conn: Connection,
-    repo_id: str,
-    *,
-    file_id: str | None = None,
-) -> dict[str, Any]:
-    """Resolve intra-repo ``imports``, ``inherits``, and ``calls`` edges against SQLite nodes."""
-    index = _RepoGraphIndex(conn, repo_id)
+def _bind_imported_symbol(
+    state: _LinkerState,
+    ev_file_id: str | None,
+    bound_name: str,
+    resolved_id: str,
+) -> None:
+    """Bind an imported symbol or submodule name in ``ev_file_id``."""
+    if not ev_file_id:
+        return
+    state.file_bindings[ev_file_id][bound_name] = resolved_id
+    if state.index.node_by_id[resolved_id]["kind"] == "module":
+        state.dotted_import_map[ev_file_id][bound_name] = resolved_id
 
+
+def _resolve_direct_import_edge(
+    state: _LinkerState,
+    edge: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve an ``import pkg.mod [as alias]`` edge and record file bindings."""
+    mod_name = payload.get("module") or ""
+    placeholder_id = f"external_or_unresolved:{mod_name}"
+    mod_node = state.index.find_module(mod_name)
+    if mod_node is None:
+        return placeholder_id, None
+
+    mod_id = str(mod_node["id"])
+    ev_file_id = edge.get("evidence_file_id")
+    if ev_file_id:
+        alias = payload.get("alias")
+        if alias:
+            state.file_bindings[ev_file_id][alias] = mod_id
+            state.dotted_import_map[ev_file_id][alias] = mod_id
+        else:
+            state.dotted_import_map[ev_file_id][mod_name] = mod_id
+            top_name = mod_name.split(".")[0]
+            top_mod = state.index.find_module(top_name)
+            if top_mod is not None:
+                state.file_bindings[ev_file_id][top_name] = str(top_mod["id"])
+    return placeholder_id, mod_id
+
+
+def _extract_from_import_symbol(
+    edge: dict[str, Any],
+    payload: dict[str, Any],
+    mod_name: str,
+) -> str:
+    """Extract imported symbol name from payload or fallback placeholder ``to_id``."""
+    sym_name = payload.get("symbol")
+    if sym_name:
+        return str(sym_name)
+    raw_tail = str(edge["to_id"]).removeprefix("external_or_unresolved:")
+    if mod_name and raw_tail.startswith(f"{mod_name}."):
+        return raw_tail[len(mod_name) + 1 :]
+    return raw_tail
+
+
+def _resolve_from_import_edge(
+    state: _LinkerState,
+    edge: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve a ``from mod import sym [as alias]`` edge and record file bindings."""
+    mod_name = payload.get("module") or ""
+    sym_name = _extract_from_import_symbol(edge, payload, mod_name)
+    target = f"{mod_name}.{sym_name}" if mod_name else sym_name
+    placeholder_id = f"external_or_unresolved:{target}"
+
+    if sym_name == "*" or not sym_name:
+        mod_node = state.index.find_module(mod_name)
+        return placeholder_id, mod_node["id"] if mod_node is not None else None
+
+    matched_node = state.index.find_node(target) or state.index.find_module(target)
+    resolved_id = matched_node["id"] if matched_node is not None else None
+    if resolved_id is not None:
+        _bind_imported_symbol(
+            state,
+            edge.get("evidence_file_id"),
+            payload.get("alias") or sym_name,
+            resolved_id,
+        )
+    return placeholder_id, resolved_id
+
+
+def _try_resolve_reexport_entry(
+    state: _LinkerState,
+    edge: dict[str, Any],
+    payload: dict[str, Any],
+) -> str | None:
+    """Attempt one re-export hop for an unresolved ``from`` import edge."""
+    mod_name = payload.get("module") or ""
+    sym_name = payload.get("symbol") or ""
+    if payload.get("import_type") != "from" or not mod_name or not sym_name or sym_name == "*":
+        return None
+    mod_node = state.index.find_module(mod_name)
+    if mod_node is None:
+        return None
+    reexported_id = state.file_bindings.get(mod_node["file_id"], {}).get(sym_name)
+    if not reexported_id or reexported_id not in state.index.node_by_id:
+        return None
+    _bind_imported_symbol(
+        state,
+        edge.get("evidence_file_id"),
+        payload.get("alias") or sym_name,
+        reexported_id,
+    )
+    return reexported_id
+
+
+def _propagate_reexports(
+    state: _LinkerState,
+    cache: list[tuple[dict, dict, str, str | None]],
+) -> None:
+    """Propagate package ``__init__`` re-exports up to 3 hops."""
+    for _ in range(3):
+        progressed = False
+        for idx, (edge, payload, placeholder_id, resolved_id) in enumerate(cache):
+            if resolved_id is not None:
+                continue
+            reexported_id = _try_resolve_reexport_entry(state, edge, payload)
+            if reexported_id is not None:
+                cache[idx] = (edge, payload, placeholder_id, reexported_id)
+                progressed = True
+        if not progressed:
+            break
+
+
+def _resolve_import_pass(state: _LinkerState, import_edges: list[dict[str, Any]]) -> None:
+    """Execute Pass 1: resolve all ``imports`` edges and populate file symbol bindings."""
+    cache: list[tuple[dict, dict, str, str | None]] = []
+    for edge in import_edges:
+        payload = _parse_payload(edge.get("payload_json"))
+        if payload.get("import_type") == "import":
+            placeholder_id, resolved_id = _resolve_direct_import_edge(state, edge, payload)
+        else:
+            placeholder_id, resolved_id = _resolve_from_import_edge(state, edge, payload)
+        cache.append((edge, payload, placeholder_id, resolved_id))
+
+    _propagate_reexports(state, cache)
+
+    for edge, _payload, placeholder_id, resolved_id in cache:
+        if state.file_id is not None and edge.get("evidence_file_id") != state.file_id:
+            continue
+        state.checked_count += 1
+        valid_id = (
+            resolved_id
+            if resolved_id is not None and resolved_id in state.index.node_by_id
+            else None
+        )
+        r_delta, reset_delta = _stage_edge_update(
+            edge, valid_id, placeholder_id, 0.8, state.updates
+        )
+        state.imports_resolved += r_delta
+        state.edges_reset += reset_delta
+
+
+def _find_base_in_enclosing_scopes(
+    index: _RepoGraphIndex,
+    from_id: str,
+    lookup_name: str,
+) -> str | None:
+    """Search enclosing class/function/module scopes upward for a base class name."""
+    from_node = index.node_by_id.get(from_id)
+    cur_parent = from_node.get("parent_id") if from_node else None
+    visited_parents: set[str] = set()
+    while cur_parent is not None and cur_parent not in visited_parents:
+        visited_parents.add(cur_parent)
+        child = index.find_direct_child(cur_parent, lookup_name, prefer_kinds={"class"})
+        if child is not None and child["id"] != from_id:
+            return child["id"]
+        parent_node = index.node_by_id.get(cur_parent)
+        cur_parent = parent_node.get("parent_id") if parent_node else None
+    return None
+
+
+def _resolve_single_inherit_target(
+    state: _LinkerState,
+    edge: dict[str, Any],
+    lookup_name: str,
+) -> str | None:
+    """Resolve the target class ID for one ``inherits`` edge."""
+    if not lookup_name:
+        return None
+    ev_file_id = edge.get("evidence_file_id")
+    if "." not in lookup_name:
+        scoped_id = _find_base_in_enclosing_scopes(state.index, edge["from_id"], lookup_name)
+        if scoped_id is not None:
+            return scoped_id
+        bound = state.file_bindings.get(ev_file_id, {}).get(lookup_name) if ev_file_id else None
+        return bound if bound and bound in state.index.node_by_id else None
+
+    prefixed_id = _resolve_prefixed_target(
+        state, ev_file_id, lookup_name, prefer_kind="class"
+    )
+    if prefixed_id is None:
+        node = state.index.find_node(lookup_name, prefer_kind="class")
+        return node["id"] if node is not None else None
+    return prefixed_id
+
+
+def _resolve_inherit_pass(state: _LinkerState, inherit_edges: list[dict[str, Any]]) -> None:
+    """Execute Pass 2: resolve ``inherits`` edges and build ``class_bases`` graph."""
+    for edge in inherit_edges:
+        payload = _parse_payload(edge.get("payload_json"))
+        base_name = payload.get("base_name") or edge["to_id"].removeprefix("unresolved_base:")
+        placeholder_id = f"unresolved_base:{base_name}"
+        lookup_name = base_name.split("[", 1)[0].strip()
+        resolved_id = _resolve_single_inherit_target(state, edge, lookup_name)
+
+        if resolved_id is not None:
+            state.class_bases[edge["from_id"]].append(resolved_id)
+
+        ev_file_id = edge.get("evidence_file_id")
+        if state.file_id is None or ev_file_id == state.file_id:
+            state.checked_count += 1
+            r_delta, reset_delta = _stage_edge_update(
+                edge, resolved_id, placeholder_id, 0.75, state.updates
+            )
+            state.inherits_resolved += r_delta
+            state.edges_reset += reset_delta
+
+
+def _resolve_self_or_cls_call(
+    state: _LinkerState,
+    caller_id: str,
+    target: str,
+) -> str | None:
+    """Resolve ``self.method()`` or ``cls.method()`` across the enclosing class hierarchy."""
+    member_name = target.split(".", 1)[1] if "." in target else target
+    enclosing_cls_id = _find_enclosing_class_id(state.index, caller_id)
+    if enclosing_cls_id is None or "." in member_name:
+        return None
+    return _pick_member_on_class_hierarchy(
+        state.index, enclosing_cls_id, member_name, state.class_bases
+    )
+
+
+def _resolve_super_call(
+    state: _LinkerState,
+    caller_id: str,
+    target: str,
+) -> str | None:
+    """Resolve ``super().method()`` strictly on ancestor base classes."""
+    method_name = target[len("super().") :]
+    if "." in method_name:
+        return None
+    enclosing_cls_id = _find_enclosing_class_id(state.index, caller_id)
+    if enclosing_cls_id is None:
+        return None
+    return _pick_member_on_class_hierarchy(
+        state.index,
+        enclosing_cls_id,
+        method_name,
+        state.class_bases,
+        include_start=False,
+    )
+
+
+def _find_unqualified_call_in_scopes(
+    index: _RepoGraphIndex,
+    caller_id: str,
+    target: str,
+) -> str | None:
+    """Search enclosing function/module scopes (skipping class bodies per Python LEGB)."""
+    cur_scope_id: str | None = caller_id
+    visited_scopes: set[str] = set()
+    while cur_scope_id is not None and cur_scope_id not in visited_scopes:
+        visited_scopes.add(cur_scope_id)
+        scope_node = index.node_by_id.get(cur_scope_id)
+        if scope_node is None:
+            break
+        if scope_node["kind"] != "class" or cur_scope_id == caller_id:
+            child = index.find_direct_child(
+                cur_scope_id,
+                target,
+                prefer_kinds=_CALLABLE_KINDS | {"class"},
+            )
+            if child is not None:
+                return child["id"]
+        cur_scope_id = scope_node.get("parent_id")
+    return None
+
+
+def _resolve_bare_name_call(
+    state: _LinkerState,
+    caller_id: str,
+    ev_file_id: str | None,
+    target: str,
+) -> str | None:
+    """Resolve an unqualified ``func()`` or ``Cls()`` call via LEGB scopes and imports."""
+    scoped_id = _find_unqualified_call_in_scopes(state.index, caller_id, target)
+    if scoped_id is not None:
+        return scoped_id
+
+    bound = state.file_bindings.get(ev_file_id, {}).get(target) if ev_file_id else None
+    if bound and bound in state.index.node_by_id:
+        return bound
+
+    caller_node = state.index.node_by_id.get(caller_id)
+    if (
+        caller_node is not None
+        and caller_node["name"] == target
+        and caller_node["kind"] in _CALLABLE_KINDS
+    ):
+        return caller_id
+    return None
+
+
+def _resolve_single_call_target(
+    state: _LinkerState,
+    edge: dict[str, Any],
+    target: str,
+    qualifier: str | None,
+) -> str | None:
+    """Resolve the target symbol ID for one ``calls`` edge."""
+    caller_id = edge["from_id"]
+    ev_file_id = edge.get("evidence_file_id")
+    if qualifier in ("self", "cls"):
+        return _resolve_self_or_cls_call(state, caller_id, target)
+    if qualifier == "module":
+        return _resolve_prefixed_target(state, ev_file_id, target)
+    if qualifier is None and target.startswith("super()."):
+        return _resolve_super_call(state, caller_id, target)
+    if qualifier is None and "." not in target:
+        return _resolve_bare_name_call(state, caller_id, ev_file_id, target)
+    return None
+
+
+def _resolve_call_pass(state: _LinkerState, call_edges: list[dict[str, Any]]) -> None:
+    """Execute Pass 3: resolve ``calls`` edges using scopes, imports, and class hierarchy."""
+    for edge in call_edges:
+        state.checked_count += 1
+        payload = _parse_payload(edge.get("payload_json"))
+        target = payload.get("target") or edge["to_id"].removeprefix("unresolved_call:")
+        placeholder_id = f"unresolved_call:{target}"
+        resolved_id = _resolve_single_call_target(
+            state, edge, target, payload.get("qualifier")
+        )
+        r_delta, reset_delta = _stage_edge_update(
+            edge, resolved_id, placeholder_id, 0.7, state.updates
+        )
+        state.calls_resolved += r_delta
+        state.edges_reset += reset_delta
+
+
+def _load_candidate_edges(conn: Connection, repo_id: str) -> list[dict[str, Any]]:
+    """Fetch ``imports``, ``inherits``, and ``calls`` edges for ``repo_id``."""
     edge_rows = (
         conn.execute(
             select(
@@ -315,7 +689,33 @@ def resolve_repo_edges(
         .mappings()
         .all()
     )
-    all_edges = [dict(row) for row in edge_rows]
+    return [dict(row) for row in edge_rows]
+
+
+def _persist_edge_updates(conn: Connection, updates: list[dict[str, Any]]) -> None:
+    """Batch-persist staged edge target and confidence updates."""
+    if not updates:
+        return
+    conn.execute(
+        update(edges_table)
+        .where(edges_table.c.id == bindparam("b_id"))
+        .values(
+            to_id=bindparam("b_to_id"),
+            confidence=bindparam("b_confidence"),
+        ),
+        updates,
+    )
+
+
+def resolve_repo_edges(
+    conn: Connection,
+    repo_id: str,
+    *,
+    file_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve intra-repo ``imports``, ``inherits``, and ``calls`` edges against SQLite nodes."""
+    state = _LinkerState(index=_RepoGraphIndex(conn, repo_id), file_id=file_id)
+    all_edges = _load_candidate_edges(conn, repo_id)
 
     import_edges = [e for e in all_edges if e["kind"] == EDGE_KIND_IMPORTS]
     inherit_edges = [e for e in all_edges if e["kind"] == EDGE_KIND_INHERITS]
@@ -326,270 +726,20 @@ def resolve_repo_edges(
         and (file_id is None or e["evidence_file_id"] == file_id)
     ]
 
-    updates: list[dict[str, Any]] = []
-    file_bindings: dict[str, dict[str, str]] = defaultdict(dict)
-    dotted_import_map: dict[str, dict[str, str]] = defaultdict(dict)
-    imports_resolved = 0
-    inherits_resolved = 0
-    calls_resolved = 0
-    edges_reset = 0
-    checked_count = 0
-
-    # --- Pass 1: Imports ---
-    import_resolution_cache: list[tuple[dict, dict, str, str | None]] = []
-    for edge in import_edges:
-        payload = _parse_payload(edge.get("payload_json"))
-        import_type = payload.get("import_type")
-        mod_name = payload.get("module") or ""
-        alias = payload.get("alias")
-        ev_file_id = edge.get("evidence_file_id")
-        resolved_id: str | None = None
-
-        if import_type == "import":
-            placeholder_id = f"external_or_unresolved:{mod_name}"
-            mod_node = index.find_module(mod_name)
-            if mod_node is not None:
-                mod_id = str(mod_node["id"])
-                resolved_id = mod_id
-                if ev_file_id:
-                    if alias:
-                        file_bindings[ev_file_id][alias] = mod_id
-                        dotted_import_map[ev_file_id][alias] = mod_id
-                    else:
-                        dotted_import_map[ev_file_id][mod_name] = mod_id
-                        top_name = mod_name.split(".")[0]
-                        top_mod = index.find_module(top_name)
-                        if top_mod is not None:
-                            file_bindings[ev_file_id][top_name] = str(top_mod["id"])
-        else:
-            sym_name = payload.get("symbol")
-            if not sym_name:
-                raw_tail = edge["to_id"].removeprefix("external_or_unresolved:")
-                if mod_name and raw_tail.startswith(f"{mod_name}."):
-                    sym_name = raw_tail[len(mod_name) + 1 :]
-                else:
-                    sym_name = raw_tail
-            target = f"{mod_name}.{sym_name}" if mod_name else (sym_name or "")
-            placeholder_id = f"external_or_unresolved:{target}"
-
-            if sym_name == "*" or not sym_name:
-                mod_node = index.find_module(mod_name)
-                if mod_node is not None:
-                    resolved_id = mod_node["id"]
-            else:
-                sym_node = index.find_node(target)
-                if sym_node is not None:
-                    resolved_id = sym_node["id"]
-                else:
-                    submod = index.find_module(target)
-                    if submod is not None:
-                        resolved_id = submod["id"]
-
-                if resolved_id is not None and ev_file_id:
-                    bound_name = alias or sym_name
-                    file_bindings[ev_file_id][bound_name] = resolved_id
-                    if index.node_by_id[resolved_id]["kind"] == "module":
-                        dotted_import_map[ev_file_id][bound_name] = resolved_id
-
-        import_resolution_cache.append((edge, payload, placeholder_id, resolved_id))
-
-    # Resolve package __init__ re-exports (up to 3 hops) for unresolved `from` imports
-    for _ in range(3):
-        progressed = False
-        for i, (edge, payload, placeholder_id, resolved_id) in enumerate(import_resolution_cache):
-            if resolved_id is not None or payload.get("import_type") != "from":
-                continue
-            mod_name = payload.get("module") or ""
-            sym_name = payload.get("symbol") or ""
-            if not mod_name or not sym_name or sym_name == "*":
-                continue
-            mod_node = index.find_module(mod_name)
-            if mod_node is None:
-                continue
-            reexported_id = file_bindings.get(mod_node["file_id"], {}).get(sym_name)
-            if reexported_id and reexported_id in index.node_by_id:
-                import_resolution_cache[i] = (edge, payload, placeholder_id, reexported_id)
-                ev_file_id = edge.get("evidence_file_id")
-                if ev_file_id:
-                    bound_name = payload.get("alias") or sym_name
-                    file_bindings[ev_file_id][bound_name] = reexported_id
-                    if index.node_by_id[reexported_id]["kind"] == "module":
-                        dotted_import_map[ev_file_id][bound_name] = reexported_id
-                progressed = True
-        if not progressed:
-            break
-
-    for edge, _payload, placeholder_id, resolved_id in import_resolution_cache:
-        if file_id is not None and edge.get("evidence_file_id") != file_id:
-            continue
-        checked_count += 1
-        if resolved_id is not None and resolved_id not in index.node_by_id:
-            resolved_id = None
-        r_delta, reset_delta = _stage_edge_update(
-            edge, resolved_id, placeholder_id, 0.8, updates
-        )
-        imports_resolved += r_delta
-        edges_reset += reset_delta
-
-    # --- Pass 2: Inheritance ---
-    class_bases: dict[str, list[str]] = defaultdict(list)
-    for edge in inherit_edges:
-        payload = _parse_payload(edge.get("payload_json"))
-        base_name = payload.get("base_name") or edge["to_id"].removeprefix("unresolved_base:")
-        placeholder_id = f"unresolved_base:{base_name}"
-        lookup_name = base_name.split("[", 1)[0].strip()
-        ev_file_id = edge.get("evidence_file_id")
-        from_node = index.node_by_id.get(edge["from_id"])
-        resolved_id = None
-
-        if lookup_name:
-            if "." not in lookup_name:
-                # 1. Enclosing scopes up to the module
-                cur_parent = from_node.get("parent_id") if from_node else None
-                visited_parents: set[str] = set()
-                while cur_parent is not None and cur_parent not in visited_parents:
-                    visited_parents.add(cur_parent)
-                    child = index.find_direct_child(
-                        cur_parent, lookup_name, prefer_kinds={"class"}
-                    )
-                    if child is not None and child["id"] != edge["from_id"]:
-                        resolved_id = child["id"]
-                        break
-                    parent_node = index.node_by_id.get(cur_parent)
-                    cur_parent = parent_node.get("parent_id") if parent_node else None
-
-                # 2. Imported symbols in file
-                if resolved_id is None and ev_file_id:
-                    bound = file_bindings.get(ev_file_id, {}).get(lookup_name)
-                    if bound and bound in index.node_by_id:
-                        resolved_id = bound
-            else:
-                resolved_id = _resolve_prefixed_target(
-                    index,
-                    ev_file_id,
-                    lookup_name,
-                    file_bindings,
-                    dotted_import_map,
-                    class_bases,
-                    prefer_kind="class",
-                )
-                if resolved_id is None:
-                    node = index.find_node(lookup_name, prefer_kind="class")
-                    if node is not None:
-                        resolved_id = node["id"]
-
-        if resolved_id is not None:
-            class_bases[edge["from_id"]].append(resolved_id)
-
-        if file_id is None or ev_file_id == file_id:
-            checked_count += 1
-            r_delta, reset_delta = _stage_edge_update(
-                edge, resolved_id, placeholder_id, 0.75, updates
-            )
-            inherits_resolved += r_delta
-            edges_reset += reset_delta
-
-    # --- Pass 3: Calls ---
-    for edge in call_edges:
-        checked_count += 1
-        payload = _parse_payload(edge.get("payload_json"))
-        target = payload.get("target") or edge["to_id"].removeprefix("unresolved_call:")
-        qualifier = payload.get("qualifier")
-        placeholder_id = f"unresolved_call:{target}"
-        ev_file_id = edge.get("evidence_file_id")
-        caller_id = edge["from_id"]
-        resolved_id: str | None = None
-
-        if qualifier in ("self", "cls"):
-            member_name = target.split(".", 1)[1] if "." in target else target
-            enclosing_cls_id = _find_enclosing_class_id(index, caller_id)
-            if enclosing_cls_id is not None and "." not in member_name:
-                resolved_id = _pick_member_on_class_hierarchy(
-                    index, enclosing_cls_id, member_name, class_bases
-                )
-
-        elif qualifier == "module":
-            resolved_id = _resolve_prefixed_target(
-                index,
-                ev_file_id,
-                target,
-                file_bindings,
-                dotted_import_map,
-                class_bases,
-            )
-
-        elif qualifier is None:
-            if target.startswith("super()."):
-                method_name = target[len("super().") :]
-                if "." not in method_name:
-                    enclosing_cls_id = _find_enclosing_class_id(index, caller_id)
-                    if enclosing_cls_id is not None:
-                        resolved_id = _pick_member_on_class_hierarchy(
-                            index,
-                            enclosing_cls_id,
-                            method_name,
-                            class_bases,
-                            include_start=False,
-                        )
-            elif "." not in target:
-                # 1. Enclosing function / module scopes (skip class bodies per Python LEGB)
-                caller_node = index.node_by_id.get(caller_id)
-                cur_scope_id: str | None = caller_id
-                visited_scopes: set[str] = set()
-                while cur_scope_id is not None and cur_scope_id not in visited_scopes:
-                    visited_scopes.add(cur_scope_id)
-                    scope_node = index.node_by_id.get(cur_scope_id)
-                    if scope_node is None:
-                        break
-                    if scope_node["kind"] != "class" or cur_scope_id == caller_id:
-                        child = index.find_direct_child(
-                            cur_scope_id,
-                            target,
-                            prefer_kinds=_CALLABLE_KINDS | {"class"},
-                        )
-                        if child is not None:
-                            resolved_id = child["id"]
-                            break
-                    cur_scope_id = scope_node.get("parent_id")
-
-                # 2. Imported symbols in evidence file
-                if resolved_id is None and ev_file_id:
-                    bound = file_bindings.get(ev_file_id, {}).get(target)
-                    if bound and bound in index.node_by_id:
-                        resolved_id = bound
-                # Also allow self-recursive module-level or class-level call check
-                if (
-                    resolved_id is None
-                    and caller_node is not None
-                    and caller_node["name"] == target
-                    and caller_node["kind"] in _CALLABLE_KINDS
-                ):
-                    resolved_id = caller_id
-
-        r_delta, reset_delta = _stage_edge_update(
-            edge, resolved_id, placeholder_id, 0.7, updates
-        )
-        calls_resolved += r_delta
-        edges_reset += reset_delta
-
-    if updates:
-        conn.execute(
-            update(edges_table)
-            .where(edges_table.c.id == bindparam("b_id"))
-            .values(
-                to_id=bindparam("b_to_id"),
-                confidence=bindparam("b_confidence"),
-            ),
-            updates,
-        )
+    _resolve_import_pass(state, import_edges)
+    _resolve_inherit_pass(state, inherit_edges)
+    _resolve_call_pass(state, call_edges)
+    _persist_edge_updates(conn, state.updates)
 
     return {
         "repo_id": repo_id,
         "file_id": file_id,
-        "edges_checked": checked_count,
-        "imports_resolved": imports_resolved,
-        "inherits_resolved": inherits_resolved,
-        "calls_resolved": calls_resolved,
-        "total_resolved": imports_resolved + inherits_resolved + calls_resolved,
-        "edges_reset": edges_reset,
+        "edges_checked": state.checked_count,
+        "imports_resolved": state.imports_resolved,
+        "inherits_resolved": state.inherits_resolved,
+        "calls_resolved": state.calls_resolved,
+        "total_resolved": (
+            state.imports_resolved + state.inherits_resolved + state.calls_resolved
+        ),
+        "edges_reset": state.edges_reset,
     }

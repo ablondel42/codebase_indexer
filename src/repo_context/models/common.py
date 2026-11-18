@@ -1,8 +1,8 @@
 """Common model types and serialization/validation helpers."""
 
+import json
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
-import json
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +48,8 @@ def _json_default(value: Any) -> Any:
 
 def to_json(value: Any) -> str:
     """Serialize a value (dict, list, dataclass, or Pydantic BaseModel) to JSON string."""
-    if isinstance(value, type):
-        if is_dataclass(value) or issubclass(value, BaseModel):
-            raise TypeError("to_json expects an instance, not a class")
+    if isinstance(value, type) and (is_dataclass(value) or issubclass(value, BaseModel)):
+        raise TypeError("to_json expects an instance, not a class")
     if isinstance(value, BaseModel):
         return json.dumps(value.model_dump(mode="json"), sort_keys=True, default=_json_default)
     if is_dataclass(value) and not isinstance(value, type):

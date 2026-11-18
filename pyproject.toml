@@ -31,10 +31,50 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-extend-exclude = ["tests/fixtures"]
+target-version = "py311"
+preview = true
+extend-exclude = ["tests/fixtures", ".agents"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+explicit-preview-rules = true
+select = [
+    # PEP 8 & Hygiene
+    "E", "W",
+    "N",
+    "I",
+    "F",
+    "PLC0415",
+
+    # Function Size & Single Responsibility
+    "C90",
+    "PLR0915",
+    "PLR0912",
+    "PLR0911",
+    "PLR0913",
+    "PLR0914",
+    "PLR1702",
+
+    # Readability & Flat Control Flow
+    "SIM",
+    "RET",
+    "C4",
+    "B",
+    "UP",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.ruff.lint.pylint]
+max-statements = 35
+max-branches = 8
+max-returns = 5
+max-args = 6
+max-locals = 12
+max-nested-blocks = 3
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["PLR0913", "PLR0914", "PLR0915"]
 
 [tool.pyright]
 include = ["src", "tests"]
@@ -47,3 +87,6 @@ exclude = [
 extraPaths = ["src"]
 venvPath = "."
 venv = "venv"
+typeCheckingMode = "standard"
+reportMissingParameterType = "error"
+reportUnnecessaryTypeIgnoreComment = "error"

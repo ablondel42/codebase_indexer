@@ -66,6 +66,21 @@ _CREATE_FTS_DDL = (
 )
 
 
+def _drop_legacy_v1_tables(conn: Connection) -> None:
+    """Drop legacy FTS triggers, FTS virtual table, and core tables."""
+    for ddl in _DROP_LEGACY_FTS_DDL:
+        conn.exec_driver_sql(ddl)
+    metadata.drop_all(conn)
+
+
+def _create_v2_schema(conn: Connection) -> None:
+    """Create schema v2 core tables, FTS5 virtual table, and synchronization triggers."""
+    metadata.create_all(conn)
+    for ddl in _CREATE_FTS_DDL:
+        conn.exec_driver_sql(ddl)
+    conn.exec_driver_sql(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
 def initialize_database(conn: Connection) -> None:
     """Initialize or upgrade the SQLite database to schema v2.
 
@@ -91,13 +106,8 @@ def initialize_database(conn: Connection) -> None:
         )
 
     try:
-        for ddl in _DROP_LEGACY_FTS_DDL:
-            conn.exec_driver_sql(ddl)
-        metadata.drop_all(conn)
-        metadata.create_all(conn)
-        for ddl in _CREATE_FTS_DDL:
-            conn.exec_driver_sql(ddl)
-        conn.exec_driver_sql(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        _drop_legacy_v1_tables(conn)
+        _create_v2_schema(conn)
         conn.commit()
     except OperationalError as exc:
         if "readonly" in str(exc).lower():

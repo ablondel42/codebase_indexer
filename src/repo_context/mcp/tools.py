@@ -1,13 +1,13 @@
 """Token-lean MCP tool handlers executing blocking I/O in worker threads."""
 
 import asyncio
-from collections import Counter
 import json
+from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 from mcp.server import MCPServer
-from sqlalchemy import func, or_, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.engine import Connection
 
 from repo_context.config import get_config
@@ -27,6 +27,8 @@ from repo_context.exceptions import (
 )
 from repo_context.graph import (
     analyze_target_set_risk as engine_analyze_target_set_risk,
+)
+from repo_context.graph import (
     build_reference_stats,
     count_symbol_reference_edges,
     get_files_by_ids,
@@ -61,6 +63,7 @@ from repo_context.mcp.schemas import (
     SearchSymbolsInput,
     SymbolKindLiteral,
 )
+from repo_context.models.repo import RepoRecord
 from repo_context.parsing.pathing import ensure_safe_repo_file
 from repo_context.storage import (
     connection_scope,
@@ -109,7 +112,10 @@ def _normalize_path_prefix(path_prefix: str) -> str:
     return clean.rstrip("/")
 
 
-def _format_ambiguous_candidates(conn: Connection, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _format_ambiguous_candidates(
+    conn: Connection,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Build compact disambiguation candidate entries for ambiguous symbol lookups."""
     file_ids = [fid for c in candidates if isinstance((fid := c.get("file_id")), str) and fid]
     files_by_id = get_files_by_ids(conn, file_ids)
@@ -130,6 +136,25 @@ def _format_ambiguous_candidates(conn: Connection, candidates: list[dict[str, An
     return items
 
 
+def _find_unique_mcp_symbol(
+    conn: Connection,
+    stmt: Select[Any],
+    symbol_ref: str,
+) -> dict[str, Any] | None:
+    """Execute a symbol lookup query, returning the sole match or raising if ambiguous."""
+    rows = conn.execute(stmt).mappings().all()
+    if len(rows) == 1:
+        return row_to_node(rows[0])
+    if len(rows) > 1:
+        candidates = [row_to_node(r) for r in rows]
+        raise RepoContextError(
+            f"Ambiguous symbol '{symbol_ref}' ({len(candidates)} matches).",
+            error_code=ERROR_AMBIGUOUS_SYMBOL,
+            context={"candidates": _format_ambiguous_candidates(conn, candidates)},
+        )
+    return None
+
+
 def _resolve_symbol_target(
     conn: Connection,
     repo_id: str,
@@ -145,73 +170,32 @@ def _resolve_symbol_target(
             )
         return node
 
-    exact_qname_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == repo_id,
-                nodes_table.c.qualified_name == symbol_ref,
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.id)
-        )
-        .mappings()
-        .all()
-    )
-    if len(exact_qname_rows) == 1:
-        return row_to_node(exact_qname_rows[0])
-    if len(exact_qname_rows) > 1:
-        candidates = [row_to_node(r) for r in exact_qname_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{symbol_ref}' ({len(candidates)} matches).",
-            error_code=ERROR_AMBIGUOUS_SYMBOL,
-            context={"candidates": _format_ambiguous_candidates(conn, candidates)},
-        )
-
-    exact_name_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == repo_id,
-                nodes_table.c.name == symbol_ref,
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
-        )
-        .mappings()
-        .all()
-    )
-    if len(exact_name_rows) == 1:
-        return row_to_node(exact_name_rows[0])
-    if len(exact_name_rows) > 1:
-        candidates = [row_to_node(r) for r in exact_name_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{symbol_ref}' ({len(candidates)} matches).",
-            error_code=ERROR_AMBIGUOUS_SYMBOL,
-            context={"candidates": _format_ambiguous_candidates(conn, candidates)},
-        )
-
     suffix_pattern = f"%.{_escape_like(symbol_ref)}"
-    suffix_rows = (
-        conn.execute(
-            select(nodes_table)
-            .where(
-                nodes_table.c.repo_id == repo_id,
-                nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
-            )
-            .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
-            .limit(25)
+    queries = (
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == repo_id,
+            nodes_table.c.qualified_name == symbol_ref,
         )
-        .mappings()
-        .all()
+        .order_by(nodes_table.c.kind, nodes_table.c.id),
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == repo_id,
+            nodes_table.c.name == symbol_ref,
+        )
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id),
+        select(nodes_table)
+        .where(
+            nodes_table.c.repo_id == repo_id,
+            nodes_table.c.qualified_name.like(suffix_pattern, escape="\\"),
+        )
+        .order_by(nodes_table.c.kind, nodes_table.c.qualified_name, nodes_table.c.id)
+        .limit(25),
     )
-    if len(suffix_rows) == 1:
-        return row_to_node(suffix_rows[0])
-    if len(suffix_rows) > 1:
-        candidates = [row_to_node(r) for r in suffix_rows]
-        raise RepoContextError(
-            f"Ambiguous symbol '{symbol_ref}' ({len(candidates)} matches).",
-            error_code=ERROR_AMBIGUOUS_SYMBOL,
-            context={"candidates": _format_ambiguous_candidates(conn, candidates)},
-        )
+    for stmt in queries:
+        matched = _find_unique_mcp_symbol(conn, stmt, symbol_ref)
+        if matched is not None:
+            return matched
 
     raise SymbolNotFoundError(
         f"Symbol not found: {symbol_ref}",
@@ -429,12 +413,14 @@ def _sync_search_symbols(
     db_path: str | Path | None,
 ) -> dict[str, Any]:
     """Synchronous implementation for ``search_symbols``."""
-    inp = SearchSymbolsInput(
-        query=query,
-        repo_id=repo_id,
-        kind=kind,  # type: ignore[arg-type]
-        file_path=file_path,
-        limit=limit,
+    inp = SearchSymbolsInput.model_validate(
+        {
+            "query": query,
+            "repo_id": repo_id,
+            "kind": kind,
+            "file_path": file_path,
+            "limit": limit,
+        }
     )
     resolved_db = _resolve_db_path(db_path)
 
@@ -560,6 +546,16 @@ def _load_safe_file_lines(
     return lines
 
 
+def _extract_evidence_line_index(edge: dict[str, Any]) -> int | None:
+    """Return 0-based evidence start line index if valid, else None."""
+    rng = edge.get("evidence_range_json")
+    start = rng.get("start") if isinstance(rng, dict) else None
+    line_idx = start.get("line") if isinstance(start, dict) else None
+    if isinstance(line_idx, int) and line_idx >= 0:
+        return line_idx
+    return None
+
+
 def _extract_site_preview(
     edge: dict[str, Any],
     repo_root: Path | None,
@@ -568,14 +564,8 @@ def _extract_site_preview(
     cache: dict[str, list[str] | None],
 ) -> str | None:
     """Extract a trimmed 1-line source preview at an edge's evidence line."""
-    rng = edge.get("evidence_range_json")
-    if not isinstance(rng, dict):
-        return None
-    start = rng.get("start")
-    if not isinstance(start, dict):
-        return None
-    line_idx = start.get("line")
-    if not isinstance(line_idx, int) or line_idx < 0:
+    line_idx = _extract_evidence_line_index(edge)
+    if line_idx is None:
         return None
 
     lines = _load_safe_file_lines(repo_root, file_info, max_bytes, cache)
@@ -608,28 +598,143 @@ def _resolve_peer_display_name(
     return None
 
 
+class SymbolReferencesOptions(TypedDict, total=False):
+    """Optional keyword parameters for ``get_symbol_references``."""
+
+    repo_id: str | None
+    direction: DirectionLiteral | str
+    refresh_lsp: bool
+    limit: int
+    offset: int
+    db_path: str | Path | None
+    lsp_pool: LspSessionPool | None
+
+
+_ALLOWED_REF_OPTION_KEYS = frozenset(
+    {"repo_id", "direction", "refresh_lsp", "limit", "offset", "db_path", "lsp_pool"}
+)
+
+
+def _refresh_symbol_lsp_via_pool(
+    conn: Connection,
+    target: dict[str, Any],
+    repo_record: RepoRecord | None,
+    pool: LspSessionPool,
+) -> None:
+    """Refresh LSP reference edges for ``target`` using ``pool``."""
+    file_record = get_file_by_id(conn, target["file_id"])
+    if file_record is None or repo_record is None:
+        raise DatabaseError(
+            "Repository or file metadata missing for LSP refresh.",
+            error_code="references_unavailable",
+        )
+    target_symbol = {
+        "id": target["id"],
+        "repo_id": target["repo_id"],
+        "file_id": target["file_id"],
+        "file_path": file_record["file_path"],
+        "uri": target["uri"],
+        "qualified_name": target["qualified_name"],
+        "kind": target["kind"],
+        "scope": target.get("scope"),
+        "range_json": target.get("range_json"),
+        "selection_range_json": target.get("selection_range_json"),
+        "repo_root": repo_record.root_path,
+    }
+    client = pool.get_or_start(repo_record.root_path)
+    try:
+        enrich_references_for_symbol(
+            conn,
+            client,
+            target_symbol,
+            open_all_files=False,
+        )
+    except Exception:
+        if not client.is_running:
+            pool.close_repo(repo_record.root_path)
+        raise
+
+
+def _resolve_mcp_repo_root(repo_record: RepoRecord | None) -> Path | None:
+    """Return existing repository root directory path if present on disk."""
+    if repo_record and repo_record.root_path:
+        candidate_root = Path(repo_record.root_path)
+        if candidate_root.is_dir():
+            return candidate_root
+    return None
+
+
+def _collect_mcp_edge_lookups(
+    conn: Connection,
+    target_file_id: str,
+    edges: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Batch-fetch symbol nodes and file records referenced by ``edges``."""
+    node_ids_to_fetch: list[str] = []
+    file_ids_to_fetch: list[str] = [target_file_id]
+    for edge in edges:
+        node_ids_to_fetch.append(edge["from_id"])
+        node_ids_to_fetch.append(edge["to_id"])
+        if edge.get("evidence_file_id"):
+            file_ids_to_fetch.append(edge["evidence_file_id"])
+    return get_symbols_by_ids(conn, node_ids_to_fetch), get_files_by_ids(conn, file_ids_to_fetch)
+
+
+def _resolve_edge_direction(
+    edge: dict[str, Any],
+    target_id: str,
+    requested_direction: str,
+) -> str:
+    """Determine edge direction label for MCP reference output."""
+    if requested_direction in ("incoming", "outgoing"):
+        return requested_direction
+    if edge["to_id"] == target_id and edge["from_id"] == target_id:
+        return "self"
+    if edge["to_id"] == target_id:
+        return "incoming"
+    return "outgoing"
+
+
+def _build_mcp_reference_items(
+    conn: Connection,
+    target: dict[str, Any],
+    edges: list[dict[str, Any]],
+    requested_direction: str,
+    repo_root_path: Path | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Adapt paginated reference edges with 1-line source previews."""
+    nodes_by_id, files_by_id = _collect_mcp_edge_lookups(conn, target["file_id"], edges)
+    max_bytes = get_config().max_file_size_bytes
+    file_lines_cache: dict[str, list[str] | None] = {}
+    items: list[dict[str, Any]] = []
+    for edge in edges:
+        ev_file = files_by_id.get(edge.get("evidence_file_id") or "")
+        items.append(
+            adapt_edge(
+                edge,
+                preview=_extract_site_preview(
+                    edge,
+                    repo_root_path,
+                    ev_file,
+                    max_bytes,
+                    file_lines_cache,
+                ),
+                from_name=_resolve_peer_display_name(edge["from_id"], nodes_by_id, edge),
+                to_name=_resolve_peer_display_name(edge["to_id"], nodes_by_id, edge),
+                file_path=ev_file.get("file_path") if ev_file else None,
+                direction=_resolve_edge_direction(edge, target["id"], requested_direction),
+            )
+        )
+    return files_by_id, items
+
+
 def _sync_get_symbol_references(
-    symbol: str,
-    repo_id: str | None,
-    direction: str,
-    refresh_lsp: bool,
-    limit: int,
-    offset: int,
+    inp: GetSymbolReferencesInput,
     db_path: str | Path | None,
     lsp_pool: LspSessionPool | None,
 ) -> dict[str, Any]:
     """Synchronous implementation for ``get_symbol_references``."""
-    inp = GetSymbolReferencesInput(
-        symbol_id_or_name=symbol,
-        repo_id=repo_id,
-        direction=direction,  # type: ignore[arg-type]
-        refresh_lsp=refresh_lsp,
-        limit=limit,
-        offset=offset,
-    )
     resolved_db = _resolve_db_path(db_path)
-    cfg = get_config()
-    pool = lsp_pool if lsp_pool is not None else _DEFAULT_LSP_POOL
 
     with connection_scope(
         resolved_db,
@@ -642,37 +747,12 @@ def _sync_get_symbol_references(
         repo_record = get_repo_by_id(conn, resolved_repo_id)
 
         if inp.refresh_lsp:
-            file_record = get_file_by_id(conn, target["file_id"])
-            if file_record is None or repo_record is None:
-                raise DatabaseError(
-                    "Repository or file metadata missing for LSP refresh.",
-                    error_code="references_unavailable",
-                )
-            target_symbol = {
-                "id": target["id"],
-                "repo_id": target["repo_id"],
-                "file_id": target["file_id"],
-                "file_path": file_record["file_path"],
-                "uri": target["uri"],
-                "qualified_name": target["qualified_name"],
-                "kind": target["kind"],
-                "scope": target.get("scope"),
-                "range_json": target.get("range_json"),
-                "selection_range_json": target.get("selection_range_json"),
-                "repo_root": repo_record.root_path,
-            }
-            client = pool.get_or_start(repo_record.root_path)
-            try:
-                enrich_references_for_symbol(
-                    conn,
-                    client,
-                    target_symbol,
-                    open_all_files=False,
-                )
-            except Exception:
-                if not client.is_running:
-                    pool.close_repo(repo_record.root_path)
-                raise
+            _refresh_symbol_lsp_via_pool(
+                conn,
+                target,
+                repo_record,
+                lsp_pool if lsp_pool is not None else _DEFAULT_LSP_POOL,
+            )
 
         edges = list_symbol_reference_edges(
             conn,
@@ -686,56 +766,16 @@ def _sync_get_symbol_references(
             target["id"],
             direction=inp.direction,
         )
-        stats = build_reference_stats(conn, target["id"])
-
-        node_ids_to_fetch: list[str] = []
-        file_ids_to_fetch: list[str] = [target["file_id"]]
-        for edge in edges:
-            node_ids_to_fetch.append(edge["from_id"])
-            node_ids_to_fetch.append(edge["to_id"])
-            if edge.get("evidence_file_id"):
-                file_ids_to_fetch.append(edge["evidence_file_id"])
-
-        nodes_by_id = get_symbols_by_ids(conn, node_ids_to_fetch)
-        files_by_id = get_files_by_ids(conn, file_ids_to_fetch)
-
-        repo_root_path: Path | None = None
-        if repo_record and repo_record.root_path:
-            candidate_root = Path(repo_record.root_path)
-            if candidate_root.is_dir():
-                repo_root_path = candidate_root
-
-        file_lines_cache: dict[str, list[str] | None] = {}
-        items: list[dict[str, Any]] = []
-        for edge in edges:
-            ev_file = files_by_id.get(edge.get("evidence_file_id") or "")
-            preview = _extract_site_preview(
-                edge,
-                repo_root_path,
-                ev_file,
-                cfg.max_file_size_bytes,
-                file_lines_cache,
-            )
-            if inp.direction in ("incoming", "outgoing"):
-                edge_dir = inp.direction
-            elif edge["to_id"] == target["id"] and edge["from_id"] == target["id"]:
-                edge_dir = "self"
-            elif edge["to_id"] == target["id"]:
-                edge_dir = "incoming"
-            else:
-                edge_dir = "outgoing"
-
-            items.append(
-                adapt_edge(
-                    edge,
-                    preview=preview,
-                    from_name=_resolve_peer_display_name(edge["from_id"], nodes_by_id, edge),
-                    to_name=_resolve_peer_display_name(edge["to_id"], nodes_by_id, edge),
-                    file_path=ev_file.get("file_path") if ev_file else None,
-                    direction=edge_dir,
-                )
-            )
-
+        files_by_id, items = _build_mcp_reference_items(
+            conn,
+            target,
+            edges,
+            inp.direction,
+            _resolve_mcp_repo_root(repo_record),
+        )
+        ref_summary = {
+            k: v for k, v in build_reference_stats(conn, target["id"]).items() if v is not None
+        }
         return success_result(
             {
                 "symbol": adapt_node(target, file_info=files_by_id.get(target["file_id"])),
@@ -745,7 +785,7 @@ def _sync_get_symbol_references(
                 "offset": inp.offset,
                 "limit": inp.limit,
                 "has_more": (inp.offset + len(items)) < total_count,
-                "reference_summary": {k: v for k, v in stats.items() if v is not None},
+                "reference_summary": ref_summary,
                 "references": items,
             }
         )
@@ -917,26 +957,31 @@ async def get_symbol_context(
 
 async def get_symbol_references(
     symbol: str,
-    repo_id: str | None = None,
-    direction: DirectionLiteral = "incoming",
-    refresh_lsp: bool = False,
-    limit: int = 30,
-    offset: int = 0,
-    db_path: str | Path | None = None,
-    lsp_pool: LspSessionPool | None = None,
+    **options: Unpack[SymbolReferencesOptions],
 ) -> str:
     """Get LSP references and AST dependency sites with safe 1-line source previews."""
+    unknown = set(options) - _ALLOWED_REF_OPTION_KEYS
+    if unknown:
+        unexpected = sorted(unknown)[0]
+        raise TypeError(
+            f"get_symbol_references() got an unexpected keyword argument {unexpected!r}"
+        )
     try:
+        inp = GetSymbolReferencesInput.model_validate(
+            {
+                "symbol": symbol,
+                "repo_id": options.get("repo_id"),
+                "direction": options.get("direction", "incoming"),
+                "refresh_lsp": options.get("refresh_lsp", False),
+                "limit": options.get("limit", 30),
+                "offset": options.get("offset", 0),
+            }
+        )
         payload = await asyncio.to_thread(
             _sync_get_symbol_references,
-            symbol,
-            repo_id,
-            direction,
-            refresh_lsp,
-            limit,
-            offset,
-            db_path,
-            lsp_pool,
+            inp,
+            options.get("db_path"),
+            options.get("lsp_pool"),
         )
         return _serialize_result(payload)
     except Exception as exc:
@@ -965,12 +1010,11 @@ async def analyze_risk(
         )
 
 
-def register_tools(
+def _register_repository_tools(
     mcp: MCPServer[Any] | Any,
-    db_path: str | Path | None = None,
-    lsp_pool: LspSessionPool | None = None,
+    db_path: str | Path | None,
 ) -> None:
-    """Register the 8 cleanly named token-lean MCP tools on ``mcp``."""
+    """Register repository, file listing, file outline, and symbol search MCP tools."""
 
     @mcp.tool(name="get_repo_overview")
     async def _get_repo_overview(repo_id: str | None = None) -> str:
@@ -1029,6 +1073,14 @@ def register_tools(
             db_path=db_path,
         )
 
+
+def _register_symbol_tools(
+    mcp: MCPServer[Any] | Any,
+    db_path: str | Path | None,
+    lsp_pool: LspSessionPool | None,
+) -> None:
+    """Register symbol source, context, reference, and risk analysis MCP tools."""
+
     @mcp.tool(name="get_symbol_source")
     async def _get_symbol_source(
         symbol: str,
@@ -1053,7 +1105,7 @@ def register_tools(
         include_source: bool = False,
         max_source_lines: int = 80,
     ) -> str:
-        """Get bounded symbol context: hierarchy, callers/callees/imports/inherits, and freshness."""
+        """Get bounded symbol context: hierarchy, relationships, and freshness."""
         return await get_symbol_context(
             symbol=symbol,
             repo_id=repo_id,
@@ -1095,3 +1147,13 @@ def register_tools(
             repo_id=repo_id,
             db_path=db_path,
         )
+
+
+def register_tools(
+    mcp: MCPServer[Any] | Any,
+    db_path: str | Path | None = None,
+    lsp_pool: LspSessionPool | None = None,
+) -> None:
+    """Register the 8 cleanly named token-lean MCP tools on ``mcp``."""
+    _register_repository_tools(mcp, db_path)
+    _register_symbol_tools(mcp, db_path, lsp_pool)

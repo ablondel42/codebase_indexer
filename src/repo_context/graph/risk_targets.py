@@ -117,7 +117,4 @@ def is_public_like(target: RiskTarget) -> bool:
     if short_name.startswith("__") and short_name.endswith("__"):
         return True
 
-    if not short_name.startswith("_"):
-        return True
-
-    return False
+    return not short_name.startswith("_")

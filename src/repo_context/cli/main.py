@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+import contextlib
 import json
 import logging
 import os
-from pathlib import Path
 import shlex
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from repo_context import __version__
-from repo_context.constants import VALID_SYMBOL_KINDS
-from repo_context.exceptions import DatabaseNotFoundError, RepoContextError
 import repo_context.logging_config as logging_config
-from repo_context.logging_config import get_logger, setup_logging
-from repo_context.storage import connection_scope, list_repos, resolve_repo_id
+from repo_context import __version__
 from repo_context.cli.commands import (
     cmd_db_repos,
     cmd_db_runs,
@@ -40,6 +37,10 @@ from repo_context.cli.commands import (
     cmd_watch,
 )
 from repo_context.cli.utils import resolve_db_path
+from repo_context.constants import VALID_SYMBOL_KINDS
+from repo_context.exceptions import DatabaseNotFoundError, RepoContextError
+from repo_context.logging_config import get_logger, setup_logging
+from repo_context.storage import connection_scope, list_repos, resolve_repo_id
 
 _KNOWN_COMMANDS = frozenset(
     {
@@ -58,13 +59,19 @@ _KNOWN_COMMANDS = frozenset(
     }
 )
 _REPO_SCOPED_ROOT = frozenset({"files", "outline", "source", "refs", "risk", "mcp-call"})
-_REPO_SCOPED_SUBS = {("db", "status"), ("db", "runs"), ("symbols", "search"), ("symbols", "list"), ("symbols", "show")}
+_REPO_SCOPED_SUBS = {
+    ("db", "status"),
+    ("db", "runs"),
+    ("symbols", "search"),
+    ("symbols", "list"),
+    ("symbols", "show"),
+}
 
 logger = get_logger("cli.main")
 
 
 def _make_subcommand_common_parser() -> argparse.ArgumentParser:
-    """Create shared parent flags for subcommands using SUPPRESS so root flags are never clobbered."""
+    """Create shared parent flags for subcommands using SUPPRESS so root flags stay intact."""
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--db-path",
@@ -75,41 +82,11 @@ def _make_subcommand_common_parser() -> argparse.ArgumentParser:
     return common
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the grouped ``rc`` CLI argument parser."""
-    sub_common = _make_subcommand_common_parser()
-
-    parser = argparse.ArgumentParser(
-        prog="rc",
-        description="Repository intelligence CLI and token-lean MCP server",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-    )
-    parser.add_argument(
-        "--db-path",
-        type=Path,
-        default=None,
-        help="Path to SQLite database file (default: repo_context.db)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable debug logging to stderr",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        default=False,
-        help="Enable debug logging to stderr",
-    )
-
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # rc index
+def _add_index_parser(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    sub_common: argparse.ArgumentParser,
+) -> None:
+    """Register the ``rc index`` subcommand parser."""
     index_parser = subparsers.add_parser(
         "index",
         parents=[sub_common],
@@ -148,7 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     index_parser.set_defaults(func=cmd_index)
 
-    # rc db ...
+
+def _add_db_parser(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    sub_common: argparse.ArgumentParser,
+) -> None:
+    """Register the ``rc db`` subcommand group and its subcommands."""
     db_parser = subparsers.add_parser(
         "db",
         parents=[sub_common],
@@ -159,9 +141,17 @@ def build_parser() -> argparse.ArgumentParser:
     db_status_parser = db_subparsers.add_parser(
         "status",
         parents=[sub_common],
-        help="Show DB size, schema version, table counts, edge breakdown, LSP coverage, and latest run",
+        help=(
+            "Show DB size, schema version, table counts, edge breakdown, "
+            "LSP coverage, and latest run"
+        ),
     )
-    db_status_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+    db_status_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
     db_status_parser.set_defaults(func=cmd_db_status)
 
     db_repos_parser = db_subparsers.add_parser(
@@ -183,8 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[sub_common],
         help="List recent indexing runs",
     )
-    db_runs_parser.add_argument("--repo", type=str, default=None, help="Filter by repository ID, name, or path")
-    db_runs_parser.add_argument("--limit", type=int, default=20, help="Maximum runs to show (default: 20)")
+    db_runs_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Filter by repository ID, name, or path",
+    )
+    db_runs_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum runs to show (default: 20)",
+    )
     db_runs_parser.set_defaults(func=cmd_db_runs)
 
     db_sql_parser = db_subparsers.add_parser(
@@ -193,50 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a strictly read-only SELECT/PRAGMA query against the SQLite database",
     )
     db_sql_parser.add_argument("query", type=str, help="Read-only SQL SELECT/PRAGMA query")
-    db_sql_parser.add_argument("--limit", type=int, default=100, help="Maximum rows to display (default: 100)")
+    db_sql_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum rows to display (default: 100)",
+    )
     db_sql_parser.set_defaults(func=cmd_db_sql)
 
-    # rc files
-    files_parser = subparsers.add_parser(
-        "files",
-        parents=[sub_common],
-        help="List indexed files with line count, symbol count, and live disk freshness",
-    )
-    files_parser.add_argument(
-        "pattern",
-        type=str,
-        nargs="?",
-        default=None,
-        help="Optional substring or glob filter on file/module path",
-    )
-    files_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
-    files_parser.add_argument(
-        "--include-tests",
-        action="store_true",
-        default=False,
-        help="Include indexed test files",
-    )
-    files_parser.add_argument("--limit", type=int, default=50, help="Maximum files to show (default: 50)")
-    files_parser.set_defaults(func=cmd_files)
 
-    # rc outline
-    outline_parser = subparsers.add_parser(
-        "outline",
-        parents=[sub_common],
-        help="Show hierarchical symbol outline for an indexed file",
-    )
-    outline_parser.add_argument("file_path", type=str, help="Repository-relative file path")
-    outline_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
-    outline_parser.add_argument(
-        "--no-private",
-        action="store_true",
-        default=False,
-        help="Exclude private and function-local symbols",
-    )
-    outline_parser.add_argument("--max-depth", type=int, default=3, help="Maximum symbol tree depth (default: 3)")
-    outline_parser.set_defaults(func=cmd_outline)
-
-    # rc symbols ...
+def _add_symbols_parser(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    sub_common: argparse.ArgumentParser,
+) -> None:
+    """Register the ``rc symbols`` subcommand group and its subcommands."""
     symbols_parser = subparsers.add_parser(
         "symbols",
         parents=[sub_common],
@@ -251,10 +221,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Search symbols via FTS5 with exact/prefix ranking and LIKE fallback",
     )
     sym_search_parser.add_argument("query", type=str, help="Search query")
-    sym_search_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
-    sym_search_parser.add_argument("--kind", type=str, choices=kind_choices, default=None, help="Filter by symbol kind")
-    sym_search_parser.add_argument("--file", type=str, default=None, help="Filter by file or directory prefix")
-    sym_search_parser.add_argument("--limit", type=int, default=20, help="Maximum results (default: 20)")
+    sym_search_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
+    sym_search_parser.add_argument(
+        "--kind",
+        type=str,
+        choices=kind_choices,
+        default=None,
+        help="Filter by symbol kind",
+    )
+    sym_search_parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Filter by file or directory prefix",
+    )
+    sym_search_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum results (default: 20)",
+    )
     sym_search_parser.set_defaults(func=cmd_symbols_search)
 
     sym_list_parser = symbols_subparsers.add_parser(
@@ -262,11 +253,37 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[sub_common],
         help="Browse indexed symbols with pagination",
     )
-    sym_list_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
-    sym_list_parser.add_argument("--kind", type=str, choices=kind_choices, default=None, help="Filter by symbol kind")
-    sym_list_parser.add_argument("--file", type=str, default=None, help="Filter by file or directory prefix")
-    sym_list_parser.add_argument("--limit", type=int, default=50, help="Maximum symbols to show (default: 50)")
-    sym_list_parser.add_argument("--offset", type=int, default=0, help="Pagination offset (default: 0)")
+    sym_list_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
+    sym_list_parser.add_argument(
+        "--kind",
+        type=str,
+        choices=kind_choices,
+        default=None,
+        help="Filter by symbol kind",
+    )
+    sym_list_parser.add_argument(
+        "--file",
+        type=str,
+        default=None,
+        help="Filter by file or directory prefix",
+    )
+    sym_list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum symbols to show (default: 50)",
+    )
+    sym_list_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Pagination offset (default: 0)",
+    )
     sym_list_parser.set_defaults(func=cmd_symbols_list)
 
     sym_show_parser = symbols_subparsers.add_parser(
@@ -274,8 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[sub_common],
         help="Show full symbol context including hierarchy, relationships, and freshness",
     )
-    sym_show_parser.add_argument("id_or_name", type=str, help="Symbol ID (sym:...), qualified name, or short name")
-    sym_show_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+    sym_show_parser.add_argument(
+        "id_or_name",
+        type=str,
+        help="Symbol ID (sym:...), qualified name, or short name",
+    )
+    sym_show_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
     sym_show_parser.add_argument(
         "--source",
         action="store_true",
@@ -284,26 +310,116 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sym_show_parser.set_defaults(func=cmd_symbols_show)
 
-    # rc source
+
+def _add_query_parsers(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    sub_common: argparse.ArgumentParser,
+) -> None:
+    """Register ``files``, ``outline``, ``source``, ``refs``, and ``risk`` subcommands."""
+    files_parser = subparsers.add_parser(
+        "files",
+        parents=[sub_common],
+        help="List indexed files with line count, symbol count, and live disk freshness",
+    )
+    files_parser.add_argument(
+        "pattern",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Optional substring or glob filter on file/module path",
+    )
+    files_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
+    files_parser.add_argument(
+        "--include-tests",
+        action="store_true",
+        default=False,
+        help="Include indexed test files",
+    )
+    files_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum files to show (default: 50)",
+    )
+    files_parser.set_defaults(func=cmd_files)
+
+    outline_parser = subparsers.add_parser(
+        "outline",
+        parents=[sub_common],
+        help="Show hierarchical symbol outline for an indexed file",
+    )
+    outline_parser.add_argument("file_path", type=str, help="Repository-relative file path")
+    outline_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
+    outline_parser.add_argument(
+        "--no-private",
+        action="store_true",
+        default=False,
+        help="Exclude private and function-local symbols",
+    )
+    outline_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="Maximum symbol tree depth (default: 3)",
+    )
+    outline_parser.set_defaults(func=cmd_outline)
+
     source_parser = subparsers.add_parser(
         "source",
         parents=[sub_common],
         help="Print line-numbered source snippet for a symbol",
     )
-    source_parser.add_argument("id_or_name", type=str, help="Symbol ID (sym:...), qualified name, or short name")
-    source_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
-    source_parser.add_argument("--max-lines", type=int, default=120, help="Maximum lines to print (default: 120)")
-    source_parser.add_argument("--offset", type=int, default=0, help="Line offset within symbol (default: 0)")
+    source_parser.add_argument(
+        "id_or_name",
+        type=str,
+        help="Symbol ID (sym:...), qualified name, or short name",
+    )
+    source_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
+    source_parser.add_argument(
+        "--max-lines",
+        type=int,
+        default=120,
+        help="Maximum lines to print (default: 120)",
+    )
+    source_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Line offset within symbol (default: 0)",
+    )
     source_parser.set_defaults(func=cmd_source)
 
-    # rc refs
     refs_parser = subparsers.add_parser(
         "refs",
         parents=[sub_common],
         help="Show incoming/outgoing calls and references with 1-line previews",
     )
-    refs_parser.add_argument("id_or_name", type=str, help="Symbol ID (sym:...), qualified name, or short name")
-    refs_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+    refs_parser.add_argument(
+        "id_or_name",
+        type=str,
+        help="Symbol ID (sym:...), qualified name, or short name",
+    )
+    refs_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
     refs_parser.add_argument(
         "--direction",
         type=str,
@@ -317,11 +433,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Refresh LSP references via pyright-langserver before querying",
     )
-    refs_parser.add_argument("--limit", type=int, default=50, help="Maximum edges to display (default: 50)")
-    refs_parser.add_argument("--offset", type=int, default=0, help="Pagination offset (default: 0)")
+    refs_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum edges to display (default: 50)",
+    )
+    refs_parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Pagination offset (default: 0)",
+    )
     refs_parser.set_defaults(func=cmd_refs)
 
-    # rc risk
     risk_parser = subparsers.add_parser(
         "risk",
         parents=[sub_common],
@@ -333,19 +458,33 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="One or more symbol IDs, qualified names, or unique short names",
     )
-    risk_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+    risk_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
     risk_parser.set_defaults(func=cmd_risk)
 
-    # rc shell
+
+def _add_daemon_parsers(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    sub_common: argparse.ArgumentParser,
+) -> None:
+    """Register ``shell``, ``watch``, ``serve``, and ``mcp-call`` subcommands."""
     shell_parser = subparsers.add_parser(
         "shell",
         parents=[sub_common],
         help="Start interactive `rc>` shell to inspect an indexed database",
     )
-    shell_parser.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+    shell_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="Repository ID, name, or root path",
+    )
     shell_parser.set_defaults(func=_cmd_shell)
 
-    # rc watch
     watch_parser = subparsers.add_parser(
         "watch",
         parents=[sub_common],
@@ -378,7 +517,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_parser.set_defaults(func=cmd_watch)
 
-    # rc serve
     serve_parser = subparsers.add_parser(
         "serve",
         parents=[sub_common],
@@ -392,7 +530,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.set_defaults(func=cmd_serve)
 
-    # rc mcp-call
     mcp_call_parser = subparsers.add_parser(
         "mcp-call",
         parents=[sub_common],
@@ -417,6 +554,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mcp_call_parser.set_defaults(func=cmd_mcp_call)
 
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the grouped ``rc`` CLI argument parser."""
+    sub_common = _make_subcommand_common_parser()
+
+    parser = argparse.ArgumentParser(
+        prog="rc",
+        description="Repository intelligence CLI and token-lean MCP server",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Path to SQLite database file (default: repo_context.db)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable debug logging to stderr",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug logging to stderr",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_index_parser(subparsers, sub_common)
+    _add_db_parser(subparsers, sub_common)
+    _add_symbols_parser(subparsers, sub_common)
+    _add_query_parsers(subparsers, sub_common)
+    _add_daemon_parsers(subparsers, sub_common)
     return parser
 
 
@@ -437,8 +613,19 @@ def _print_cli_error(
     print(json.dumps(payload, indent=2), file=sys.stderr)
 
 
+def _silence_broken_pipe() -> None:
+    """Redirect stdout file descriptor to ``os.devnull`` after ``BrokenPipeError``."""
+    with contextlib.suppress(OSError):
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, sys.stdout.fileno())
+        finally:
+            os.close(devnull_fd)
+
+
 def dispatch_args(args: argparse.Namespace) -> int:
     """Execute parsed CLI arguments with consistent structured JSON error handling."""
+    exit_code = 1
     try:
         return int(args.func(args))
     except DatabaseNotFoundError as exc:
@@ -447,10 +634,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
             f"{exc}. Run `rc index` first.",
             details=exc.context,
         )
-        return 1
     except RepoContextError as exc:
         _print_cli_error(exc.error_code, exc.message, details=exc.context)
-        return 1
     except (
         FileNotFoundError,
         NotADirectoryError,
@@ -459,24 +644,16 @@ def dispatch_args(args: argparse.Namespace) -> int:
         ValueError,
     ) as exc:
         _print_cli_error("error", str(exc))
-        return 1
     except BrokenPipeError:
-        try:
-            devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(devnull_fd, sys.stdout.fileno())
-            finally:
-                os.close(devnull_fd)
-        except OSError:
-            pass
-        return 0
+        _silence_broken_pipe()
+        exit_code = 0
     except KeyboardInterrupt:
         _print_cli_error("interrupted", "Interrupted.")
-        return 130
+        exit_code = 130
     except Exception as exc:
         logger.exception("CLI command failed")
         _print_cli_error("internal_error", str(exc))
-        return 1
+    return exit_code
 
 
 def _preprocess_argv(tokens: list[str]) -> list[str]:
@@ -502,17 +679,96 @@ def _preprocess_argv(tokens: list[str]) -> list[str]:
     return out
 
 
-def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
-    """Run a compact interactive ``rc>`` REPL over the existing CLI parser."""
+def _resolve_shell_repo(db_path: Path, repo_arg: str | None) -> str | None:
+    """Resolve the active repository ID for an interactive ``rc>`` shell session."""
     with connection_scope(db_path, read_only=True) as conn:
         repos = list_repos(conn)
         if repo_arg:
-            active_repo: str | None = resolve_repo_id(conn, repo_arg)
-        elif len(repos) == 1:
-            active_repo = repos[0].id
-        else:
-            active_repo = None
+            return resolve_repo_id(conn, repo_arg)
+        if len(repos) == 1:
+            return repos[0].id
+        return None
 
+
+def _read_shell_line() -> tuple[bool, str | None]:
+    """Read one prompt line from stdin, returning ``(should_exit, line)``."""
+    try:
+        if sys.stdin.isatty():
+            return False, input("rc> ")
+        sys.stdout.write("rc> ")
+        sys.stdout.flush()
+        raw = sys.stdin.readline()
+        if raw == "":
+            return True, None
+        return False, raw.rstrip("\r\n")
+    except (EOFError, BrokenPipeError):
+        return True, None
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        return False, None
+
+
+def _inject_shell_defaults(
+    tokens: list[str],
+    db_path: Path,
+    active_repo: str | None,
+) -> list[str]:
+    """Normalize ``db sql`` tokens and append active ``--db-path`` / ``--repo`` flags."""
+    if (
+        len(tokens) >= 3
+        and tokens[:2] == ["db", "sql"]
+        and not any(t.startswith("-") for t in tokens[2:])
+    ):
+        tokens = ["db", "sql", " ".join(tokens[2:])]
+
+    if any(t in ("-h", "--help", "--version") for t in tokens):
+        return tokens
+
+    if not any(t == "--db-path" or t.startswith("--db-path=") for t in tokens):
+        tokens.extend(["--db-path", str(db_path)])
+
+    takes_repo = tokens[0] in _REPO_SCOPED_ROOT or (
+        len(tokens) >= 2 and (tokens[0], tokens[1]) in _REPO_SCOPED_SUBS
+    )
+    if (
+        active_repo
+        and takes_repo
+        and not any(t == "--repo" or t.startswith("--repo=") for t in tokens)
+    ):
+        tokens.extend(["--repo", active_repo])
+    return tokens
+
+
+def _prepare_shell_tokens(
+    stripped: str,
+    parser: argparse.ArgumentParser,
+    db_path: Path,
+    active_repo: str | None,
+) -> tuple[bool, list[str] | None]:
+    """Tokenize a shell command and handle built-ins, returning ``(should_exit, tokens)``."""
+    try:
+        tokens = shlex.split(stripped)
+    except ValueError as exc:
+        _print_cli_error("parse_error", str(exc))
+        return False, None
+
+    if tokens[0] == "rc" and len(tokens) > 1:
+        tokens = tokens[1:]
+    if tokens[0] in ("exit", "quit", "q"):
+        return True, None
+    if tokens[0] in ("help", "?", "shell"):
+        if tokens[0] == "shell":
+            _print_cli_error("invalid_command", "Already inside rc shell.")
+        else:
+            parser.print_help()
+        return False, None
+
+    return False, _inject_shell_defaults(tokens, db_path, active_repo)
+
+
+def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
+    """Run a compact interactive ``rc>`` REPL over the existing CLI parser."""
+    active_repo = _resolve_shell_repo(db_path, repo_arg)
     print(
         f"Interactive rc shell (db: {db_path}, repo: {active_repo or 'auto'}). "
         "Type 'help' or 'exit'."
@@ -520,60 +776,18 @@ def _run_shell(db_path: Path, repo_arg: str | None = None) -> int:
     parser = build_parser()
 
     while True:
-        try:
-            if sys.stdin.isatty():
-                line = input("rc> ")
-            else:
-                sys.stdout.write("rc> ")
-                sys.stdout.flush()
-                raw = sys.stdin.readline()
-                if raw == "":
-                    break
-                line = raw.rstrip("\r\n")
-        except (EOFError, BrokenPipeError):
+        should_exit, line = _read_shell_line()
+        if should_exit:
             break
-        except KeyboardInterrupt:
-            print("", file=sys.stderr)
-            continue
-
-        stripped = line.strip()
+        stripped = line.strip() if line is not None else ""
         if not stripped or stripped.startswith("#"):
             continue
-        try:
-            tokens = shlex.split(stripped)
-        except ValueError as exc:
-            _print_cli_error("parse_error", str(exc))
-            continue
-        if tokens[0] == "rc" and len(tokens) > 1:
-            tokens = tokens[1:]
-        if tokens[0] in ("exit", "quit", "q"):
+
+        should_exit, tokens = _prepare_shell_tokens(stripped, parser, db_path, active_repo)
+        if should_exit:
             break
-        if tokens[0] in ("help", "?"):
-            parser.print_help()
+        if tokens is None:
             continue
-        if tokens[0] == "shell":
-            _print_cli_error("invalid_command", "Already inside rc shell.")
-            continue
-
-        if (
-            len(tokens) >= 3
-            and tokens[:2] == ["db", "sql"]
-            and not any(t.startswith("-") for t in tokens[2:])
-        ):
-            tokens = ["db", "sql", " ".join(tokens[2:])]
-
-        if not any(t in ("-h", "--help", "--version") for t in tokens):
-            if not any(t == "--db-path" or t.startswith("--db-path=") for t in tokens):
-                tokens.extend(["--db-path", str(db_path)])
-            takes_repo = tokens[0] in _REPO_SCOPED_ROOT or (
-                len(tokens) >= 2 and (tokens[0], tokens[1]) in _REPO_SCOPED_SUBS
-            )
-            if (
-                active_repo
-                and takes_repo
-                and not any(t == "--repo" or t.startswith("--repo=") for t in tokens)
-            ):
-                tokens.extend(["--repo", active_repo])
 
         try:
             parsed = parser.parse_args(tokens)

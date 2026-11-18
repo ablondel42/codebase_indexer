@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from sqlalchemy import delete, or_, select

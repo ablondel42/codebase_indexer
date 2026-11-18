@@ -4,18 +4,18 @@ import dataclasses
 import json
 from pathlib import Path
 
-from pydantic import ValidationError as PydanticValidationError
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from repo_context.constants import (
     EDGE_KIND_CALLS,
     EDGE_KIND_SCOPE_PARENT,
-    Language,
     SYMBOL_KIND_ATTRIBUTE,
     SYMBOL_KIND_CONSTANT,
     SYMBOL_KIND_TYPE_ALIAS,
     VALID_EDGE_KINDS,
     VALID_SYMBOL_KINDS,
+    Language,
 )
 from repo_context.models import (
     Edge,
@@ -119,8 +119,14 @@ def test_symbol_node_supports_all_v2_kinds_and_fields(kind: str) -> None:
             "name": long_name,
             "qualified_name": f"app.{long_name}",
             "uri": "file:///path/to/repo/app/service.py",
-            "range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
-            "selection_range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "range_json": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 2, "character": 0},
+            },
+            "selection_range_json": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 5},
+            },
             "start_line": 1,
             "end_line": 3,
             "signature": "MAX_RETRIES: int = 3",
@@ -175,7 +181,10 @@ def test_edge_supports_normalized_v2_kinds_and_json_validation(kind: str) -> Non
             "from_id": "sym:a",
             "to_id": "sym:b",
             "payload_json": {"target": "b"},
-            "evidence_range_json": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}},
+            "evidence_range_json": {
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 3},
+            },
         }
     )
     assert edge.kind == kind

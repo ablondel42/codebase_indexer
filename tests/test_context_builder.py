@@ -31,7 +31,7 @@ from repo_context.storage import (
 
 @pytest.fixture
 def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[Connection, Path, str]]:
-    """Index a realistic multi-file repository in ``tmp_path`` and yield ``(conn, root, repo_id)``."""
+    """Index a multi-file repository in ``tmp_path`` and yield ``(conn, root, repo_id)``."""
     repo_root = tmp_path / "ctx_repo"
     repo_root.mkdir()
 
@@ -139,7 +139,7 @@ def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
 def test_build_symbol_context_edge_limit_and_missing(
     indexed_context_repo: tuple[Connection, Path, str],
 ) -> None:
-    """build_symbol_context respects edge_limit, validates negative limits, and returns None when missing."""
+    """build_symbol_context respects edge_limit, rejects <0, and returns None when missing."""
     conn, _, _ = indexed_context_repo
     assert build_symbol_context(conn, "sym:nonexistent") is None
     with pytest.raises(ValidationError):
@@ -149,7 +149,7 @@ def test_build_symbol_context_edge_limit_and_missing(
 def test_build_file_outline_structure_and_filters(
     indexed_context_repo: tuple[Connection, Path, str],
 ) -> None:
-    """build_file_outline returns hierarchical start_line-ordered symbols and deduplicated imports."""
+    """build_file_outline returns start_line-ordered symbols and deduplicated imports."""
     conn, _, repo_id = indexed_context_repo
 
     outline = build_file_outline(conn, repo_id, "service.py")
@@ -182,7 +182,7 @@ def test_read_symbol_source_pagination_staleness_and_path_security(
     indexed_context_repo: tuple[Connection, Path, str],
     tmp_path: Path,
 ) -> None:
-    """read_symbol_source slices 1-based lines, paginates, detects staleness, and rejects escapes."""
+    """read_symbol_source slices 1-based lines, paginates, detects staleness, and blocks escapes."""
     conn, repo_root, _ = indexed_context_repo
     run_id = _find_node_id(conn, "run", "method")
 
@@ -211,7 +211,9 @@ def test_read_symbol_source_pagination_staleness_and_path_security(
 
     # Disk staleness detection
     service_file = repo_root / "service.py"
-    service_file.write_text(service_file.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    service_file.write_text(
+        service_file.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+    )
     stale_src = read_symbol_source(conn, run_id)
     assert stale_src["is_fresh"] is False
     assert stale_src["stale_reason"] == "content_hash_mismatch"

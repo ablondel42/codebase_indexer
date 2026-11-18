@@ -42,13 +42,8 @@ def _classify_call_target(func_expr: ast.AST) -> tuple[str, str | None]:
     if isinstance(func_expr, ast.Attribute):
         parts = _extract_dotted_parts(func_expr)
         if parts is not None and len(parts) >= 2:
-            target = ".".join(parts)
-            if parts[0] == "self":
-                return target, "self"
-            if parts[0] == "cls":
-                return target, "cls"
-            return target, "module"
-        return cap_signature(safe_unparse(func_expr), max_length=200), None
+            qualifier = parts[0] if parts[0] in ("self", "cls") else "module"
+            return ".".join(parts), qualifier
 
     return cap_signature(safe_unparse(func_expr), max_length=200), None
 

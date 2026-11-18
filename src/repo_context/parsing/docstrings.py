@@ -8,6 +8,18 @@ MAX_DOCSTRING_LENGTH = 200
 TRUNCATION_SUFFIX = "..."
 
 
+def _extract_first_paragraph_lines(docstring: str) -> list[str]:
+    """Collect stripped non-empty lines up to the first blank line."""
+    meaningful_lines: list[str] = []
+    for line in docstring.splitlines():
+        stripped = line.strip()
+        if stripped:
+            meaningful_lines.append(stripped)
+        elif meaningful_lines:
+            break
+    return meaningful_lines
+
+
 def get_doc_summary(node: ast.AST) -> str | None:
     """Extract a short summary from a node's docstring.
 
@@ -21,29 +33,14 @@ def get_doc_summary(node: ast.AST) -> str | None:
         return None
 
     docstring = ast.get_docstring(node)
-    if docstring is None:
+    if not docstring or not docstring.strip():
         return None
 
-    docstring = docstring.strip()
-    if not docstring:
-        return None
-
-    lines = docstring.splitlines()
-    meaningful_lines = []
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped:
-            meaningful_lines.append(stripped)
-        elif meaningful_lines:
-            # Stop at first blank line after meaningful content
-            break
-
+    meaningful_lines = _extract_first_paragraph_lines(docstring.strip())
     if not meaningful_lines:
         return None
 
     summary = " ".join(meaningful_lines[:MAX_DOCSTRING_LINES])
     if len(summary) > MAX_DOCSTRING_LENGTH:
-        summary = summary[: MAX_DOCSTRING_LENGTH - len(TRUNCATION_SUFFIX)] + TRUNCATION_SUFFIX
-
+        return summary[: MAX_DOCSTRING_LENGTH - len(TRUNCATION_SUFFIX)] + TRUNCATION_SUFFIX
     return summary

@@ -2,9 +2,9 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -91,7 +91,13 @@ def test_rc_index_initial_incremental_force_and_include_tests(
     assert inc_data["files_unchanged"] == 3
 
     force_res = _run_rc(
-        "index", str(repo_root), "--db-path", str(db_path), "--force", "--include-tests", cwd=repo_root
+        "index",
+        str(repo_root),
+        "--db-path",
+        str(db_path),
+        "--force",
+        "--include-tests",
+        cwd=repo_root,
     )
     assert force_res.returncode == 0
     force_data = json.loads(force_res.stdout)
@@ -125,7 +131,10 @@ def test_rc_db_subcommands_and_read_only_sql_guard(
         "DELETE FROM nodes",
         "DROP TABLE nodes",
         "UPDATE nodes SET name = 'hacked'",
-        "INSERT INTO repos (id, root_path, name, default_language, created_at) VALUES ('a','b','c','python','2026-01-01T00:00:00Z')",
+        (
+            "INSERT INTO repos (id, root_path, name, default_language, created_at) "
+            "VALUES ('a','b','c','python','2026-01-01T00:00:00Z')"
+        ),
     ):
         bad_res = _run_rc("db", "sql", forbidden_sql, "--db-path", str(db_path), cwd=repo_root)
         assert bad_res.returncode != 0, f"Expected failure for {forbidden_sql}"
@@ -143,7 +152,10 @@ def test_rc_files_and_outline_json(
     files_res = _run_rc("files", "--db-path", str(db_path), cwd=repo_root)
     assert files_res.returncode == 0
     files_payload = json.loads(files_res.stdout)
-    assert any(f["file_path"] == "pkg/math_ops.py" and f["freshness"] == "fresh" for f in files_payload["files"])
+    assert any(
+        f["file_path"] == "pkg/math_ops.py" and f["freshness"] == "fresh"
+        for f in files_payload["files"]
+    )
 
     # Modify one file on disk and verify rc files detects 'modified'
     math_file = repo_root / "pkg" / "math_ops.py"
@@ -174,10 +186,12 @@ def test_rc_files_and_outline_json(
 def test_rc_symbols_source_refs_risk_and_mcp_call(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """`rc symbols`, `rc source`, `rc refs`, `rc risk`, and `rc mcp-call` emit valid JSON objects."""
+    """`rc symbols`, `rc source`, `rc refs`, `rc risk`, and `rc mcp-call` emit valid JSON."""
     repo_root, db_path = indexed_workspace
 
-    search_res = _run_rc("symbols", "search", "Calculator", "--db-path", str(db_path), cwd=repo_root)
+    search_res = _run_rc(
+        "symbols", "search", "Calculator", "--db-path", str(db_path), cwd=repo_root
+    )
     assert search_res.returncode == 0
     search_data = json.loads(search_res.stdout)
     assert any(
@@ -185,7 +199,9 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
         for s in search_data["symbols"]
     )
 
-    list_res = _run_rc("symbols", "list", "--kind", "module", "--db-path", str(db_path), cwd=repo_root)
+    list_res = _run_rc(
+        "symbols", "list", "--kind", "module", "--db-path", str(db_path), cwd=repo_root
+    )
     assert list_res.returncode == 0
     modules = json.loads(list_res.stdout)["symbols"]
     assert len(modules) == 3
@@ -214,7 +230,13 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
 
     # rc refs
     refs_res = _run_rc(
-        "refs", "pkg.math_ops.add", "--direction", "incoming", "--db-path", str(db_path), cwd=repo_root
+        "refs",
+        "pkg.math_ops.add",
+        "--direction",
+        "incoming",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert refs_res.returncode == 0
     refs_data = json.loads(refs_res.stdout)
@@ -235,7 +257,9 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
     # rc watch / serve help & rc mcp-call
     assert _run_rc("watch", "--help").returncode == 0
     assert _run_rc("serve", "--help").returncode == 0
-    mcp_res = _run_rc("mcp-call", "get_repo_overview", "{}", "--db-path", str(db_path), cwd=repo_root)
+    mcp_res = _run_rc(
+        "mcp-call", "get_repo_overview", "{}", "--db-path", str(db_path), cwd=repo_root
+    )
     assert mcp_res.returncode == 0, mcp_res.stderr
     assert json.loads(mcp_res.stdout)["result"]["ok"] is True
 

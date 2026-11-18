@@ -1,7 +1,7 @@
 """Tests for the v0.2.0 risk engine."""
 
-from collections.abc import Iterator
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -257,7 +257,9 @@ def _seed_two_module_graph(conn: Connection, repo_root: Path) -> str:
             "confidence": 0.9,
             "evidence_file_id": f2.id,
             "evidence_uri": f2.uri,
-            "evidence_range_json": json.dumps({"start": {"line": 6, "character": 11}, "end": {"line": 6, "character": 16}}),
+            "evidence_range_json": json.dumps(
+                {"start": {"line": 6, "character": 11}, "end": {"line": 6, "character": 16}}
+            ),
             "payload_json": json.dumps({"mapping_mode": "exact_symbol"}),
             "last_indexed_at": "2026-01-01T00:00:00Z",
         },
@@ -286,7 +288,7 @@ def _seed_two_module_graph(conn: Connection, repo_root: Path) -> str:
 def test_load_risk_targets_populates_file_metadata_from_files_join(
     initialized_conn: tuple[Connection, Path],
 ) -> None:
-    """load_risk_targets joins files so file_path, module_path, is_test, and line bounds populate."""
+    """load_risk_targets joins files so file_path, module_path, is_test, and lines populate."""
     conn, repo_root = initialized_conn
     repo_id = _seed_two_module_graph(conn, repo_root)
 
@@ -304,7 +306,7 @@ def test_load_risk_targets_populates_file_metadata_from_files_join(
 
 
 def test_is_public_like_checks_local_scope_before_visibility_hint() -> None:
-    """Local functions (scope=='function') are NEVER public-like even with visibility_hint='public'."""
+    """Local functions (scope=='function') are never public-like even with visibility='public'."""
     local_target = RiskTarget(
         symbol_id="sym:local",
         qualified_name="mod.outer.helper",

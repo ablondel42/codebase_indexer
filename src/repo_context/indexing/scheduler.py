@@ -1,9 +1,9 @@
 """Event scheduler with debounce, sequence-aware collapsing, and serial worker execution."""
 
-from collections import defaultdict
 import queue
 import threading
-from typing import Callable
+from collections import defaultdict
+from collections.abc import Callable
 
 from repo_context.indexing.events import FileChangeEvent
 from repo_context.logging_config import get_logger
@@ -116,7 +116,7 @@ class EventScheduler:
 
     def _default_batch_handler(self, events: list[FileChangeEvent]) -> None:
         """Default batch handler (no-op if not overridden)."""
-        return None
+        return
 
 
 def collapse_events(events: list[FileChangeEvent]) -> list[FileChangeEvent]:

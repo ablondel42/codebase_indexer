@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -46,54 +47,87 @@ def get_reference_query_position(symbol: Any) -> dict[str, int]:
     raise ValueError(f"Symbol {symbol_id} has no stored range for references query")
 
 
+def _add_unique_uri(candidates: list[str], value: str) -> None:
+    """Append ``value`` to ``candidates`` when non-empty and not yet present."""
+    if value and value not in candidates:
+        candidates.append(value)
+
+
+def _add_path_uris(candidates: list[str], path: Path) -> None:
+    """Append ``as_uri()`` and unquoted URI variants for an absolute ``Path``."""
+    if not path.is_absolute():
+        return
+    with contextlib.suppress(ValueError):
+        path_uri = path.as_uri()
+        _add_unique_uri(candidates, path_uri)
+        _add_unique_uri(candidates, unquote(path_uri))
+
+
+def _normalize_parsed_uri_path(raw_path: str) -> Path:
+    """Decode percent-escaped URI path and strip leading slash on Windows drive paths."""
+    decoded = unquote(raw_path)
+    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
+        decoded = decoded[1:]
+    return Path(decoded)
+
+
 def _extract_file_candidates(uri: str) -> tuple[list[str], Path | None]:
     """Build candidate file URIs and canonical filesystem path from a URI string."""
     candidates: list[str] = []
-
-    def add_candidate(value: str) -> None:
-        if value and value not in candidates:
-            candidates.append(value)
-
-    add_candidate(uri)
-    unquoted_uri = unquote(uri)
-    add_candidate(unquoted_uri)
+    _add_unique_uri(candidates, uri)
+    _add_unique_uri(candidates, unquote(uri))
 
     parsed = urlparse(uri)
-    resolved_path: Path | None = None
+    if parsed.scheme not in ("file", "") or not parsed.path:
+        return candidates, None
 
-    if parsed.scheme in ("file", "") and parsed.path:
-        decoded_path = unquote(parsed.path)
-        if (
-            len(decoded_path) >= 3
-            and decoded_path[0] == "/"
-            and decoded_path[2] == ":"
-            and decoded_path[1].isalpha()
-        ):
-            decoded_path = decoded_path[1:]
+    raw_path = _normalize_parsed_uri_path(parsed.path)
+    _add_path_uris(candidates, raw_path)
 
-        raw_path = Path(decoded_path)
-        if raw_path.is_absolute():
-            try:
-                raw_uri = raw_path.as_uri()
-                add_candidate(raw_uri)
-                add_candidate(unquote(raw_uri))
-            except ValueError:
-                pass
-
-        try:
-            resolved_path = raw_path.resolve()
-        except OSError:
-            resolved_path = raw_path
-
-        if resolved_path.is_absolute():
-            try:
-                canonical_uri = resolved_path.as_uri()
-                add_candidate(canonical_uri)
-                add_candidate(unquote(canonical_uri))
-            except ValueError:
-                pass
+    try:
+        resolved_path = raw_path.resolve()
+    except OSError:
+        resolved_path = raw_path
+    _add_path_uris(candidates, resolved_path)
 
     return candidates, resolved_path
+
+
+def _resolve_file_by_repo_relative(
+    conn: Connection,
+    resolved_path: Path,
+    repo_id: str | None,
+) -> dict[str, Any] | None:
+    """Match ``resolved_path`` relative to registered repository roots."""
+    repo_stmt = select(repos_table.c.id, repos_table.c.root_path)
+    if repo_id is not None:
+        repo_stmt = repo_stmt.where(repos_table.c.id == repo_id)
+
+    for repo_row in conn.execute(repo_stmt).mappings().all():
+        root_val = repo_row["root_path"]
+        if not root_val:
+            continue
+        try:
+            rel_path = resolved_path.relative_to(Path(root_val).resolve()).as_posix()
+        except (OSError, ValueError):
+            continue
+
+        matched = (
+            conn.execute(
+                select(files_table)
+                .where(
+                    files_table.c.repo_id == repo_row["id"],
+                    files_table.c.file_path == rel_path,
+                )
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if matched is not None:
+            return dict(matched)
+
+    return None
 
 
 def resolve_file_by_uri(
@@ -114,33 +148,6 @@ def resolve_file_by_uri(
         return dict(row)
 
     if resolved_path is not None:
-        repo_stmt = select(repos_table.c.id, repos_table.c.root_path)
-        if repo_id is not None:
-            repo_stmt = repo_stmt.where(repos_table.c.id == repo_id)
-
-        for repo_row in conn.execute(repo_stmt).mappings().all():
-            root_val = repo_row["root_path"]
-            if not root_val:
-                continue
-            try:
-                repo_root = Path(root_val).resolve()
-                rel_path = resolved_path.relative_to(repo_root).as_posix()
-            except (OSError, ValueError):
-                continue
-
-            matched = (
-                conn.execute(
-                    select(files_table)
-                    .where(
-                        files_table.c.repo_id == repo_row["id"],
-                        files_table.c.file_path == rel_path,
-                    )
-                    .limit(1)
-                )
-                .mappings()
-                .first()
-            )
-            if matched is not None:
-                return dict(matched)
+        return _resolve_file_by_repo_relative(conn, resolved_path, repo_id)
 
     return None

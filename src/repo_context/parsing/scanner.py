@@ -2,9 +2,12 @@
 
 import fnmatch
 import os
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from repo_context.constants import Language
 from repo_context.exceptions import ParseError, PathSecurityError
 from repo_context.logging_config import get_logger
 from repo_context.models.file import FileRecord
@@ -24,6 +27,17 @@ logger = get_logger("parsing.scanner")
 
 DEFAULT_MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024
 DEFAULT_TEST_DIR_NAMES = ("tests", "test")
+
+
+@dataclass(frozen=True)
+class _ScanOptions:
+    """Normalized repository scanning options derived from application config."""
+
+    include_tests: bool
+    test_dir_names: tuple[str, ...]
+    max_file_size_bytes: int
+    ignored_dirs: tuple[str, ...]
+    supported_extensions: tuple[str, ...]
 
 
 def should_ignore_dir(name: str, ignored_dirs: tuple[str, ...]) -> bool:
@@ -60,12 +74,12 @@ def is_supported_source_file(path: Path, supported_extensions: tuple[str, ...]) 
 
 def _utc_now_iso() -> str:
     """Get current UTC time as ISO 8601 string."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _count_lines(file_path: Path) -> int:
     """Count lines in a text file matching ``str.splitlines()`` semantics."""
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_path, encoding="utf-8", errors="replace") as f:
         return len(f.read().splitlines())
 
 
@@ -85,7 +99,7 @@ def build_repo_record(repo_root: Path) -> RepoRecord:
         id=derive_repo_id(resolved),
         root_path=str(resolved),
         name=resolved.name,
-        default_language="python",  # type: ignore[arg-type]
+        default_language=Language.PYTHON,
         created_at=now,
         last_indexed_at=now,
     )
@@ -145,12 +159,60 @@ def build_file_record(
         size_bytes=stat_res.st_size,
         line_count=_count_lines(safe_path),
         is_test=is_test_path(rel_path, test_dir_names),
-        last_modified_at=datetime.fromtimestamp(stat_res.st_mtime, tz=timezone.utc).isoformat(),
+        last_modified_at=datetime.fromtimestamp(stat_res.st_mtime, tz=UTC).isoformat(),
         last_indexed_at=now,
     )
 
 
-def scan_repository(repo_root: str | Path, config) -> tuple[RepoRecord, list[FileRecord]]:
+def _scan_single_file(
+    repo_id: str,
+    root: Path,
+    candidate: Path,
+    options: _ScanOptions,
+) -> FileRecord | None:
+    """Validate and build a ``FileRecord`` for one candidate path, or return None if skipped."""
+    if not is_supported_source_file(candidate, options.supported_extensions):
+        return None
+    try:
+        safe_path = ensure_safe_repo_file(root, candidate)
+        size_bytes = safe_path.stat().st_size
+        if size_bytes > options.max_file_size_bytes:
+            logger.warning(
+                "Skipping oversized file %s (%d bytes > %d max_file_size_bytes)",
+                safe_path,
+                size_bytes,
+                options.max_file_size_bytes,
+            )
+            return None
+        return build_file_record(
+            repo_id,
+            root,
+            safe_path,
+            max_file_size_bytes=options.max_file_size_bytes,
+            test_dir_names=options.test_dir_names,
+        )
+    except (PathSecurityError, ParseError, OSError) as exc:
+        logger.warning("Skipping file %s: %s", candidate, exc)
+        return None
+
+
+def _scan_directory_files(
+    repo_id: str,
+    root: Path,
+    current_dir: Path,
+    filenames: list[str],
+    options: _ScanOptions,
+) -> list[FileRecord]:
+    """Scan all filenames in ``current_dir`` and return valid ``FileRecord`` entries."""
+    records: list[FileRecord] = []
+    for filename in sorted(filenames):
+        record = _scan_single_file(repo_id, root, current_dir / filename, options)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def scan_repository(repo_root: str | Path, config: Any) -> tuple[RepoRecord, list[FileRecord]]:
     """Scan a repository and return ``RepoRecord`` and sorted ``FileRecord`` list.
 
     Enforces symlink/traversal security checks, skips oversized files with a
@@ -170,13 +232,14 @@ def scan_repository(repo_root: str | Path, config) -> tuple[RepoRecord, list[Fil
     """
     root = normalize_repo_root(repo_root)
     repo = build_repo_record(root)
+    options = _ScanOptions(
+        include_tests=getattr(config, "include_tests", False),
+        test_dir_names=getattr(config, "test_dir_names", DEFAULT_TEST_DIR_NAMES),
+        max_file_size_bytes=getattr(config, "max_file_size_bytes", DEFAULT_MAX_FILE_SIZE_BYTES),
+        ignored_dirs=getattr(config, "ignored_dirs", ()),
+        supported_extensions=getattr(config, "supported_extensions", (".py",)),
+    )
     results: list[FileRecord] = []
-
-    include_tests = getattr(config, "include_tests", False)
-    test_dir_names = getattr(config, "test_dir_names", DEFAULT_TEST_DIR_NAMES)
-    max_file_size_bytes = getattr(config, "max_file_size_bytes", DEFAULT_MAX_FILE_SIZE_BYTES)
-    ignored_dirs = getattr(config, "ignored_dirs", ())
-    supported_extensions = getattr(config, "supported_extensions", (".py",))
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         current_dir = Path(dirpath)
@@ -184,37 +247,10 @@ def scan_repository(repo_root: str | Path, config) -> tuple[RepoRecord, list[Fil
             d
             for d in dirnames
             if not (current_dir / d).is_symlink()
-            and not should_ignore_dir(d, ignored_dirs)
-            and (include_tests or not should_ignore_dir(d, test_dir_names))
+            and not should_ignore_dir(d, options.ignored_dirs)
+            and (options.include_tests or not should_ignore_dir(d, options.test_dir_names))
         )
-
-        for filename in sorted(filenames):
-            candidate = current_dir / filename
-            if not is_supported_source_file(candidate, supported_extensions):
-                continue
-
-            try:
-                safe_path = ensure_safe_repo_file(root, candidate)
-                size_bytes = safe_path.stat().st_size
-                if size_bytes > max_file_size_bytes:
-                    logger.warning(
-                        "Skipping oversized file %s (%d bytes > %d max_file_size_bytes)",
-                        safe_path,
-                        size_bytes,
-                        max_file_size_bytes,
-                    )
-                    continue
-                record = build_file_record(
-                    repo.id,
-                    root,
-                    safe_path,
-                    max_file_size_bytes=max_file_size_bytes,
-                    test_dir_names=test_dir_names,
-                )
-                results.append(record)
-            except (PathSecurityError, ParseError, OSError) as exc:
-                logger.warning("Skipping file %s: %s", candidate, exc)
-                continue
+        results.extend(_scan_directory_files(repo.id, root, current_dir, filenames, options))
 
     results.sort(key=lambda x: x.file_path)
     return repo, results

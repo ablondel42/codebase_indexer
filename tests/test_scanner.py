@@ -2,10 +2,10 @@
 
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -60,9 +60,13 @@ def sample_repo(tmp_path: Path) -> Path:
 
     # Test files under tests/ and test/
     (repo / "tests").mkdir()
-    (repo / "tests" / "test_auth.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    (repo / "tests" / "test_auth.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
     (repo / "test").mkdir()
-    (repo / "test" / "test_main.py").write_text("def test_main():\n    assert True\n", encoding="utf-8")
+    (repo / "test" / "test_main.py").write_text(
+        "def test_main():\n    assert True\n", encoding="utf-8"
+    )
 
     # Ignored directories including fnmatch *.egg-info and .nox
     for ignored in (".git", "__pycache__", "node_modules", ".nox", "pkg_name.egg-info"):

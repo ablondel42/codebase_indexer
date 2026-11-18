@@ -1,9 +1,9 @@
 """Logging configuration tests verifying stderr-only console output and safe level checks."""
 
-from collections.abc import Iterator
 import logging
-from pathlib import Path
 import sys
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -60,7 +60,9 @@ class TestSetupLogging:
         assert stream_handlers[0].stream is not sys.stdout
         assert logging_config.LOGGING_INITIALIZED is True
 
-    def test_setup_logging_skips_if_already_initialized(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_setup_logging_skips_if_already_initialized(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         setup_logging(level="INFO")
         with caplog.at_level(logging.WARNING):
             setup_logging(level="DEBUG")

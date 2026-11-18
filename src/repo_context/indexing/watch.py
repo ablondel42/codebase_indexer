@@ -5,9 +5,10 @@ and scheduler, and processes incremental updates sequentially.
 """
 
 import json
-from pathlib import Path
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from sqlalchemy.engine import Connection
 from watchdog.events import FileSystemEventHandler
@@ -163,6 +164,37 @@ def watch_repo(
         logger.info("Watch mode stopped")
 
 
+def _log_watch_result(result: dict[str, Any], *, verbose: bool) -> None:
+    """Emit structured log entry for a single processed watch event result."""
+    status = result.get("status", "unknown")
+    file_path = result.get("file_path", "unknown")
+
+    if status == "reindexed" and verbose:
+        logger.info(
+            "File reindexed",
+            extra={
+                "file_path": file_path,
+                "node_count": result.get("node_count", 0),
+                "edge_count": result.get("edge_count", 0),
+                "invalidated_refs": result.get("invalidated_reference_edge_count", 0),
+            },
+        )
+    elif status == "deleted" and verbose:
+        logger.info(
+            "File deleted",
+            extra={
+                "file_path": file_path,
+                "deleted_nodes": result.get("deleted_node_count", 0),
+                "deleted_edges": result.get("deleted_edge_count", 0),
+                "invalidated_symbols": result.get("invalidated_target_symbol_count", 0),
+            },
+        )
+    elif status == "parse_failed":
+        logger.warning("File parse failed during watch", extra={"file_path": file_path})
+    elif status == "error":
+        logger.error("File indexing error during watch", extra={"file_path": file_path})
+
+
 def _process_watch_batch(
     conn_factory_func: Callable[[], Connection],
     repo_root: Path,
@@ -174,42 +206,10 @@ def _process_watch_batch(
     conn = conn_factory_func()
     try:
         results = process_event_batch(conn, repo_root, events, config)
-
         for result in results:
-            status = result.get("status", "unknown")
-            file_path = result.get("file_path", "unknown")
-
-            if status == "reindexed":
-                if verbose:
-                    logger.info(
-                        "File reindexed",
-                        extra={
-                            "file_path": file_path,
-                            "node_count": result.get("node_count", 0),
-                            "edge_count": result.get("edge_count", 0),
-                            "invalidated_refs": result.get("invalidated_reference_edge_count", 0),
-                        },
-                    )
-            elif status == "deleted":
-                if verbose:
-                    logger.info(
-                        "File deleted",
-                        extra={
-                            "file_path": file_path,
-                            "deleted_nodes": result.get("deleted_node_count", 0),
-                            "deleted_edges": result.get("deleted_edge_count", 0),
-                            "invalidated_symbols": result.get("invalidated_target_symbol_count", 0),
-                        },
-                    )
-            elif status == "parse_failed":
-                logger.warning("File parse failed during watch", extra={"file_path": file_path})
-            elif status == "error":
-                logger.error("File indexing error during watch", extra={"file_path": file_path})
-
-            if status == "skipped" and not verbose:
+            _log_watch_result(result, verbose=verbose)
+            if result.get("status", "unknown") == "skipped" and not verbose:
                 continue
-
             print(json.dumps({"event": "file_processed", **result}, indent=2), flush=True)
-
     finally:
         close_connection(conn)

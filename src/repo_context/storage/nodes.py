@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import json
 import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from sqlalchemy import case, delete, func, literal_column, or_, select

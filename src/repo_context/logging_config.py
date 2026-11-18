@@ -3,7 +3,6 @@
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 # Flag to track if logging has been initialized
 LOGGING_INITIALIZED: bool = False
@@ -31,7 +30,7 @@ def _resolve_log_level(level: str) -> int:
 
 def setup_logging(
     level: str = "INFO",
-    log_file: Optional[Path] = None,
+    log_file: Path | None = None,
 ) -> None:
     """Configure logging for the application.
 

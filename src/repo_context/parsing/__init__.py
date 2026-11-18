@@ -6,6 +6,7 @@ from repo_context.parsing.call_extractor import extract_call_edges
 from repo_context.parsing.callable_extractor import extract_callable_nodes, extract_parameters
 from repo_context.parsing.class_extractor import extract_class_nodes
 from repo_context.parsing.docstrings import get_doc_summary
+from repo_context.parsing.extraction_context import ExtractionContext, ScopeTarget
 from repo_context.parsing.hashing import (
     compute_symbol_content_hash,
     sha256_file,
@@ -98,6 +99,9 @@ __all__ = [
     "utf8_byte_offset_to_char_offset",
     # Docstrings
     "get_doc_summary",
+    # Extraction context
+    "ExtractionContext",
+    "ScopeTarget",
     # Extractors
     "extract_module_node",
     "extract_class_nodes",

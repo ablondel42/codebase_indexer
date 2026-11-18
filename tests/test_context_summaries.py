@@ -43,9 +43,20 @@ def test_nested_declaration_distinguishes_class_methods_from_function_locals() -
     assert _is_local_declaration({"kind": "class", "scope": "function"}) is True
     assert _is_local_declaration({"kind": "method", "scope": "class"}) is False
 
-    assert _is_nested_declaration({"kind": "local_function", "scope": "function", "lexical_parent_id": "p"}) is True
-    assert _is_nested_declaration({"kind": "method", "scope": "class", "lexical_parent_id": "cls"}) is False
-    assert _is_nested_declaration({"kind": "function", "scope": "module", "lexical_parent_id": None}) is False
+    assert (
+        _is_nested_declaration(
+            {"kind": "local_function", "scope": "function", "lexical_parent_id": "p"}
+        )
+        is True
+    )
+    assert (
+        _is_nested_declaration({"kind": "method", "scope": "class", "lexical_parent_id": "cls"})
+        is False
+    )
+    assert (
+        _is_nested_declaration({"kind": "function", "scope": "module", "lexical_parent_id": None})
+        is False
+    )
 
 
 def test_build_confidence_none_when_no_edges_and_placeholders() -> None:

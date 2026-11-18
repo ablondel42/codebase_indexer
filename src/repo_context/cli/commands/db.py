@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -279,26 +280,49 @@ def _fetch_latest_run(
         ) from exc
 
 
+@dataclass(frozen=True)
+class _SchemaStatusMetrics:
+    """Repository, edge, LSP coverage, and run metrics for a v2 database."""
+
+    all_repos: list[RepoRecord]
+    selected_repo: RepoRecord | None
+    edge_counts_by_kind: dict[str, int]
+    lsp_coverage: dict[str, Any]
+    latest_run: dict[str, Any] | None
+
+
+def _collect_schema_status_metrics(
+    conn: Connection,
+    repo_arg: str | None,
+) -> _SchemaStatusMetrics:
+    """Collect schema-dependent metrics when ``PRAGMA user_version == SCHEMA_VERSION``."""
+    all_repos, selected_repo = _resolve_status_repo(conn, repo_arg)
+    repo_id = selected_repo.id if selected_repo is not None else None
+    return _SchemaStatusMetrics(
+        all_repos=all_repos,
+        selected_repo=selected_repo,
+        edge_counts_by_kind=_fetch_edge_counts_by_kind(conn, repo_id),
+        lsp_coverage=_fetch_lsp_coverage(conn, repo_id),
+        latest_run=_fetch_latest_run(conn, repo_id),
+    )
+
+
 def _build_status_payload(
     *,
     db_path: Path,
     db_size_bytes: int,
     user_version: int,
-    all_repos: list[RepoRecord],
-    selected_repo: RepoRecord | None,
     tables: list[dict[str, Any]],
-    edge_counts_by_kind: dict[str, int],
-    lsp_coverage: dict[str, Any],
-    latest_run: dict[str, Any] | None,
+    metrics: _SchemaStatusMetrics,
 ) -> dict[str, Any]:
     """Assemble the database status payload."""
     repo_summary: dict[str, Any] | None = None
-    if selected_repo is not None:
+    if metrics.selected_repo is not None:
         repo_summary = {
-            "id": selected_repo.id,
-            "name": selected_repo.name,
-            "root_path": selected_repo.root_path,
-            "last_indexed_at": selected_repo.last_indexed_at,
+            "id": metrics.selected_repo.id,
+            "name": metrics.selected_repo.name,
+            "root_path": metrics.selected_repo.root_path,
+            "last_indexed_at": metrics.selected_repo.last_indexed_at,
         }
 
     return {
@@ -307,12 +331,12 @@ def _build_status_payload(
         "user_version": user_version,
         "expected_schema_version": SCHEMA_VERSION,
         "schema_ok": user_version == SCHEMA_VERSION,
-        "repo_count": len(all_repos),
+        "repo_count": len(metrics.all_repos),
         "selected_repo": repo_summary,
         "tables": tables,
-        "edge_counts_by_kind": edge_counts_by_kind,
-        "lsp_coverage": lsp_coverage,
-        "latest_run": latest_run,
+        "edge_counts_by_kind": metrics.edge_counts_by_kind,
+        "lsp_coverage": metrics.lsp_coverage,
+        "latest_run": metrics.latest_run,
     }
 
 
@@ -322,34 +346,20 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     repo_arg: str | None = getattr(args, "repo", None)
     logger.debug("Running db status (db_path=%s, repo=%s)", db_path, repo_arg)
 
-    all_repos: list[RepoRecord] = []
-    selected_repo: RepoRecord | None = None
-    edge_counts_by_kind: dict[str, int] = {}
-    lsp_coverage = _empty_lsp_coverage()
-    latest_run: dict[str, Any] | None = None
-
+    metrics = _SchemaStatusMetrics([], None, {}, _empty_lsp_coverage(), None)
     with connection_scope(db_path, read_only=True) as conn:
         db_size_bytes = _get_db_size_bytes(db_path)
         user_version = _read_schema_version(conn)
         tables = _list_table_counts(conn)
-
         if _has_compatible_schema(user_version, tables):
-            all_repos, selected_repo = _resolve_status_repo(conn, repo_arg)
-            repo_id = selected_repo.id if selected_repo is not None else None
-            edge_counts_by_kind = _fetch_edge_counts_by_kind(conn, repo_id)
-            lsp_coverage = _fetch_lsp_coverage(conn, repo_id)
-            latest_run = _fetch_latest_run(conn, repo_id)
+            metrics = _collect_schema_status_metrics(conn, repo_arg)
 
     payload = _build_status_payload(
         db_path=db_path,
         db_size_bytes=db_size_bytes,
         user_version=user_version,
-        all_repos=all_repos,
-        selected_repo=selected_repo,
         tables=tables,
-        edge_counts_by_kind=edge_counts_by_kind,
-        lsp_coverage=lsp_coverage,
-        latest_run=latest_run,
+        metrics=metrics,
     )
     print(json.dumps(payload, indent=2))
     return 0
@@ -506,7 +516,7 @@ def cmd_db_sql(args: argparse.Namespace) -> int:
                 "columns": columns,
                 "row_count": len(rows),
                 "truncated": truncated,
-                "rows": [dict(zip(columns, row)) for row in rows],
+                "rows": [dict(zip(columns, row, strict=False)) for row in rows],
             },
             indent=2,
             default=str,

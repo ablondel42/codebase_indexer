@@ -128,6 +128,67 @@ def make_range(node: ast.AST, lines: Sequence[str] | None = None) -> dict[str, A
     return {"start": start, "end": end}
 
 
+def _make_single_line_range(
+    lineno: int,
+    start_char: int | None,
+    end_char: int | None,
+) -> dict[str, Any] | None:
+    """Build a single-line range dict when both character offsets are valid."""
+    start = make_position(to_zero_based_line(lineno), start_char)
+    end = make_position(to_zero_based_line(lineno), end_char)
+    if start is None or end is None:
+        return None
+    return {"start": start, "end": end}
+
+
+def _selection_range_for_name_node(
+    node: ast.Name,
+    lineno: int,
+    col_offset: int,
+    source_line: str | None,
+) -> dict[str, Any] | None:
+    """Compute selection range directly for an ``ast.Name`` node."""
+    start_char = _col_to_char(col_offset, source_line)
+    if start_char is None:
+        return None
+    end_col = getattr(node, "end_col_offset", None)
+    end_char = _col_to_char(end_col, source_line) if end_col is not None else None
+    if end_char is None or getattr(node, "end_lineno", lineno) != lineno:
+        end_char = start_char + len(node.id)
+    return _make_single_line_range(lineno, start_char, end_char)
+
+
+def _extract_node_identifier(node: ast.AST, raw_name: Any) -> str | None:
+    """Extract simple identifier text from an AST declaration or attribute node."""
+    if isinstance(node, ast.Attribute):
+        return node.attr or None
+    name = raw_name if isinstance(raw_name, str) else getattr(node, "id", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _compute_identifier_char_span(
+    node: ast.AST,
+    name: str,
+    col_offset: int,
+    source_line: str | None,
+) -> tuple[int, int]:
+    """Compute zero-based ``(start_char, end_char)`` for an identifier on ``source_line``."""
+    if source_line is None:
+        return col_offset, col_offset + len(name)
+
+    char_col = utf8_byte_offset_to_char_offset(source_line, col_offset)
+    tail = source_line[char_col:]
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        match = _DECL_NAME_RE.match(tail)
+        if match is not None and match.group(1) == name:
+            return char_col + match.start(1), char_col + match.end(1)
+
+    word_match = re.search(rf"\b{re.escape(name)}\b", tail)
+    if word_match is not None:
+        return char_col + word_match.start(), char_col + word_match.end()
+    return char_col, char_col + len(name)
+
+
 def make_name_selection_range(
     node: ast.AST,
     source_line: str | None = None,
@@ -159,57 +220,13 @@ def make_name_selection_range(
     if lineno is None or col_offset is None:
         return None
 
-    if source_line is None:
-        source_line = _get_line(lines, lineno)
-
+    resolved_line = source_line if source_line is not None else _get_line(lines, lineno)
     if isinstance(node, ast.Name):
-        name = node.id
-        start_char = _col_to_char(col_offset, source_line)
-        end_col = getattr(node, "end_col_offset", None)
-        end_char = _col_to_char(end_col, source_line) if end_col is not None else None
-        if start_char is None:
-            return None
-        if end_char is None or getattr(node, "end_lineno", lineno) != lineno:
-            end_char = start_char + len(name)
-        return {
-            "start": make_position(to_zero_based_line(lineno), start_char),
-            "end": make_position(to_zero_based_line(lineno), end_char),
-        }
+        return _selection_range_for_name_node(node, lineno, col_offset, resolved_line)
 
-    if isinstance(node, ast.Attribute):
-        name = node.attr
-    else:
-        name = raw_name if isinstance(raw_name, str) else getattr(node, "id", None)
-
+    name = _extract_node_identifier(node, raw_name)
     if not name:
         return None
 
-    if source_line is not None:
-        char_col = utf8_byte_offset_to_char_offset(source_line, col_offset)
-        tail = source_line[char_col:]
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            match = _DECL_NAME_RE.match(tail)
-            if match is not None and match.group(1) == name:
-                start_char = char_col + match.start(1)
-                end_char = char_col + match.end(1)
-                return {
-                    "start": make_position(to_zero_based_line(lineno), start_char),
-                    "end": make_position(to_zero_based_line(lineno), end_char),
-                }
-        word_match = re.search(rf"\b{re.escape(name)}\b", tail)
-        if word_match is not None:
-            start_char = char_col + word_match.start()
-            end_char = char_col + word_match.end()
-        else:
-            start_char = char_col
-            end_char = char_col + len(name)
-    else:
-        start_char = col_offset
-        end_char = col_offset + len(name)
-
-    start = make_position(to_zero_based_line(lineno), start_char)
-    end = make_position(to_zero_based_line(lineno), end_char)
-    if start is None or end is None:
-        return None
-
-    return {"start": start, "end": end}
+    start_char, end_char = _compute_identifier_char_span(node, name, col_offset, resolved_line)
+    return _make_single_line_range(lineno, start_char, end_char)

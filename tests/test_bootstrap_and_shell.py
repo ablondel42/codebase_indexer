@@ -5,9 +5,9 @@ from __future__ import annotations
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -23,7 +23,10 @@ def _make_sample_repo(root: Path) -> Path:
     (repo / "pkg").mkdir(parents=True)
     (repo / "pkg" / "__init__.py").write_text('"""Sample pkg."""\n', encoding="utf-8")
     (repo / "pkg" / "greeter.py").write_text(
-        '"""Greeter module."""\n\n\ndef hello(name: str) -> str:\n    """Return greeting."""\n    return f"hi {name}"\n',
+        '"""Greeter module."""\n\n\n'
+        "def hello(name: str) -> str:\n"
+        '    """Return greeting."""\n'
+        '    return f"hi {name}"\n',
         encoding="utf-8",
     )
     return repo
@@ -109,7 +112,7 @@ def test_interactive_shell_commands_and_error_recovery(
 
 
 def test_root_rc_modes_and_tests_runner(tmp_path: Path) -> None:
-    """`./rc`, `./rc <repo> [--cli|--no-cli]`, `./rc demo --cli`, subcommands, and `./rc tests` work."""
+    """`./rc`, `./rc <repo> [--cli|--no-cli]`, `./rc demo`, subcommands, and `./rc tests` work."""
     assert RC_SCRIPT.is_file() and os.access(RC_SCRIPT, os.X_OK)
 
     usage = _run_root_rc()

@@ -1,12 +1,14 @@
 """Tests for the 8 token-lean MCP tools, schemas, adapters, errors, and budgets."""
 
 import asyncio
-from collections.abc import Iterator
 import json
 import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 
 from repo_context.config import AppConfig
@@ -154,10 +156,12 @@ class _FakeFastMCP:
     """Lightweight duck-typed FastMCP stub for testing ``register_tools`` without ``mcp``."""
 
     def __init__(self) -> None:
-        self.tools: dict[str, object] = {}
+        self.tools: dict[str, Callable[..., Any]] = {}
 
-    def tool(self, name: str | None = None):
-        def decorator(fn):
+    def tool(
+        self, name: str | None = None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[name or fn.__name__] = fn
             return fn
 
@@ -173,16 +177,23 @@ def test_error_envelopes_and_exception_mapping(capsys: pytest.CaptureFixture[str
     }
     assert success_result({"x": 1}) == {"ok": True, "data": {"x": 1}, "error": None}
 
-    assert map_exception_to_error_result(DatabaseNotFoundError("x"), operation="op")["error"]["code"] == ERROR_DATABASE_NOT_FOUND
-    assert map_exception_to_error_result(SymbolNotFoundError("x"), operation="op")["error"]["code"] == ERROR_SYMBOL_NOT_FOUND
+    db_err = map_exception_to_error_result(DatabaseNotFoundError("x"), operation="op")
+    assert db_err["error"]["code"] == ERROR_DATABASE_NOT_FOUND
+    sym_err = map_exception_to_error_result(SymbolNotFoundError("x"), operation="op")
+    assert sym_err["error"]["code"] == ERROR_SYMBOL_NOT_FOUND
     sec = map_exception_to_error_result(PathSecurityError("/secret/abs/path"), operation="op")
     assert sec["error"]["code"] == ERROR_PATH_SECURITY
     assert "/secret/abs/path" not in sec["error"]["message"]
-    assert map_exception_to_error_result(LspError("x"), operation="op")["error"]["code"] == ERROR_LSP_FAILURE
-    assert map_exception_to_error_result(ParseError("x"), operation="op")["error"]["code"] == ERROR_PARSE_ERROR
-    assert map_exception_to_error_result(ValidationError("x"), operation="op")["error"]["code"] == ERROR_INVALID_INPUT
+    lsp_err = map_exception_to_error_result(LspError("x"), operation="op")
+    assert lsp_err["error"]["code"] == ERROR_LSP_FAILURE
+    parse_err = map_exception_to_error_result(ParseError("x"), operation="op")
+    assert parse_err["error"]["code"] == ERROR_PARSE_ERROR
+    val_err = map_exception_to_error_result(ValidationError("x"), operation="op")
+    assert val_err["error"]["code"] == ERROR_INVALID_INPUT
 
-    internal = map_exception_to_error_result(RuntimeError("/private/secret/traceback"), operation="op")
+    internal = map_exception_to_error_result(
+        RuntimeError("/private/secret/traceback"), operation="op"
+    )
     assert internal["error"]["code"] == ERROR_INTERNAL_ERROR
     assert "/private/secret/traceback" not in internal["error"]["message"]
     captured = capsys.readouterr()
@@ -192,11 +203,11 @@ def test_error_envelopes_and_exception_mapping(capsys: pytest.CaptureFixture[str
 def test_schemas_validation_and_aliases() -> None:
     """Pydantic input schemas enforce bounds and accept legacy aliases cleanly."""
     assert GetRepoOverviewInput(repo_id=None).repo_id is None
-    with pytest.raises(Exception):
+    with pytest.raises(PydanticValidationError):
         GetRepoOverviewInput(repo_id="   ")
 
     assert ListFilesInput(limit=50, offset=0).limit == 50
-    with pytest.raises(Exception):
+    with pytest.raises(PydanticValidationError):
         ListFilesInput(limit=201)
 
     assert GetFileOutlineInput(file_path="a.py").max_depth == 3
@@ -214,16 +225,22 @@ def test_schemas_validation_and_aliases() -> None:
 
     risk_in = AnalyzeRiskInput.model_validate({"symbol_ids": ["a", "b"]})
     assert risk_in.symbols == ["a", "b"]
-    with pytest.raises(Exception):
+    with pytest.raises(PydanticValidationError):
         AnalyzeRiskInput(symbols=["x"] * 51)
-    with pytest.raises(Exception):
+    with pytest.raises(PydanticValidationError):
         AnalyzeRiskInput(symbols=[])
 
 
 def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
     """Adapters strip None noise and drop child docstrings when >10 children are present."""
     adapted = adapt_node(
-        {"id": "sym:1", "kind": "function", "name": "f", "qualified_name": "m.f", "doc_summary": None}
+        {
+            "id": "sym:1",
+            "kind": "function",
+            "name": "f",
+            "qualified_name": "m.f",
+            "doc_summary": None,
+        }
     )
     assert "doc_summary" not in adapted
 
@@ -231,10 +248,23 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
     assert "preview" not in edge_adapted
 
     class DummyCtx:
-        focus_symbol = {"id": "sym:c", "kind": "class", "name": "C", "qualified_name": "m.C", "start_line": 1, "end_line": 50}
+        focus_symbol = {
+            "id": "sym:c",
+            "kind": "class",
+            "name": "C",
+            "qualified_name": "m.C",
+            "start_line": 1,
+            "end_line": 50,
+        }
         structural_parent = None
         structural_children = [
-            {"id": f"sym:m{i}", "kind": "method", "name": f"m{i}", "lines": f"{i}-{i}", "doc_summary": f"doc {i}"}
+            {
+                "id": f"sym:m{i}",
+                "kind": "method",
+                "name": f"m{i}",
+                "lines": f"{i}-{i}",
+                "doc_summary": f"doc {i}",
+            }
             for i in range(12)
         ]
         lexical_parent = None
@@ -251,33 +281,41 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
     assert all("doc_summary" not in c for c in compact_ctx["structural_children"])
     assert "structural_parent" not in compact_ctx
 
-    out = adapt_outline({"file_path": "a.py", "module_path": "a", "symbols": [{"id": "s", "kind": "function", "name": "f", "children": []}]})
+    out = adapt_outline(
+        {
+            "file_path": "a.py",
+            "module_path": "a",
+            "symbols": [{"id": "s", "kind": "function", "name": "f", "children": []}],
+        }
+    )
     assert "children" not in out["symbols"][0]
+
+    class DummyFacts:
+        target_count = 0
+        symbol_ids = []
+        symbol_kinds = set()
+        reference_counts = {}
+        reference_availability = {}
+        referencing_file_counts = {}
+        referencing_module_counts = {}
+        touches_public_surface = False
+        touches_local_scope_only = False
+        target_spans_multiple_files = False
+        target_spans_multiple_modules = False
+        cross_file_impact = False
+        cross_module_impact = False
+        inheritance_involved = False
+        stale_symbols = []
+        low_confidence_symbols = []
+        low_confidence_edges = []
+        extra = {}
 
     class DummyRisk:
         risk_score = 10
         decision = "safe_enough"
         issues = []
         targets = []
-        class facts:
-            target_count = 0
-            symbol_ids = []
-            symbol_kinds = set()
-            reference_counts = {}
-            reference_availability = {}
-            referencing_file_counts = {}
-            referencing_module_counts = {}
-            touches_public_surface = False
-            touches_local_scope_only = False
-            target_spans_multiple_files = False
-            target_spans_multiple_modules = False
-            cross_file_impact = False
-            cross_module_impact = False
-            inheritance_involved = False
-            stale_symbols = []
-            low_confidence_symbols = []
-            low_confidence_edges = []
-            extra = {}
+        facts = DummyFacts()
 
     assert adapt_risk_result(DummyRisk())["decision"] == "safe_enough"
 
@@ -294,10 +332,14 @@ def test_all_8_mcp_tools_end_to_end(indexed_mcp_repo: tuple[Path, Path, str]) ->
     assert ov["data"]["stats"]["test_file_count"] == 1
 
     # 2. list_files
-    lf_no_tests = json.loads(asyncio.run(list_files(path_prefix="pkg", include_tests=False, db_path=db_path)))
+    lf_no_tests = json.loads(
+        asyncio.run(list_files(path_prefix="pkg", include_tests=False, db_path=db_path))
+    )
     assert lf_no_tests["ok"] is True
     assert lf_no_tests["data"]["total_count"] == 3
-    lf_tests = json.loads(asyncio.run(list_files(include_tests=True, limit=2, offset=1, db_path=db_path)))
+    lf_tests = json.loads(
+        asyncio.run(list_files(include_tests=True, limit=2, offset=1, db_path=db_path))
+    )
     assert lf_tests["data"]["total_count"] == 4
     assert lf_tests["data"]["returned_count"] == 2
     assert lf_tests["data"]["has_more"] is True
@@ -315,13 +357,19 @@ def test_all_8_mcp_tools_end_to_end(indexed_mcp_repo: tuple[Path, Path, str]) ->
     assert search["data"]["symbols"][0]["qualified_name"] == "pkg.core.Worker"
 
     # 5. get_symbol_source
-    src = json.loads(asyncio.run(get_symbol_source("pkg.core.Worker.run", max_lines=2, offset=0, db_path=db_path)))
+    src = json.loads(
+        asyncio.run(
+            get_symbol_source("pkg.core.Worker.run", max_lines=2, offset=0, db_path=db_path)
+        )
+    )
     assert src["ok"] is True
     assert src["data"]["truncated"] is True
     assert "def run(" in src["data"]["source"]
 
     # 6. get_symbol_context + ambiguity handling
-    ctx = json.loads(asyncio.run(get_symbol_context("pkg.core.Worker", include_source=True, db_path=db_path)))
+    ctx = json.loads(
+        asyncio.run(get_symbol_context("pkg.core.Worker", include_source=True, db_path=db_path))
+    )
     assert ctx["ok"] is True
     assert ctx["data"]["context"]["focus_symbol"]["qualified_name"] == "pkg.core.Worker"
     assert "bases" in ctx["data"]["context"]
@@ -332,14 +380,18 @@ def test_all_8_mcp_tools_end_to_end(indexed_mcp_repo: tuple[Path, Path, str]) ->
     assert len(ambig["error"]["details"]["candidates"]) == 2
 
     # 7. get_symbol_references (AST fallback & 1-line preview)
-    refs = json.loads(asyncio.run(get_symbol_references("pkg.core.helper", direction="incoming", db_path=db_path)))
+    refs = json.loads(
+        asyncio.run(get_symbol_references("pkg.core.helper", direction="incoming", db_path=db_path))
+    )
     assert refs["ok"] is True
     assert refs["data"]["reference_summary"]["reference_source"] == "ast"
     assert refs["data"]["total_count"] >= 1
     assert any("helper(x)" in (item.get("preview") or "") for item in refs["data"]["references"])
 
     # 8. analyze_risk
-    risk = json.loads(asyncio.run(analyze_risk(["pkg.core.Base", "pkg.client.run"], db_path=db_path)))
+    risk = json.loads(
+        asyncio.run(analyze_risk(["pkg.core.Base", "pkg.client.run"], db_path=db_path))
+    )
     assert risk["ok"] is True
     assert risk["data"]["risk"]["facts"]["inheritance_involved"] is True
     assert risk["data"]["risk"]["facts"]["target_spans_multiple_modules"] is True
@@ -358,7 +410,7 @@ def test_all_8_mcp_tools_end_to_end(indexed_mcp_repo: tuple[Path, Path, str]) ->
 def test_get_symbol_references_refresh_lsp_and_error_handling(
     indexed_mcp_repo: tuple[Path, Path, str],
 ) -> None:
-    """get_symbol_references supports refresh_lsp=True with mocked LspSessionPool and catches LspError."""
+    """get_symbol_references supports refresh_lsp=True with mocked pool and catches LspError."""
     db_path, repo_root, _ = indexed_mcp_repo
 
     class _FakeClient:
@@ -370,16 +422,25 @@ def test_get_symbol_references_refresh_lsp_and_error_handling(
         def did_open_or_change(self, uri: str, text: str) -> None:
             pass
 
-        def find_references(self, uri: str, line: int, character: int, include_declaration: bool = False):
+        def find_references(
+            self,
+            uri: str,
+            line: int,
+            character: int,
+            include_declaration: bool = False,
+        ) -> list[dict[str, Any]]:
             return [
                 {
                     "uri": (repo_root / "pkg" / "core.py").resolve().as_uri(),
-                    "range": {"start": {"line": 13, "character": 15}, "end": {"line": 13, "character": 21}},
+                    "range": {
+                        "start": {"line": 13, "character": 15},
+                        "end": {"line": 13, "character": 21},
+                    },
                 }
             ]
 
     class _FakePool:
-        def get_or_start(self, root: str):
+        def get_or_start(self, root: str) -> _FakeClient:
             return _FakeClient()
 
         def close_repo(self, root: str) -> None:
@@ -391,7 +452,7 @@ def test_get_symbol_references_refresh_lsp_and_error_handling(
                 "pkg.core.helper",
                 refresh_lsp=True,
                 db_path=db_path,
-                lsp_pool=_FakePool(),  # type: ignore[arg-type]
+                lsp_pool=cast(Any, _FakePool()),
             )
         )
     )
@@ -400,7 +461,7 @@ def test_get_symbol_references_refresh_lsp_and_error_handling(
     assert res["data"]["reference_summary"]["reference_source"] == "lsp"
 
     class _FailingPool:
-        def get_or_start(self, root: str):
+        def get_or_start(self, root: str) -> _FakeClient:
             raise LspError("pyright unavailable")
 
         def close_repo(self, root: str) -> None:
@@ -412,7 +473,7 @@ def test_get_symbol_references_refresh_lsp_and_error_handling(
                 "pkg.core.helper",
                 refresh_lsp=True,
                 db_path=db_path,
-                lsp_pool=_FailingPool(),  # type: ignore[arg-type]
+                lsp_pool=cast(Any, _FailingPool()),
             )
         )
     )
@@ -459,7 +520,7 @@ def test_register_tools_and_create_server(indexed_mcp_repo: tuple[Path, Path, st
         "analyze_risk",
     }
     assert set(fake_mcp.tools.keys()) == expected
-    ov_res = json.loads(asyncio.run(fake_mcp.tools["get_repo_overview"]()))  # type: ignore[operator]
+    ov_res = json.loads(asyncio.run(fake_mcp.tools["get_repo_overview"]()))
     assert ov_res["ok"] is True
 
     server = create_server(db_path=db_path)
@@ -467,10 +528,15 @@ def test_register_tools_and_create_server(indexed_mcp_repo: tuple[Path, Path, st
 
 
 def test_40_method_class_token_budget(tmp_path: Path) -> None:
-    """Indexing a 40-method class keeps get_symbol_context < 1,500 tokens (~6,000 chars) and get_file_outline < 1,000 tokens."""
+    """Indexing a 40-method class keeps context < 1,500 tokens and outline < 1,000 tokens."""
     repo_root = tmp_path / "budget_repo"
     repo_root.mkdir()
-    lines = ['"""Large service module."""', "", "class BigService:", '    """Service with 40 methods."""']
+    lines = [
+        '"""Large service module."""',
+        "",
+        "class BigService:",
+        '    """Service with 40 methods."""',
+    ]
     for i in range(40):
         lines.append(f"    def method_{i:02d}(self, value: int) -> int:")
         lines.append(f'        """Handle operation {i}."""')

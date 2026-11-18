@@ -230,71 +230,68 @@ def _get_referencing_sites(
     return [(row["ref_file_id"], row["ref_module_path"]) for row in rows]
 
 
-def build_risk_facts(conn: Connection, targets: list[RiskTarget]) -> RiskFacts:
-    """Build deterministic risk facts for a normalized list of targets."""
-    if not targets:
-        return RiskFacts()
-
-    facts = RiskFacts(
-        target_count=len(targets),
-        symbol_ids=[t.symbol_id for t in targets],
-        symbol_kinds={t.kind for t in targets},
+def _detect_target_impact_spread(
+    conn: Connection,
+    target: RiskTarget,
+    reference_source: str,
+) -> tuple[bool, bool]:
+    """Return ``(cross_file_impact, cross_module_impact)`` for one target."""
+    edge_kinds = (
+        (EDGE_KIND_REFERENCES,)
+        if reference_source == "lsp"
+        else AST_DEPENDENCY_EDGE_KINDS
     )
+    sites = _get_referencing_sites(conn, target.symbol_id, edge_kinds)
+    if not sites:
+        return False, False
 
-    all_file_ids: set[str] = set()
-    all_module_paths: set[str] = set()
-    reference_sources: dict[str, str] = {}
-    any_public = False
-    all_function_scope = True
-    any_inheritance = False
+    ref_files = {fid for fid, _ in sites if fid}
+    ref_modules = {mod for _, mod in sites if mod}
+    cross_file = any(fid != target.file_id for fid in ref_files)
+    if target.module_path:
+        cross_module = any(mod != target.module_path for mod in ref_modules)
+    else:
+        cross_module = len(ref_modules) > 1
+    return cross_file, cross_module
 
-    for target in targets:
-        stats = build_reference_stats(conn, target.symbol_id)
-        facts.reference_counts[target.symbol_id] = stats["reference_count"]
-        facts.reference_availability[target.symbol_id] = stats["available"]
-        facts.referencing_file_counts[target.symbol_id] = stats["referencing_file_count"]
-        facts.referencing_module_counts[target.symbol_id] = stats["referencing_module_count"]
-        reference_sources[target.symbol_id] = stats["reference_source"]
 
-        if target.file_id:
-            all_file_ids.add(target.file_id)
-        if target.module_path:
-            all_module_paths.add(target.module_path)
-        elif target.file_id:
-            all_module_paths.add(target.file_id)
+def _record_target_reference_facts(
+    conn: Connection,
+    target: RiskTarget,
+    facts: RiskFacts,
+    reference_sources: dict[str, str],
+) -> None:
+    """Populate per-target reference counts, availability, and impact spread."""
+    stats = build_reference_stats(conn, target.symbol_id)
+    facts.reference_counts[target.symbol_id] = stats["reference_count"]
+    facts.reference_availability[target.symbol_id] = stats["available"]
+    facts.referencing_file_counts[target.symbol_id] = stats["referencing_file_count"]
+    facts.referencing_module_counts[target.symbol_id] = stats["referencing_module_count"]
+    reference_sources[target.symbol_id] = stats["reference_source"]
 
-        if is_public_like(target):
-            any_public = True
-        if target.scope != "function":
-            all_function_scope = False
-        if target_has_inheritance_risk(conn, target):
-            any_inheritance = True
+    cross_file, cross_module = _detect_target_impact_spread(
+        conn, target, stats["reference_source"]
+    )
+    if cross_file:
+        facts.cross_file_impact = True
+    if cross_module:
+        facts.cross_module_impact = True
 
-        edge_kinds = (
-            (EDGE_KIND_REFERENCES,)
-            if stats["reference_source"] == "lsp"
-            else AST_DEPENDENCY_EDGE_KINDS
-        )
-        sites = _get_referencing_sites(conn, target.symbol_id, edge_kinds)
-        if sites:
-            ref_files = {fid for fid, _ in sites if fid}
-            ref_modules = {mod for _, mod in sites if mod}
 
-            if any(fid != target.file_id for fid in ref_files):
-                facts.cross_file_impact = True
+def _target_module_key(target: RiskTarget) -> str | None:
+    """Return module grouping key for a target (module_path fallback to file_id)."""
+    if target.module_path:
+        return target.module_path
+    return target.file_id or None
 
-            if target.module_path:
-                if any(mod != target.module_path for mod in ref_modules):
-                    facts.cross_module_impact = True
-            elif len(ref_modules) > 1:
-                facts.cross_module_impact = True
 
-    facts.touches_public_surface = any_public
-    facts.touches_local_scope_only = all_function_scope and len(targets) > 0
-    facts.target_spans_multiple_files = len(all_file_ids) > 1
-    facts.target_spans_multiple_modules = len(all_module_paths) > 1
-    facts.inheritance_involved = any_inheritance
-
+def _populate_quality_and_extra_facts(
+    conn: Connection,
+    targets: list[RiskTarget],
+    facts: RiskFacts,
+    reference_sources: dict[str, str],
+) -> None:
+    """Populate freshness, confidence, and diagnostic extra metadata on ``facts``."""
     facts.stale_symbols = collect_stale_symbols(conn, targets)
     facts.low_confidence_symbols = collect_low_confidence_symbols(conn, targets)
     low_edge_ids, total_low_edges = _query_low_confidence_edges(conn, targets)
@@ -308,4 +305,28 @@ def build_risk_facts(conn: Connection, targets: list[RiskTarget]) -> RiskFacts:
     facts.extra["low_confidence_edge_count"] = total_low_edges
     facts.extra["low_confidence_edges_truncated"] = total_low_edges > len(low_edge_ids)
 
+
+def build_risk_facts(conn: Connection, targets: list[RiskTarget]) -> RiskFacts:
+    """Build deterministic risk facts for a normalized list of targets."""
+    if not targets:
+        return RiskFacts()
+
+    facts = RiskFacts(
+        target_count=len(targets),
+        symbol_ids=[t.symbol_id for t in targets],
+        symbol_kinds={t.kind for t in targets},
+    )
+    reference_sources: dict[str, str] = {}
+    for target in targets:
+        _record_target_reference_facts(conn, target, facts, reference_sources)
+
+    all_file_ids = {t.file_id for t in targets if t.file_id}
+    all_module_paths = {key for t in targets if (key := _target_module_key(t))}
+    facts.touches_public_surface = any(is_public_like(t) for t in targets)
+    facts.touches_local_scope_only = all(t.scope == "function" for t in targets)
+    facts.target_spans_multiple_files = len(all_file_ids) > 1
+    facts.target_spans_multiple_modules = len(all_module_paths) > 1
+    facts.inheritance_involved = any(target_has_inheritance_risk(conn, t) for t in targets)
+
+    _populate_quality_and_extra_facts(conn, targets, facts, reference_sources)
     return facts

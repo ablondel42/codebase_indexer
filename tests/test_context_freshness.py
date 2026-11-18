@@ -11,8 +11,18 @@ def test_build_freshness_ast_only_and_edge_snapshot() -> None:
     """build_freshness reports ast_only by default and computes latest edge timestamp."""
     focus_node = {"id": "sym1", "last_indexed_at": "2026-01-01T00:00:00Z"}
     raw_edges = [
-        {"from_id": "other", "to_id": "sym1", "kind": "calls", "last_indexed_at": "2026-01-01T01:00:00Z"},
-        {"from_id": "sym1", "to_id": "dest", "kind": "calls", "last_indexed_at": "2026-01-02T03:00:00Z"},
+        {
+            "from_id": "other",
+            "to_id": "sym1",
+            "kind": "calls",
+            "last_indexed_at": "2026-01-01T01:00:00Z",
+        },
+        {
+            "from_id": "sym1",
+            "to_id": "dest",
+            "kind": "calls",
+            "last_indexed_at": "2026-01-02T03:00:00Z",
+        },
     ]
     context = SymbolContext(
         focus_symbol={"id": "sym1"},
@@ -51,7 +61,12 @@ def test_build_freshness_missing_timestamp_and_disk_staleness(tmp_path: Path) ->
 
     src = tmp_path / "mod.py"
     src.write_text("x = 1\n", encoding="utf-8")
-    file_rec = {"id": "file:1", "repo_id": "repo:1", "file_path": "mod.py", "content_hash": sha256_file(src)}
+    file_rec = {
+        "id": "file:1",
+        "repo_id": "repo:1",
+        "file_path": "mod.py",
+        "content_hash": sha256_file(src),
+    }
     focus = {"id": "sym1", "file_id": "file:1", "last_indexed_at": "2026-01-01T00:00:00Z"}
 
     fresh = build_freshness(context, focus, file_record=file_rec, repo_root=tmp_path)

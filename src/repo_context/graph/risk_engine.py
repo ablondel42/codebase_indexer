@@ -7,11 +7,11 @@ Provides the primary API for risk analysis:
 
 from sqlalchemy.engine import Connection
 
-from repo_context.graph.risk_types import RiskResult
-from repo_context.graph.risk_targets import load_risk_targets
 from repo_context.graph.risk_facts import build_risk_facts
 from repo_context.graph.risk_rules import detect_risk_issues
-from repo_context.graph.risk_scoring import score_risk, decide_risk
+from repo_context.graph.risk_scoring import decide_risk, score_risk
+from repo_context.graph.risk_targets import load_risk_targets
+from repo_context.graph.risk_types import RiskResult
 
 
 def analyze_symbol_risk(conn: Connection, symbol_id: str) -> RiskResult:
@@ -53,12 +53,10 @@ def analyze_target_set_risk(conn: Connection, symbol_ids: list[str]) -> RiskResu
     decision = decide_risk(issues, facts, risk_score)
 
     # Step 6: Assemble result
-    result = RiskResult(
+    return RiskResult(
         targets=targets,
         facts=facts,
         issues=issues,
         risk_score=risk_score,
         decision=decision,
     )
-
-    return result

@@ -1,6 +1,7 @@
 """Context builders for assembling slim, bounded symbol-centered graph views."""
 
-from collections import Counter
+from collections import Counter, deque
+from dataclasses import dataclass
 
 from sqlalchemy.engine import Connection
 
@@ -165,25 +166,17 @@ def _select_balanced_edges(edges: list[dict], limit: int) -> list[dict]:
     if len(edges) <= limit:
         return edges
 
-    buckets: dict[str, list[dict]] = {}
+    buckets: dict[str, deque[dict]] = {}
     for edge in edges:
-        kind = edge.get("kind") or ""
-        buckets.setdefault(kind, []).append(edge)
+        buckets.setdefault(edge.get("kind") or "", deque()).append(edge)
 
+    active = deque(buckets.values())
     selected: list[dict] = []
-    offsets = {kind: 0 for kind in buckets}
-    while len(selected) < limit:
-        progressed = False
-        for kind, items in buckets.items():
-            idx = offsets[kind]
-            if idx < len(items):
-                selected.append(items[idx])
-                offsets[kind] = idx + 1
-                progressed = True
-                if len(selected) >= limit:
-                    break
-        if not progressed:
-            break
+    while active and len(selected) < limit:
+        bucket = active.popleft()
+        selected.append(bucket.popleft())
+        if bucket:
+            active.append(bucket)
 
     selected.sort(key=_edge_sort_key)
     return selected
@@ -208,6 +201,173 @@ def _compute_relationship_counts(
     }
 
 
+@dataclass(frozen=True)
+class _SymbolHierarchy:
+    """Raw structural, lexical, and sibling nodes surrounding a focus symbol."""
+
+    structural_parent: dict | None
+    structural_children: list[dict]
+    lexical_parent: dict | None
+    lexical_children: list[dict]
+    direct_siblings: list[dict]
+
+
+@dataclass(frozen=True)
+class _SymbolEdges:
+    """Raw, semantic, and balanced-bounded incoming/outgoing edge sets."""
+
+    all_raw: list[dict]
+    incoming_semantic: list[dict]
+    outgoing_semantic: list[dict]
+    bounded_incoming: list[dict]
+    bounded_outgoing: list[dict]
+
+
+def _has_real_lexical_parent(focus_node: dict) -> bool:
+    """Return True when focus_node has a non-class-method lexical parent."""
+    if focus_node.get("lexical_parent_id") is None:
+        return False
+    return not (
+        focus_node.get("kind") in (SYMBOL_KIND_METHOD, SYMBOL_KIND_ASYNC_METHOD)
+        and focus_node.get("scope") == "class"
+    )
+
+
+def _load_symbol_hierarchy(conn: Connection, focus_node: dict) -> _SymbolHierarchy:
+    """Load structural/lexical parent-child nodes and same-file direct siblings."""
+    node_id = focus_node["id"]
+    structural_parent = get_parent_symbol(conn, focus_node)
+    structural_children = get_child_symbols(conn, node_id)
+    lexical_parent = (
+        get_lexical_parent_symbol(conn, focus_node)
+        if _has_real_lexical_parent(focus_node)
+        else None
+    )
+    # Never duplicate identical structural class members under lexical_children
+    lexical_children = [
+        child
+        for child in get_lexical_child_symbols(conn, node_id)
+        if child.get("scope") == "function"
+    ]
+    focus_parent_id = focus_node.get("parent_id")
+    direct_siblings = [
+        node
+        for node in get_symbols_for_file(conn, focus_node["file_id"])
+        if node["id"] != node_id and node.get("parent_id") == focus_parent_id
+    ]
+    return _SymbolHierarchy(
+        structural_parent=structural_parent,
+        structural_children=structural_children,
+        lexical_parent=lexical_parent,
+        lexical_children=lexical_children,
+        direct_siblings=direct_siblings,
+    )
+
+
+def _load_symbol_edges(conn: Connection, node_id: str, edge_limit: int) -> _SymbolEdges:
+    """Load raw edges and sort/bound semantic incoming and outgoing edges."""
+    outgoing_raw = get_outgoing_edges(conn, node_id)
+    incoming_raw = get_incoming_edges(conn, node_id)
+    incoming_semantic = sorted(
+        [e for e in incoming_raw if e.get("kind") not in _STRUCTURAL_EDGE_KINDS],
+        key=_edge_sort_key,
+    )
+    outgoing_semantic = sorted(
+        [e for e in outgoing_raw if e.get("kind") not in _STRUCTURAL_EDGE_KINDS],
+        key=_edge_sort_key,
+    )
+    return _SymbolEdges(
+        all_raw=[*incoming_raw, *outgoing_raw],
+        incoming_semantic=incoming_semantic,
+        outgoing_semantic=outgoing_semantic,
+        bounded_incoming=_select_balanced_edges(incoming_semantic, edge_limit),
+        bounded_outgoing=_select_balanced_edges(outgoing_semantic, edge_limit),
+    )
+
+
+def _collect_edge_lookup_ids(
+    edges: list[dict],
+    peer_key: str,
+    peer_ids: list[str],
+    file_ids: list[str],
+) -> None:
+    """Append peer node IDs and evidence file IDs from bounded edges."""
+    for edge in edges:
+        peer_ids.append(edge[peer_key])
+        evidence_file_id = edge.get("evidence_file_id")
+        if evidence_file_id:
+            file_ids.append(evidence_file_id)
+
+
+def _resolve_peers_and_files(
+    conn: Connection,
+    focus_file_id: str,
+    hierarchy: _SymbolHierarchy,
+    edges: _SymbolEdges,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Batch-resolve peer symbol records and file metadata records."""
+    peer_ids: list[str] = []
+    file_ids: list[str] = [focus_file_id]
+    for parent in (hierarchy.structural_parent, hierarchy.lexical_parent):
+        if parent is not None:
+            file_ids.append(parent["file_id"])
+    _collect_edge_lookup_ids(edges.bounded_incoming, "from_id", peer_ids, file_ids)
+    _collect_edge_lookup_ids(edges.bounded_outgoing, "to_id", peer_ids, file_ids)
+
+    peers_by_id = get_symbols_by_ids(conn, peer_ids)
+    file_ids.extend(peer["file_id"] for peer in peers_by_id.values() if peer.get("file_id"))
+    return peers_by_id, get_files_by_ids(conn, file_ids)
+
+
+def _attach_focus_source(
+    conn: Connection,
+    focus_symbol: dict,
+    node_id: str,
+    max_source_lines: int,
+) -> None:
+    """Populate inline source or source_error on the focus symbol dict."""
+    try:
+        source_payload = read_symbol_source(conn, node_id, max_lines=max_source_lines, offset=0)
+        focus_symbol["source"] = source_payload["source"]
+        if source_payload["truncated"]:
+            focus_symbol["source_truncated"] = True
+    except PathSecurityError:
+        focus_symbol["source_error"] = (
+            "Access denied: source file is missing, symlinked, or outside repository root."
+        )
+    except (OSError, ParseError):
+        focus_symbol["source_error"] = "Unable to read symbol source from disk."
+    except ValidationError:
+        focus_symbol["source_error"] = "Symbol has no usable line range metadata."
+
+
+def _adapt_optional_symbol(node: dict | None, files_by_id: dict[str, dict]) -> dict | None:
+    """Adapt an optional parent node with its resolved file info."""
+    if node is None:
+        return None
+    return adapt_node_to_symbol(node, file_info=files_by_id.get(node["file_id"]))
+
+
+def _adapt_context_edges(
+    edges: list[dict],
+    *,
+    direction: str,
+    peers_by_id: dict[str, dict],
+    files_by_id: dict[str, dict],
+) -> list[dict]:
+    """Adapt bounded raw edges into context edge entries."""
+    peer_key = "from_id" if direction == "incoming" else "to_id"
+    return [
+        adapt_edge_to_context_edge(
+            edge,
+            peer_symbol=peers_by_id.get(edge[peer_key]),
+            file_info=files_by_id.get(edge.get("evidence_file_id") or ""),
+            direction=direction,
+        )
+        for edge in edges
+    ]
+
+
 def build_symbol_context(
     conn: Connection,
     node_id: str,
@@ -224,170 +384,61 @@ def build_symbol_context(
     if focus_node is None:
         return None
 
-    # Fetch structural and lexical hierarchy
-    structural_parent_node = get_parent_symbol(conn, focus_node)
-    structural_children_nodes = get_child_symbols(conn, node_id)
-
-    has_real_lexical_parent = (
-        focus_node.get("lexical_parent_id") is not None
-        and not (
-            focus_node.get("kind") in (SYMBOL_KIND_METHOD, SYMBOL_KIND_ASYNC_METHOD)
-            and focus_node.get("scope") == "class"
-        )
+    hierarchy = _load_symbol_hierarchy(conn, focus_node)
+    edges = _load_symbol_edges(conn, node_id, edge_limit)
+    peers_by_id, files_by_id = _resolve_peers_and_files(
+        conn, focus_node["file_id"], hierarchy, edges
     )
-    lexical_parent_node = (
-        get_lexical_parent_symbol(conn, focus_node) if has_real_lexical_parent else None
-    )
-
-    raw_lexical_children = get_lexical_child_symbols(conn, node_id)
-    # Never duplicate identical structural class members under lexical_children
-    lexical_children_nodes = [
-        child
-        for child in raw_lexical_children
-        if child.get("scope") == "function"
-    ]
-
-    # Fetch raw incoming/outgoing edges once for stats, freshness, and bounded summaries
-    outgoing_edges_raw = get_outgoing_edges(conn, node_id)
-    incoming_edges_raw = get_incoming_edges(conn, node_id)
-    all_raw_edges = [*incoming_edges_raw, *outgoing_edges_raw]
-
-    incoming_semantic = sorted(
-        [e for e in incoming_edges_raw if e.get("kind") not in _STRUCTURAL_EDGE_KINDS],
-        key=_edge_sort_key,
-    )
-    outgoing_semantic = sorted(
-        [e for e in outgoing_edges_raw if e.get("kind") not in _STRUCTURAL_EDGE_KINDS],
-        key=_edge_sort_key,
-    )
-
-    bounded_incoming_raw = _select_balanced_edges(incoming_semantic, edge_limit)
-    bounded_outgoing_raw = _select_balanced_edges(outgoing_semantic, edge_limit)
-
-    # Direct structural siblings in the same file (never descendants of focus_node)
-    all_file_symbols = get_symbols_for_file(conn, focus_node["file_id"])
-    focus_parent_id = focus_node.get("parent_id")
-    direct_siblings = [
-        n
-        for n in all_file_symbols
-        if n["id"] != node_id and n.get("parent_id") == focus_parent_id
-    ]
-
-    # Batch-resolve peer nodes and file metadata for slim context adapters
-    peer_ids: list[str] = []
-    file_ids: list[str] = [focus_node["file_id"]]
-    if structural_parent_node:
-        file_ids.append(structural_parent_node["file_id"])
-    if lexical_parent_node:
-        file_ids.append(lexical_parent_node["file_id"])
-    for edge in bounded_incoming_raw:
-        peer_ids.append(edge["from_id"])
-        if edge.get("evidence_file_id"):
-            file_ids.append(edge["evidence_file_id"])
-    for edge in bounded_outgoing_raw:
-        peer_ids.append(edge["to_id"])
-        if edge.get("evidence_file_id"):
-            file_ids.append(edge["evidence_file_id"])
-
-    peers_by_id = get_symbols_by_ids(conn, peer_ids)
-    for peer in peers_by_id.values():
-        if peer.get("file_id"):
-            file_ids.append(peer["file_id"])
-    files_by_id = get_files_by_ids(conn, file_ids)
 
     focus_file = files_by_id.get(focus_node["file_id"])
     focus_symbol = adapt_node_to_symbol(focus_node, file_info=focus_file)
-
     if include_source:
-        try:
-            source_payload = read_symbol_source(
-                conn, node_id, max_lines=max_source_lines, offset=0
-            )
-            focus_symbol["source"] = source_payload["source"]
-            if source_payload["truncated"]:
-                focus_symbol["source_truncated"] = True
-        except PathSecurityError:
-            focus_symbol["source_error"] = (
-                "Access denied: source file is missing, symlinked, or outside repository root."
-            )
-        except (OSError, ParseError):
-            focus_symbol["source_error"] = "Unable to read symbol source from disk."
-        except ValidationError:
-            focus_symbol["source_error"] = "Symbol has no usable line range metadata."
-
-    structural_parent = (
-        adapt_node_to_symbol(
-            structural_parent_node,
-            file_info=files_by_id.get(structural_parent_node["file_id"]),
-        )
-        if structural_parent_node
-        else None
-    )
-    lexical_parent = (
-        adapt_node_to_symbol(
-            lexical_parent_node,
-            file_info=files_by_id.get(lexical_parent_node["file_id"]),
-        )
-        if lexical_parent_node
-        else None
-    )
-
-    structural_children = [
-        _adapt_compact_symbol(n) for n in structural_children_nodes[:edge_limit]
-    ]
-    lexical_children = [
-        _adapt_compact_symbol(n) for n in lexical_children_nodes[:edge_limit]
-    ]
-    file_siblings = [_adapt_compact_symbol(n) for n in direct_siblings[:edge_limit]]
-
-    incoming_edges = [
-        adapt_edge_to_context_edge(
-            e,
-            peer_symbol=peers_by_id.get(e["from_id"]),
-            file_info=files_by_id.get(e.get("evidence_file_id") or ""),
-            direction="incoming",
-        )
-        for e in bounded_incoming_raw
-    ]
-    outgoing_edges = [
-        adapt_edge_to_context_edge(
-            e,
-            peer_symbol=peers_by_id.get(e["to_id"]),
-            file_info=files_by_id.get(e.get("evidence_file_id") or ""),
-            direction="outgoing",
-        )
-        for e in bounded_outgoing_raw
-    ]
+        _attach_focus_source(conn, focus_symbol, node_id, max_source_lines)
 
     context = SymbolContext(
         focus_symbol=focus_symbol,
-        structural_parent=structural_parent,
-        structural_children=structural_children,
-        lexical_parent=lexical_parent,
-        lexical_children=lexical_children,
-        incoming_edges=incoming_edges,
-        outgoing_edges=outgoing_edges,
-        file_siblings=file_siblings,
+        structural_parent=_adapt_optional_symbol(hierarchy.structural_parent, files_by_id),
+        structural_children=[
+            _adapt_compact_symbol(n) for n in hierarchy.structural_children[:edge_limit]
+        ],
+        lexical_parent=_adapt_optional_symbol(hierarchy.lexical_parent, files_by_id),
+        lexical_children=[
+            _adapt_compact_symbol(n) for n in hierarchy.lexical_children[:edge_limit]
+        ],
+        incoming_edges=_adapt_context_edges(
+            edges.bounded_incoming,
+            direction="incoming",
+            peers_by_id=peers_by_id,
+            files_by_id=files_by_id,
+        ),
+        outgoing_edges=_adapt_context_edges(
+            edges.bounded_outgoing,
+            direction="outgoing",
+            peers_by_id=peers_by_id,
+            files_by_id=files_by_id,
+        ),
+        file_siblings=[_adapt_compact_symbol(n) for n in hierarchy.direct_siblings[:edge_limit]],
     )
 
-    relationship_counts = _compute_relationship_counts(incoming_semantic, outgoing_semantic)
     context.reference_summary = build_reference_stats(conn, node_id)
     context.structural_summary = build_structural_summary(
         context,
-        total_structural_child_count=len(structural_children_nodes),
-        total_lexical_child_count=len(lexical_children_nodes),
-        total_incoming_count=len(incoming_semantic),
-        total_outgoing_count=len(outgoing_semantic),
-        total_sibling_count=len(direct_siblings),
-        relationship_counts=relationship_counts,
+        total_structural_child_count=len(hierarchy.structural_children),
+        total_lexical_child_count=len(hierarchy.lexical_children),
+        total_incoming_count=len(edges.incoming_semantic),
+        total_outgoing_count=len(edges.outgoing_semantic),
+        total_sibling_count=len(hierarchy.direct_siblings),
+        relationship_counts=_compute_relationship_counts(
+            edges.incoming_semantic, edges.outgoing_semantic
+        ),
     )
     context.freshness = build_freshness(
         context,
         focus_node,
         conn,
-        raw_edges=all_raw_edges,
+        raw_edges=edges.all_raw,
         file_record=focus_file,
     )
-    context.confidence = build_confidence(context, raw_edges=all_raw_edges)
+    context.confidence = build_confidence(context, raw_edges=edges.all_raw)
 
     return context

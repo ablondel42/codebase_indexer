@@ -1,10 +1,10 @@
 """Tests for LSP client, session pool, UTF-16 mapping, and reference enrichment (v0.2.0)."""
 
-from collections.abc import Iterator
 import json
 import os
-from pathlib import Path
 import sys
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -81,7 +81,8 @@ def _write_fake_lsp_server(path: Path, body: str) -> Path:
         "    return json.loads(sys.stdin.buffer.read(length).decode('utf-8'))\n"
         "def send_msg(obj):\n"
         "    data = json.dumps(obj).encode('utf-8')\n"
-        "    sys.stdout.buffer.write(f'Content-Length: {len(data)}\\r\\n\\r\\n'.encode('ascii') + data)\n"
+        "    hdr = f'Content-Length: {len(data)}\\r\\n\\r\\n'.encode('ascii')\n"
+        "    sys.stdout.buffer.write(hdr + data)\n"
         "    sys.stdout.buffer.flush()\n"
     )
     path.write_text(preamble + body, encoding="utf-8")
@@ -150,8 +151,14 @@ class TestResolverAndPosition:
     def test_query_position_preference_and_missing(self) -> None:
         sym = {
             "id": "sym:1",
-            "selection_range_json": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 8}},
-            "range_json": {"start": {"line": 1, "character": 0}, "end": {"line": 5, "character": 0}},
+            "selection_range_json": {
+                "start": {"line": 2, "character": 4},
+                "end": {"line": 2, "character": 8},
+            },
+            "range_json": {
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 5, "character": 0},
+            },
         }
         assert get_reference_query_position(sym) == {"line": 2, "character": 4}
         sym["selection_range_json"] = None
@@ -274,7 +281,10 @@ class TestReferenceEdgePersistenceAndStats:
             confidence=0.9,
             evidence_file_id=file_rec.id,
             evidence_uri=file_rec.uri,
-            evidence_range_json={"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 10}},
+            evidence_range_json={
+                "start": {"line": 2, "character": 4},
+                "end": {"line": 2, "character": 10},
+            },
             payload_json={"mapping_mode": "exact_symbol"},
         )
         refresh_meta = {
@@ -317,7 +327,7 @@ class TestPyrightLspClientSubprocessProtocol:
             client.start(tmp_path)
 
     def test_stderr_flood_and_server_request_id_collision_handling(self, tmp_path: Path) -> None:
-        """Handles >200 stderr lines without deadlock and dispatches colliding server request IDs."""
+        """Handles >200 stderr lines without deadlock and dispatches colliding server IDs."""
         log_file = tmp_path / "server_received.json"
         server_script = _write_fake_lsp_server(
             tmp_path / "fake_lsp.py",
@@ -337,7 +347,8 @@ while True:
                   "params": {{"items": [{{"section": "python"}}, {{"section": "pyright"}}]}}}} )
         reply1 = read_msg()
         received_replies.append(reply1)
-        send_msg({{"jsonrpc": "2.0", "id": 2, "method": "client/registerCapability", "params": {{}}}})
+        send_msg({{"jsonrpc": "2.0", "id": 2,
+                  "method": "client/registerCapability", "params": {{}}}})
         reply2 = read_msg()
         received_replies.append(reply2)
         send_msg({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"capabilities": {{}}}}}})

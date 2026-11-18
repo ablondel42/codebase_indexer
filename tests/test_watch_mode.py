@@ -1,10 +1,10 @@
 """Tests for watch mode event normalization, scheduler, deletion cleanup, and persistence."""
 
-from collections.abc import Iterator
 import json
-from pathlib import Path
 import threading
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -121,7 +121,9 @@ class TestEventNormalization:
 
         assert (
             normalize_event(
-                SimpleNamespace(event_type="modified", src_path=str(repo_root / ".." / "outside.py")),
+                SimpleNamespace(
+                    event_type="modified", src_path=str(repo_root / ".." / "outside.py")
+                ),
                 repo_root,
                 cfg,
             )
@@ -137,7 +139,9 @@ class TestEventNormalization:
         )
         assert (
             normalize_event(
-                SimpleNamespace(event_type="created", src_path=str(repo_root / "pkg.egg-info" / "a.py")),
+                SimpleNamespace(
+                    event_type="created", src_path=str(repo_root / "pkg.egg-info" / "a.py")
+                ),
                 repo_root,
                 cfg,
             )
@@ -145,7 +149,9 @@ class TestEventNormalization:
         )
         assert (
             normalize_event(
-                SimpleNamespace(event_type="created", src_path=str(repo_root / "tests" / "test_a.py")),
+                SimpleNamespace(
+                    event_type="created", src_path=str(repo_root / "tests" / "test_a.py")
+                ),
                 repo_root,
                 cfg,
             )
@@ -356,7 +362,7 @@ class TestIncrementalDeletionRollbackAndCustomDbPath:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """make_watch_connection_factory + _process_watch_batch persists to custom --db-path and emits JSON."""
+        """make_watch_connection_factory + _process_watch_batch persists to custom --db-path."""
         custom_db = tmp_path / "nested" / "custom_watch.db"
         repo_root = tmp_path / "watch_repo"
         repo_root.mkdir()

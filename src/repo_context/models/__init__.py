@@ -7,7 +7,6 @@ from repo_context.constants import (
     EDGE_KIND_INHERITS,
     EDGE_KIND_REFERENCES,
     EDGE_KIND_SCOPE_PARENT,
-    Language,
     SYMBOL_KIND_ASYNC_FUNCTION,
     SYMBOL_KIND_ASYNC_METHOD,
     SYMBOL_KIND_ATTRIBUTE,
@@ -22,6 +21,7 @@ from repo_context.constants import (
     VALID_EDGE_KINDS,
     VALID_SCOPES,
     VALID_SYMBOL_KINDS,
+    Language,
 )
 from repo_context.models.assessment import PlanAssessment
 from repo_context.models.common import (

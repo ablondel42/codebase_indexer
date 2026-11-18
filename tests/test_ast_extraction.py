@@ -1,8 +1,8 @@
 """AST extraction, hierarchy, UTF-8 range, assignment, call, and linker tests (v0.2.0)."""
 
 import ast
-from collections.abc import Iterator
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -16,7 +16,11 @@ from repo_context.parsing.ast_loader import load_file_text, parse_file
 from repo_context.parsing.linker import resolve_repo_edges
 from repo_context.parsing.pathing import derive_repo_id
 from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.ranges import make_declaration_lines, make_name_selection_range, make_range
+from repo_context.parsing.ranges import (
+    make_declaration_lines,
+    make_name_selection_range,
+    make_range,
+)
 from repo_context.parsing.scanner import build_file_record, build_repo_record, scan_repository
 from repo_context.storage import (
     close_connection,
@@ -325,7 +329,8 @@ def test_edge_json_is_single_encoded_in_sqlite(
     _persist_single_file(initialized_conn, FIXTURES_DIR / "simple_package", "services.py")
     rows = (
         initialized_conn.exec_driver_sql(
-            "SELECT payload_json, evidence_range_json FROM edges WHERE evidence_range_json IS NOT NULL"
+            "SELECT payload_json, evidence_range_json FROM edges "
+            "WHERE evidence_range_json IS NOT NULL"
         )
         .mappings()
         .all()
@@ -339,7 +344,7 @@ def test_edge_json_is_single_encoded_in_sqlite(
 
 
 def test_duplicate_names_and_generator_scope_boundary(tmp_path: Path) -> None:
-    """Duplicate same-scope declarations disambiguate cleanly; outer func isn't generator for inner yield."""
+    """Duplicate same-scope defs disambiguate; outer func isn't generator for inner yield."""
     local_root = FIXTURES_DIR / "nested_scope_case"
     repo_id = derive_repo_id(local_root)
     dup_rec = build_file_record(repo_id, local_root, local_root / "duplicate_names.py")

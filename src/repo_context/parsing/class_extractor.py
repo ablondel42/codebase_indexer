@@ -4,15 +4,15 @@ import ast
 import hashlib
 import json
 from collections.abc import Sequence
-from typing import Optional
+from dataclasses import dataclass
 
 import repo_context.parsing.callable_extractor
 from repo_context.constants import EDGE_KIND_CONTAINS
 from repo_context.models.file import FileRecord
 from repo_context.parsing.docstrings import get_doc_summary
+from repo_context.parsing.extraction_context import ExtractionContext, ScopeTarget
 from repo_context.parsing.hashing import compute_symbol_content_hash
 from repo_context.parsing.naming import (
-    DuplicateTracker,
     build_class_qualified_name,
     build_nested_qualified_name,
     cap_signature,
@@ -24,228 +24,209 @@ from repo_context.parsing.ranges import (
     make_name_selection_range,
     make_range,
 )
-from repo_context.parsing.scope_tracker import ScopeTracker
+
+
+@dataclass(frozen=True)
+class _ClassPlacement:
+    """Resolved structural and lexical placement for a class node."""
+
+    parent_id: str | None
+    lexical_parent_id: str | None
+    qualified_name: str
+    scope: str
 
 
 def _build_class_signature(class_name: str, base_names: list[str]) -> str:
     """Build compact single-line class signature capped at 240 chars."""
-    if base_names:
-        raw = f"class {class_name}({', '.join(base_names)})"
-    else:
-        raw = f"class {class_name}"
+    raw = f"class {class_name}({', '.join(base_names)})" if base_names else f"class {class_name}"
     return cap_signature(raw)
 
 
-def extract_class_nodes(
-    repo_id: str,
-    file_record: FileRecord,
-    module_node_id: str,
-    module_path: str,
-    tree: ast.Module,
-    scope_tracker: ScopeTracker,
-    duplicate_tracker: DuplicateTracker,
-    parent_id: Optional[str] = None,
-    parent_qualified_name: Optional[str] = None,
-    file_text: str = "",
-    *,
-    lines: Sequence[str] | None = None,
+def _resolve_class_placement(
+    ctx: ExtractionContext,
+    class_name: str,
+    module_node_id: str | None,
+    target: ScopeTarget | None,
+) -> _ClassPlacement:
+    """Resolve parent IDs, scope, and qualified name for an ``ast.ClassDef``."""
+    current_scope = ctx.scope_tracker.get_current_scope()
+    enclosing_id = ctx.scope_tracker.get_lexical_parent_id()
+    explicit_parent = target.parent_id if target is not None else None
+    fallback_parent = module_node_id if current_scope == "module" else enclosing_id
+    actual_parent_id = explicit_parent if explicit_parent is not None else fallback_parent
+    lexical_parent_id = enclosing_id if current_scope not in ("module", "class") else None
+
+    if not ctx.scope_tracker.is_empty():
+        qualified_name = build_nested_qualified_name(
+            ctx.module_path, ctx.scope_tracker.get_lexical_chain(), class_name
+        )
+    elif target is not None and target.parent_qualified_name:
+        qualified_name = f"{target.parent_qualified_name}.{class_name}"
+    else:
+        qualified_name = build_class_qualified_name(ctx.module_path, class_name)
+
+    return _ClassPlacement(
+        parent_id=actual_parent_id,
+        lexical_parent_id=lexical_parent_id,
+        qualified_name=qualified_name,
+        scope=current_scope,
+    )
+
+
+def _collect_direct_contains_edges(
+    ctx: ExtractionContext,
+    class_node_id: str,
+    candidates: Sequence[dict],
+) -> list[dict]:
+    """Create direct ``contains`` edges for children whose ``parent_id`` is ``class_node_id``."""
+    return [
+        _make_direct_contains_edge(ctx.repo_id, class_node_id, child, ctx.file_record)
+        for child in candidates
+        if child.get("parent_id") == class_node_id
+    ]
+
+
+def _extract_class_children(
+    ctx: ExtractionContext,
+    class_target: ScopeTarget,
+    class_node: ast.ClassDef,
+    module_node_id: str | None,
 ) -> tuple[list[dict], list[dict]]:
-    """Extract class nodes (including nested classes and methods) from AST.
-
-    Args:
-        repo_id: Repository ID.
-        file_record: File record for the source module.
-        module_node_id: Module symbol node ID.
-        module_path: Module dotted path.
-        tree: AST container whose ``body`` contains ``ast.ClassDef`` nodes.
-        scope_tracker: Scope tracker for lexical nesting.
-        duplicate_tracker: Duplicate tracker for symbol ID disambiguation.
-        parent_id: Optional explicit structural parent ID.
-        parent_qualified_name: Optional parent qualified name fallback.
-        file_text: Full source text (used when ``lines`` is not provided).
-        lines: Optional pre-split source lines.
-
-    Returns:
-        Tuple of ``(nodes list, direct contains edges list)``.
-    """
-    file_lines = lines if lines is not None else (file_text.splitlines() if file_text else None)
-    nodes: list[dict] = []
+    """Extract direct methods, nested classes, and their descendants from a class body."""
+    extract_callable_nodes = repo_context.parsing.callable_extractor.extract_callable_nodes
+    child_nodes: list[dict] = []
     contains_edges: list[dict] = []
 
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
+    with ctx.scope_tracker.scope_context(class_target.parent_id, class_node.name, "class"):
+        for stmt in class_node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                extracted = extract_callable_nodes(ctx, class_target, [stmt])
+                child_nodes.extend(extracted)
+                contains_edges.extend(
+                    _collect_direct_contains_edges(ctx, class_target.parent_id, extracted)
+                )
+            elif isinstance(stmt, ast.ClassDef):
+                nested_nodes, nested_edges = extract_class_nodes(
+                    ctx,
+                    ast.Module(body=[stmt], type_ignores=[]),
+                    module_node_id=module_node_id,
+                    target=class_target,
+                )
+                child_nodes.extend(nested_nodes)
+                contains_edges.extend(
+                    _collect_direct_contains_edges(ctx, class_target.parent_id, nested_nodes)
+                )
+                contains_edges.extend(nested_edges)
 
-        class_name = node.name
-        current_scope = scope_tracker.get_current_scope()
-        enclosing_id = scope_tracker.get_lexical_parent_id()
+    return child_nodes, contains_edges
 
-        if current_scope == "module":
-            actual_parent_id = parent_id if parent_id is not None else module_node_id
-            lexical_parent_id: str | None = None
-        elif current_scope == "class":
-            actual_parent_id = parent_id if parent_id is not None else enclosing_id
-            lexical_parent_id = None
-        else:
-            actual_parent_id = parent_id if parent_id is not None else enclosing_id
-            lexical_parent_id = enclosing_id
 
-        if not scope_tracker.is_empty():
-            qualified_name = build_nested_qualified_name(
-                module_path, scope_tracker.get_lexical_chain(), class_name
-            )
-        elif parent_qualified_name is not None:
-            qualified_name = f"{parent_qualified_name}.{class_name}"
-        else:
-            qualified_name = build_class_qualified_name(module_path, class_name)
+def _build_class_node_dict(
+    ctx: ExtractionContext,
+    node: ast.ClassDef,
+    node_id: str,
+    placement: _ClassPlacement,
+    child_nodes: Sequence[dict],
+) -> dict:
+    """Build the symbol dictionary for a class node including direct ``method_ids``."""
+    base_names = [safe_unparse(base) for base in node.bases]
+    decorators = [safe_unparse(decorator) for decorator in node.decorator_list]
+    start_line, end_line = make_declaration_lines(node)
+    method_ids = [
+        child["id"]
+        for child in child_nodes
+        if child.get("parent_id") == node_id and child["kind"] in ("method", "async_method")
+    ]
 
-        node_id = duplicate_tracker.get_symbol_id(repo_id, "class", qualified_name)
-
-        base_names = [safe_unparse(base) for base in node.bases]
-        decorators = [safe_unparse(decorator) for decorator in node.decorator_list]
-        visibility_hint = compute_visibility_hint(class_name, current_scope)
-        start_line, end_line = make_declaration_lines(node)
-        range_json = make_range(node, lines=file_lines)
-        selection_range_json = make_name_selection_range(node, lines=file_lines)
-        signature = _build_class_signature(class_name, base_names)
-        content_hash = compute_symbol_content_hash(node, file_lines, start_line, end_line)
-
-        class_node_dict = {
-            "id": node_id,
-            "repo_id": repo_id,
-            "file_id": file_record.id,
-            "language": "python",
-            "kind": "class",
-            "name": class_name,
-            "qualified_name": qualified_name,
-            "uri": file_record.uri,
-            "range_json": range_json,
-            "selection_range_json": selection_range_json,
-            "start_line": start_line,
-            "end_line": end_line,
-            "signature": signature,
-            "parent_id": actual_parent_id,
-            "visibility_hint": visibility_hint,
-            "doc_summary": get_doc_summary(node),
-            "content_hash": content_hash,
-            "semantic_hash": _compute_class_semantic_hash(qualified_name, base_names, decorators),
-            "source": "python-ast",
-            "confidence": 1.0,
-            "scope": current_scope,
-            "lexical_parent_id": lexical_parent_id,
-            "payload_json": json.dumps(
-                {
-                    "base_names": base_names,
-                    "decorators": decorators,
-                    "method_ids": [],
-                },
-                sort_keys=True,
-            ),
-            "last_indexed_at": file_record.last_indexed_at,
-        }
-        nodes.append(class_node_dict)
-
-        child_nodes, child_contains_edges = _extract_class_children(
-            repo_id=repo_id,
-            file_record=file_record,
-            module_node_id=module_node_id,
-            class_node_id=node_id,
-            class_qualified_name=qualified_name,
-            class_node=node,
-            scope_tracker=scope_tracker,
-            duplicate_tracker=duplicate_tracker,
-            module_path=module_path,
-            file_text=file_text,
-            lines=file_lines,
-        )
-        nodes.extend(child_nodes)
-        contains_edges.extend(child_contains_edges)
-
-        # Keep method_ids strictly scoped to direct method children of this class.
-        method_ids = [
-            child["id"]
-            for child in child_nodes
-            if child.get("parent_id") == node_id and child["kind"] in ("method", "async_method")
-        ]
-        class_node_dict["payload_json"] = json.dumps(
+    return {
+        "id": node_id,
+        "repo_id": ctx.repo_id,
+        "file_id": ctx.file_record.id,
+        "language": "python",
+        "kind": "class",
+        "name": node.name,
+        "qualified_name": placement.qualified_name,
+        "uri": ctx.file_record.uri,
+        "range_json": make_range(node, lines=ctx.lines),
+        "selection_range_json": make_name_selection_range(node, lines=ctx.lines),
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": _build_class_signature(node.name, base_names),
+        "parent_id": placement.parent_id,
+        "visibility_hint": compute_visibility_hint(node.name, placement.scope),
+        "doc_summary": get_doc_summary(node),
+        "content_hash": compute_symbol_content_hash(node, ctx.lines, start_line, end_line),
+        "semantic_hash": _compute_class_semantic_hash(
+            placement.qualified_name, base_names, decorators
+        ),
+        "source": "python-ast",
+        "confidence": 1.0,
+        "scope": placement.scope,
+        "lexical_parent_id": placement.lexical_parent_id,
+        "payload_json": json.dumps(
             {
                 "base_names": base_names,
                 "decorators": decorators,
                 "method_ids": method_ids,
             },
             sort_keys=True,
-        )
+        ),
+        "last_indexed_at": ctx.file_record.last_indexed_at,
+    }
 
-    return nodes, contains_edges
 
-
-def _extract_class_children(
-    repo_id: str,
-    file_record: FileRecord,
-    module_node_id: str,
-    class_node_id: str,
-    class_qualified_name: str,
-    class_node: ast.ClassDef,
-    scope_tracker: ScopeTracker,
-    duplicate_tracker: DuplicateTracker,
-    module_path: str,
-    file_text: str,
-    lines: Sequence[str] | None,
+def _build_single_class_and_children(
+    ctx: ExtractionContext,
+    node: ast.ClassDef,
+    module_node_id: str | None,
+    target: ScopeTarget | None,
 ) -> tuple[list[dict], list[dict]]:
-    """Extract direct methods, nested classes, and their descendants from a class body."""
-    extract_callable_nodes = repo_context.parsing.callable_extractor.extract_callable_nodes
+    """Extract one class node and all of its nested declarations."""
+    placement = _resolve_class_placement(ctx, node.name, module_node_id, target)
+    node_id = ctx.duplicate_tracker.get_symbol_id(ctx.repo_id, "class", placement.qualified_name)
+    class_target = ScopeTarget(
+        parent_id=node_id,
+        parent_qualified_name=placement.qualified_name,
+        scope="class",
+    )
+    child_nodes, child_contains_edges = _extract_class_children(
+        ctx, class_target, node, module_node_id
+    )
+    class_node_dict = _build_class_node_dict(ctx, node, node_id, placement, child_nodes)
+    return [class_node_dict, *child_nodes], child_contains_edges
 
-    child_nodes: list[dict] = []
+
+def extract_class_nodes(
+    ctx: ExtractionContext,
+    tree: ast.Module,
+    *,
+    module_node_id: str | None = None,
+    target: ScopeTarget | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Extract class nodes (including nested classes and methods) from AST.
+
+    Args:
+        ctx: Shared per-file extraction context.
+        tree: AST container whose ``body`` contains ``ast.ClassDef`` nodes.
+        module_node_id: Optional module symbol node ID for top-level classes.
+        target: Optional explicit structural target for nested/local classes.
+
+    Returns:
+        Tuple of ``(nodes list, direct contains edges list)``.
+    """
+    nodes: list[dict] = []
     contains_edges: list[dict] = []
 
-    with scope_tracker.scope_context(class_node_id, class_node.name, "class"):
-        for stmt in class_node.body:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                extracted = extract_callable_nodes(
-                    repo_id=repo_id,
-                    file_record=file_record,
-                    parent_id=class_node_id,
-                    parent_qualified_name=class_qualified_name,
-                    nodes=[stmt],
-                    scope_tracker=scope_tracker,
-                    duplicate_tracker=duplicate_tracker,
-                    module_path=module_path,
-                    file_text=file_text,
-                    lines=lines,
-                )
-                child_nodes.extend(extracted)
-                for extracted_node in extracted:
-                    if extracted_node.get("parent_id") == class_node_id:
-                        contains_edges.append(
-                            _make_direct_contains_edge(
-                                repo_id, class_node_id, extracted_node, file_record
-                            )
-                        )
-            elif isinstance(stmt, ast.ClassDef):
-                nested_nodes, nested_edges = extract_class_nodes(
-                    repo_id=repo_id,
-                    file_record=file_record,
-                    module_node_id=module_node_id,
-                    module_path=module_path,
-                    tree=ast.Module(body=[stmt], type_ignores=[]),
-                    scope_tracker=scope_tracker,
-                    duplicate_tracker=duplicate_tracker,
-                    parent_id=class_node_id,
-                    parent_qualified_name=class_qualified_name,
-                    file_text=file_text,
-                    lines=lines,
-                )
-                child_nodes.extend(nested_nodes)
-                for nested_node in nested_nodes:
-                    if nested_node.get("parent_id") == class_node_id:
-                        contains_edges.append(
-                            _make_direct_contains_edge(
-                                repo_id, class_node_id, nested_node, file_record
-                            )
-                        )
-                contains_edges.extend(nested_edges)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        cls_nodes, cls_edges = _build_single_class_and_children(
+            ctx, node, module_node_id, target
+        )
+        nodes.extend(cls_nodes)
+        contains_edges.extend(cls_edges)
 
-    return child_nodes, contains_edges
+    return nodes, contains_edges
 
 
 def _make_direct_contains_edge(
@@ -285,7 +266,7 @@ def _compute_class_semantic_hash(
     """Compute a semantic hash for a class node."""
     hash_obj = hashlib.sha256()
     hash_obj.update(b"kind:class")
-    hash_obj.update(f"qualified_name:{qualified_name}".encode("utf-8"))
-    hash_obj.update(f"bases:{base_names}".encode("utf-8"))
-    hash_obj.update(f"decorators:{decorators}".encode("utf-8"))
+    hash_obj.update(f"qualified_name:{qualified_name}".encode())
+    hash_obj.update(f"bases:{base_names}".encode())
+    hash_obj.update(f"decorators:{decorators}".encode())
     return f"sha256:{hash_obj.hexdigest()}"

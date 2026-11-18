@@ -1,8 +1,8 @@
 """Unit tests for grouped ``rc`` CLI argument parsing, error handling, and missing-DB safety."""
 
-from collections.abc import Iterator
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -10,9 +10,9 @@ from sqlalchemy import select
 
 import repo_context.logging_config as logging_config
 from repo_context.cli.main import build_parser, main
+from repo_context.config import AppConfig
 from repo_context.parsing.pipeline import extract_file_graph
 from repo_context.parsing.scanner import scan_repository
-from repo_context.config import AppConfig
 from repo_context.storage import (
     close_connection,
     get_connection,

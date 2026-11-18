@@ -312,5 +312,5 @@ class TestRepoRecordModelBehavior:
             default_language=Language.PYTHON,
             created_at="2026-01-01T00:00:00Z",
         )
-        with pytest.raises(Exception):  # Pydantic raises ValidationError or similar
-            repo.id = "repo:new"  # type: ignore[misc]
+        with pytest.raises(PydanticValidationError):
+            repo.id = "repo:new"

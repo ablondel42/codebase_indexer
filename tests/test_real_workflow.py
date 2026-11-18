@@ -3,10 +3,10 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -71,7 +71,7 @@ def copied_workflow_repo(tmp_path: Path) -> Path:
 
 
 def test_python_api_end_to_end_workflow(copied_workflow_repo: Path, tmp_path: Path) -> None:
-    """Full Python pipeline: scan -> extract -> link -> outline -> source -> context -> risk -> MCP."""
+    """Full Python pipeline: scan -> extract -> link -> outline -> source -> context -> MCP."""
     repo_root = copied_workflow_repo / "cross_file_refs"
     db_path = tmp_path / "workflow.db"
     cfg = AppConfig()
@@ -138,7 +138,7 @@ def test_cli_end_to_end_incremental_edit_and_prune_workflow(
     copied_workflow_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """Full CLI lifecycle on copied fixtures: index -> edit -> stale -> reindex -> delete -> prune."""
+    """Full CLI lifecycle on copied fixtures: index -> edit -> stale -> reindex -> prune."""
     repo_root = copied_workflow_repo / "simple_module"
     db_path = tmp_path / "cli_workflow.db"
 

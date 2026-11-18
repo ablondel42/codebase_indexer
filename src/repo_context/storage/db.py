@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-import sqlite3
-from typing import Any, Iterator
+from typing import Any
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Connection, Engine

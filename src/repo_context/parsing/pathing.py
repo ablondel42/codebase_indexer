@@ -31,6 +31,79 @@ def normalize_repo_root(path: str | Path) -> Path:
     return resolved
 
 
+def _find_base_for_parts(
+    raw_root: Path,
+    resolved_root: Path,
+    candidate_path: Path,
+) -> Path | None:
+    """Find the root prefix matching ``candidate_path`` for intermediate symlink checks."""
+    if candidate_path.is_relative_to(resolved_root):
+        return resolved_root
+    if candidate_path.is_relative_to(raw_root):
+        return raw_root
+    for parent in reversed(candidate_path.parents):
+        try:
+            if parent.resolve() == resolved_root:
+                return parent
+        except OSError:
+            continue
+    return None
+
+
+def _reject_intermediate_symlinks(
+    base_for_parts: Path,
+    candidate_path: Path,
+    resolved_root: Path,
+) -> None:
+    """Reject intermediate symlink components below ``base_for_parts``."""
+    current = base_for_parts
+    for part in candidate_path.relative_to(base_for_parts).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        if current.is_symlink():
+            raise PathSecurityError(
+                f"Symlink path component rejected: {current}",
+                context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
+            )
+
+
+def _resolve_and_verify_regular_file(candidate_path: Path, resolved_root: Path) -> Path:
+    """Resolve ``candidate_path`` and verify containment and regular-file mode."""
+    try:
+        resolved_candidate = candidate_path.resolve()
+    except OSError as exc:
+        raise PathSecurityError(
+            f"Cannot resolve candidate path: {candidate_path}",
+            context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
+        ) from exc
+
+    if not resolved_candidate.is_relative_to(resolved_root):
+        raise PathSecurityError(
+            f"Path escapes repository root: {resolved_candidate}",
+            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
+        )
+
+    try:
+        st = resolved_candidate.stat()
+    except OSError as exc:
+        raise PathSecurityError(
+            f"Repository file is not accessible: {resolved_candidate}",
+            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
+        ) from exc
+
+    if not stat.S_ISREG(st.st_mode):
+        raise PathSecurityError(
+            f"Repository path is not a regular file: {resolved_candidate}",
+            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
+        )
+
+    return resolved_candidate
+
+
 def ensure_safe_repo_file(repo_root: Path, candidate: Path | str) -> Path:
     """Validate that a candidate file safely resides inside ``repo_root``.
 
@@ -62,64 +135,11 @@ def ensure_safe_repo_file(repo_root: Path, candidate: Path | str) -> Path:
 
     # Reject intermediate symlink components below repo_root without flagging
     # system-level symlinks above repo_root (e.g. /tmp -> /private/tmp on macOS).
-    base_for_parts: Path | None = None
-    if candidate_path.is_relative_to(resolved_root):
-        base_for_parts = resolved_root
-    elif candidate_path.is_relative_to(raw_root):
-        base_for_parts = raw_root
-    else:
-        for parent in reversed(candidate_path.parents):
-            try:
-                if parent.resolve() == resolved_root:
-                    base_for_parts = parent
-                    break
-            except OSError:
-                continue
-
+    base_for_parts = _find_base_for_parts(raw_root, resolved_root, candidate_path)
     if base_for_parts is not None:
-        current = base_for_parts
-        for part in candidate_path.relative_to(base_for_parts).parts:
-            if part in ("", "."):
-                continue
-            if part == "..":
-                current = current.parent
-                continue
-            current = current / part
-            if current.is_symlink():
-                raise PathSecurityError(
-                    f"Symlink path component rejected: {current}",
-                    context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
-                )
+        _reject_intermediate_symlinks(base_for_parts, candidate_path, resolved_root)
 
-    try:
-        resolved_candidate = candidate_path.resolve()
-    except OSError as exc:
-        raise PathSecurityError(
-            f"Cannot resolve candidate path: {candidate_path}",
-            context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
-        ) from exc
-
-    if not resolved_candidate.is_relative_to(resolved_root):
-        raise PathSecurityError(
-            f"Path escapes repository root: {resolved_candidate}",
-            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
-        )
-
-    try:
-        st = resolved_candidate.stat()
-    except OSError as exc:
-        raise PathSecurityError(
-            f"Repository file is not accessible: {resolved_candidate}",
-            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
-        ) from exc
-
-    if not stat.S_ISREG(st.st_mode):
-        raise PathSecurityError(
-            f"Repository path is not a regular file: {resolved_candidate}",
-            context={"repo_root": str(resolved_root), "resolved": str(resolved_candidate)},
-        )
-
-    return resolved_candidate
+    return _resolve_and_verify_regular_file(candidate_path, resolved_root)
 
 
 def derive_repo_id(repo_root: Path) -> str:

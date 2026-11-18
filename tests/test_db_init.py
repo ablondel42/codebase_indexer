@@ -1,14 +1,16 @@
 """SQLite schema v2 initialization, read-only guards, and connection lifecycle tests."""
 
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
-import sqlite3
 
 import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import (
     DatabaseError as SADatabaseError,
+)
+from sqlalchemy.exc import (
     IntegrityError,
     OperationalError,
 )
@@ -234,18 +236,17 @@ def test_connection_scope_commits_and_rolls_back(temp_db_path: Path) -> None:
             )
         )
 
-    with pytest.raises(RuntimeError, match="boom"):
-        with connection_scope(temp_db_path) as conn:
-            conn.execute(
-                insert(repos_table).values(
-                    id="repo:fail",
-                    root_path="/tmp/fail",
-                    name="fail",
-                    default_language="python",
-                    created_at="2026-01-01T00:00:00Z",
-                )
+    with pytest.raises(RuntimeError, match="boom"), connection_scope(temp_db_path) as conn:
+        conn.execute(
+            insert(repos_table).values(
+                id="repo:fail",
+                root_path="/tmp/fail",
+                name="fail",
+                default_language="python",
+                created_at="2026-01-01T00:00:00Z",
             )
-            raise RuntimeError("boom")
+        )
+        raise RuntimeError("boom")
 
     with connection_scope(temp_db_path, read_only=True) as conn:
         ids = set(conn.execute(select(repos_table.c.id)).scalars())

@@ -285,7 +285,7 @@ def get_referencing_modules_for_target(
     *,
     kinds: Sequence[str] | None = None,
 ) -> list[str]:
-    """Return distinct referencing ``files.module_path`` values for edges targeting ``target_id``."""
+    """Return distinct referencing ``files.module_path`` values for ``target_id``."""
     resolved_kinds = _normalize_kinds(kinds, (EDGE_KIND_REFERENCES,))
     if not resolved_kinds:
         return []

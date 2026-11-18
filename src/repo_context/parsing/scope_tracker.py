@@ -1,38 +1,44 @@
 """Scope tracker for lexical scope during AST traversal."""
 
-from typing import Optional
+from typing import Any
 
 
 class ScopeContext:
     """Context manager for scope tracking.
-    
+
     Ensures the scope stack remains balanced even if an exception occurs
     during extraction.
-    
+
     Usage:
         with scope_tracker.scope_context(symbol_id, name, scope):
             # extraction logic
             pass
     """
-    
-    def __init__(self, tracker: 'ScopeTracker', symbol_id: str, name: str, scope: str):
+
+    def __init__(
+        self,
+        tracker: "ScopeTracker",
+        symbol_id: str,
+        name: str,
+        scope: str,
+    ) -> None:
         self.tracker = tracker
         self.symbol_id = symbol_id
         self.name = name
         self.scope = scope
-    
-    def __enter__(self) -> 'ScopeTracker':
+
+    def __enter__(self) -> "ScopeTracker":
         self.tracker.push_declaration(self.symbol_id, self.name, self.scope)
         return self.tracker
-    
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.tracker.pop_declaration()
         # Don't suppress exceptions
 
 
 class ScopeTracker:
     """Track lexical scope during AST traversal.
-    
+
     Maintains a stack of declarations to provide:
     - Current scope kind
     - Immediate lexical parent ID
@@ -45,7 +51,7 @@ class ScopeTracker:
 
     def push_declaration(self, symbol_id: str, name: str, scope: str) -> None:
         """Push a declaration onto the scope stack.
-        
+
         Args:
             symbol_id: The symbol's stable ID.
             name: The declaration's simple name.
@@ -64,7 +70,7 @@ class ScopeTracker:
 
     def get_current_scope(self) -> str:
         """Get the current scope kind.
-        
+
         Returns:
             The current scope ("module", "function", or "class").
             Returns "module" if the stack is empty.
@@ -73,9 +79,9 @@ class ScopeTracker:
             return "module"
         return self._stack[-1]["scope"]
 
-    def get_lexical_parent_id(self) -> Optional[str]:
+    def get_lexical_parent_id(self) -> str | None:
         """Get the immediate lexical parent symbol ID.
-        
+
         Returns:
             The parent symbol ID, or None if at module level.
         """
@@ -85,7 +91,7 @@ class ScopeTracker:
 
     def get_lexical_chain(self) -> list[str]:
         """Get the full lexical declaration chain.
-        
+
         Returns:
             List of declaration names from outermost to innermost.
         """
@@ -93,7 +99,7 @@ class ScopeTracker:
 
     def get_lexical_chain_ids(self) -> list[str]:
         """Get the full lexical declaration chain of symbol IDs.
-        
+
         Returns:
             List of symbol IDs from outermost to innermost.
         """
@@ -101,7 +107,7 @@ class ScopeTracker:
 
     def is_empty(self) -> bool:
         """Check if the scope stack is empty.
-        
+
         Returns:
             True if no declarations are on the stack.
         """
@@ -109,20 +115,20 @@ class ScopeTracker:
 
     def depth(self) -> int:
         """Get the current depth of the scope stack.
-        
+
         Returns:
             Number of declarations on the stack.
         """
         return len(self._stack)
-    
+
     def scope_context(self, symbol_id: str, name: str, scope: str) -> ScopeContext:
         """Create a context manager for scope tracking.
-        
+
         Args:
             symbol_id: The symbol's stable ID.
             name: The declaration's simple name.
             scope: The scope kind ("module", "function", or "class").
-            
+
         Returns:
             ScopeContext instance for use with 'with' statement.
         """

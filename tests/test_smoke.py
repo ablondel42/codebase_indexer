@@ -1,9 +1,10 @@
 """Smoke tests for v0.2.0 package imports, configuration, and grouped CLI help."""
 
+import importlib
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import repo_context
 from repo_context.config import AppConfig, get_config
@@ -61,14 +62,9 @@ def test_import_config() -> None:
 
 def test_import_models_and_packages() -> None:
     """Core packages and models import without optional runtime extras."""
-    import repo_context.cli
-    import repo_context.context
-    import repo_context.graph
-    import repo_context.indexing
-    import repo_context.lsp
-    import repo_context.mcp
-    import repo_context.parsing
-    import repo_context.storage
+    cli_pkg = importlib.import_module("repo_context.cli")
+    indexing_pkg = importlib.import_module("repo_context.indexing")
+    mcp_pkg = importlib.import_module("repo_context.mcp")
 
     assert Position is not None
     assert Range is not None
@@ -81,9 +77,9 @@ def test_import_models_and_packages() -> None:
     assert RepoContextError is not None
     assert callable(to_json)
     assert callable(from_json)
-    assert repo_context.cli is not None
-    assert repo_context.mcp is not None
-    assert repo_context.indexing is not None
+    assert cli_pkg is not None
+    assert mcp_pkg is not None
+    assert indexing_pkg is not None
 
 
 def test_cli_module_help_and_version() -> None:

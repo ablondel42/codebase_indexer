@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, Unpack
 
 from sqlalchemy import delete, select
 from sqlalchemy.engine import Connection
@@ -37,17 +38,22 @@ CONFIDENCE_EXACT = 0.9
 CONFIDENCE_MODULE = 0.7
 
 
+class _ReferenceEdgeEvidence(TypedDict):
+    evidence_file_id: str
+    evidence_uri: str
+    evidence_range_json: dict[str, Any]
+    payload_json: dict[str, Any]
+
+
 def build_reference_edge(
     repo_id: str,
     from_id: str,
     to_id: str,
     confidence: float,
-    evidence_file_id: str,
-    evidence_uri: str,
-    evidence_range_json: dict[str, Any],
-    payload_json: dict[str, Any],
+    **evidence: Unpack[_ReferenceEdgeEvidence],
 ) -> dict[str, Any]:
     """Build a references edge dict."""
+    evidence_range_json = evidence["evidence_range_json"]
     start = evidence_range_json["start"]
     edge_id = f"edge:{repo_id}:references:{from_id}->{to_id}:{start['line']}:{start['character']}"
     return {
@@ -58,11 +64,11 @@ def build_reference_edge(
         "to_id": to_id,
         "source": "lsp",
         "confidence": confidence,
-        "evidence_file_id": evidence_file_id,
-        "evidence_uri": evidence_uri,
+        "evidence_file_id": evidence["evidence_file_id"],
+        "evidence_uri": evidence["evidence_uri"],
         "evidence_range_json": evidence_range_json,
-        "payload_json": payload_json,
-        "last_indexed_at": datetime.now(timezone.utc).isoformat(),
+        "payload_json": evidence["payload_json"],
+        "last_indexed_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -189,16 +195,39 @@ def _load_file_lines_for_mapping(
     return lines
 
 
-def enrich_references_for_symbol(
-    conn: Connection,
-    lsp_client: Any,
-    target_symbol: dict[str, Any],
-    *,
-    open_all_files: bool = False,
-) -> dict[str, Any]:
-    """Enrich references for a single target symbol."""
-    cfg = get_config()
+@dataclass(frozen=True)
+class _TargetDocument:
+    """Validated target file metadata and UTF-16 query position for LSP references."""
 
+    repo_root_path: Path
+    target_file_path: Path
+    target_uri: str
+    target_text: str
+    target_lines: list[str]
+    query_position: dict[str, int]
+
+
+@dataclass
+class _ReferenceMappingState:
+    """Per-enrichment caches and deduplication state for mapping LSP locations to edges."""
+
+    conn: Connection
+    repo_id: str
+    repo_root_path: Path
+    max_bytes: int
+    target_symbol: dict[str, Any]
+    file_lines_cache: dict[str, list[str] | None]
+    seen: set[tuple[str, str, str, int, int]] = field(default_factory=set)
+    file_by_uri_cache: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    symbols_by_file_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+
+def _prepare_target_document(
+    conn: Connection,
+    target_symbol: dict[str, Any],
+    max_bytes: int,
+) -> _TargetDocument:
+    """Validate target symbol path, read target text, and compute UTF-16 query position."""
     position = get_reference_query_position(target_symbol)
     repo_root_path = _resolve_repo_root(conn, target_symbol)
     raw_file_path = target_symbol.get("file_path")
@@ -215,128 +244,186 @@ def enrich_references_for_symbol(
     except OSError as exc:
         raise LspError(f"Target file is missing or inaccessible: {candidate_path}") from exc
 
-    target_text = _read_safe_repo_text(target_file_path, cfg.max_file_size_bytes)
+    target_text = _read_safe_repo_text(target_file_path, max_bytes)
     target_lines = target_text.splitlines()
-    query_position = position_codepoint_to_utf16(target_lines, position)
+    return _TargetDocument(
+        repo_root_path=repo_root_path,
+        target_file_path=target_file_path,
+        target_uri=target_symbol.get("uri") or target_file_path.as_uri(),
+        target_text=target_text,
+        target_lines=target_lines,
+        query_position=position_codepoint_to_utf16(target_lines, position),
+    )
 
-    lsp_client.start(str(repo_root_path))
-    target_uri = target_symbol.get("uri") or target_file_path.as_uri()
-    _send_did_open(lsp_client, target_uri, target_text)
 
-    if open_all_files:
-        rows = (
-            conn.execute(
-                select(files_table.c.file_path, files_table.c.uri).where(
-                    files_table.c.repo_id == target_symbol["repo_id"],
-                    files_table.c.file_path.like("%.py"),
-                )
+def _open_auxiliary_python_files(
+    conn: Connection,
+    lsp_client: Any,
+    repo_id: str,
+    target_doc: _TargetDocument,
+    max_bytes: int,
+) -> None:
+    """Open all indexed Python files in the workspace other than the target file."""
+    rows = (
+        conn.execute(
+            select(files_table.c.file_path, files_table.c.uri).where(
+                files_table.c.repo_id == repo_id,
+                files_table.c.file_path.like("%.py"),
             )
-            .mappings()
-            .all()
         )
-        for row in rows:
-            rel_path = row["file_path"]
-            uri = row["uri"]
-            try:
-                safe_aux_path = ensure_safe_repo_file(repo_root_path, repo_root_path / rel_path)
-                if safe_aux_path == target_file_path:
-                    continue
-                aux_text = _read_safe_repo_text(safe_aux_path, cfg.max_file_size_bytes)
-                _send_did_open(lsp_client, uri, aux_text)
-            except (PathSecurityError, LspError, OSError) as exc:
-                logger.debug("Skipping auxiliary file %s during didOpen: %s", rel_path, exc)
+        .mappings()
+        .all()
+    )
+    for row in rows:
+        rel_path = row["file_path"]
+        try:
+            safe_aux = ensure_safe_repo_file(
+                target_doc.repo_root_path, target_doc.repo_root_path / rel_path
+            )
+            if safe_aux == target_doc.target_file_path:
+                continue
+            aux_text = _read_safe_repo_text(safe_aux, max_bytes)
+            _send_did_open(lsp_client, row["uri"], aux_text)
+        except (PathSecurityError, LspError, OSError) as exc:
+            logger.debug("Skipping auxiliary file %s during didOpen: %s", rel_path, exc)
+
+
+def _resolve_cached_file_symbols(
+    loc_uri: str,
+    state: _ReferenceMappingState,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Resolve and cache indexed file row and its symbols for ``loc_uri``."""
+    if loc_uri not in state.file_by_uri_cache:
+        state.file_by_uri_cache[loc_uri] = resolve_file_by_uri(
+            state.conn, loc_uri, repo_id=state.repo_id
+        )
+    file_row = state.file_by_uri_cache[loc_uri]
+    if not file_row:
+        return None
+
+    file_id = file_row["id"]
+    if file_id not in state.symbols_by_file_cache:
+        state.symbols_by_file_cache[file_id] = load_symbols_for_file(state.conn, file_id)
+    return file_row, state.symbols_by_file_cache[file_id]
+
+
+def _pick_source_symbol(
+    symbols: list[dict[str, Any]],
+    usage_range: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str, float]:
+    """Select smallest containing symbol or module fallback with confidence score."""
+    source_symbol = pick_smallest_containing_symbol(symbols, usage_range)
+    if source_symbol is not None:
+        return source_symbol, "exact_symbol", CONFIDENCE_EXACT
+    return find_module_node_for_file(symbols), "module_fallback", CONFIDENCE_MODULE
+
+
+def _map_location_to_edge(
+    loc: Any,
+    state: _ReferenceMappingState,
+) -> dict[str, Any] | None:
+    """Map one raw LSP reference location to a deduplicated reference edge dict."""
+    normalized = normalize_location(loc)
+    loc_uri = normalized["uri"]
+    if not loc_uri:
+        return None
+
+    resolved = _resolve_cached_file_symbols(loc_uri, state)
+    if resolved is None:
+        return None
+    file_row, symbols = resolved
+
+    usage_range = normalized["range"]
+    lines = _load_file_lines_for_mapping(
+        state.repo_root_path, file_row, state.max_bytes, state.file_lines_cache
+    )
+    if lines is not None:
+        usage_range = range_utf16_to_codepoint(lines, usage_range)
+
+    source_symbol, mapping_mode, confidence = _pick_source_symbol(symbols, usage_range)
+    if source_symbol is None:
+        return None
+
+    dedupe_key = (
+        state.target_symbol["id"],
+        source_symbol["id"],
+        loc_uri,
+        usage_range["start"]["line"],
+        usage_range["start"]["character"],
+    )
+    if dedupe_key in state.seen:
+        return None
+    state.seen.add(dedupe_key)
+
+    return build_reference_edge(
+        repo_id=state.repo_id,
+        from_id=source_symbol["id"],
+        to_id=state.target_symbol["id"],
+        confidence=confidence,
+        evidence_file_id=file_row["id"],
+        evidence_uri=loc_uri,
+        evidence_range_json=usage_range,
+        payload_json={
+            "mapping_mode": mapping_mode,
+            "target_symbol_kind": state.target_symbol["kind"],
+            "source_symbol_kind": source_symbol["kind"],
+            "source_symbol_scope": source_symbol.get("scope"),
+        },
+    )
+
+
+def enrich_references_for_symbol(
+    conn: Connection,
+    lsp_client: Any,
+    target_symbol: dict[str, Any],
+    *,
+    open_all_files: bool = False,
+) -> dict[str, Any]:
+    """Enrich references for a single target symbol."""
+    cfg = get_config()
+    target_doc = _prepare_target_document(conn, target_symbol, cfg.max_file_size_bytes)
+
+    lsp_client.start(str(target_doc.repo_root_path))
+    _send_did_open(lsp_client, target_doc.target_uri, target_doc.target_text)
+    if open_all_files:
+        _open_auxiliary_python_files(
+            conn,
+            lsp_client,
+            target_symbol["repo_id"],
+            target_doc,
+            cfg.max_file_size_bytes,
+        )
 
     locations = (
         lsp_client.find_references(
-            target_uri,
-            query_position["line"],
-            query_position["character"],
+            target_doc.target_uri,
+            target_doc.query_position["line"],
+            target_doc.query_position["character"],
             include_declaration=False,
         )
         or []
     )
 
-    edges: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, int, int]] = set()
-    file_by_uri_cache: dict[str, dict[str, Any] | None] = {}
-    symbols_by_file_cache: dict[str, list[dict[str, Any]]] = {}
-    file_lines_cache: dict[str, list[str] | None] = {target_symbol["file_id"]: target_lines}
-    repo_id = target_symbol["repo_id"]
-
-    for loc in locations:
-        normalized = normalize_location(loc)
-        loc_uri = normalized["uri"]
-        if not loc_uri:
-            continue
-
-        if loc_uri not in file_by_uri_cache:
-            file_by_uri_cache[loc_uri] = resolve_file_by_uri(conn, loc_uri, repo_id=repo_id)
-        file_row = file_by_uri_cache[loc_uri]
-        if not file_row:
-            continue
-
-        file_id = file_row["id"]
-        if file_id not in symbols_by_file_cache:
-            symbols_by_file_cache[file_id] = load_symbols_for_file(conn, file_id)
-        symbols = symbols_by_file_cache[file_id]
-
-        usage_range = normalized["range"]
-        lines = _load_file_lines_for_mapping(
-            repo_root_path,
-            file_row,
-            cfg.max_file_size_bytes,
-            file_lines_cache,
-        )
-        if lines is not None:
-            usage_range = range_utf16_to_codepoint(lines, usage_range)
-
-        source_symbol = pick_smallest_containing_symbol(symbols, usage_range)
-        mapping_mode = "exact_symbol"
-        confidence = CONFIDENCE_EXACT
-
-        if source_symbol is None:
-            source_symbol = find_module_node_for_file(symbols)
-            mapping_mode = "module_fallback"
-            confidence = CONFIDENCE_MODULE
-
-        if source_symbol is None:
-            continue
-
-        dedupe_key = (
-            target_symbol["id"],
-            source_symbol["id"],
-            loc_uri,
-            usage_range["start"]["line"],
-            usage_range["start"]["character"],
-        )
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-
-        edge = build_reference_edge(
-            repo_id=repo_id,
-            from_id=source_symbol["id"],
-            to_id=target_symbol["id"],
-            confidence=confidence,
-            evidence_file_id=file_id,
-            evidence_uri=loc_uri,
-            evidence_range_json=usage_range,
-            payload_json={
-                "mapping_mode": mapping_mode,
-                "target_symbol_kind": target_symbol["kind"],
-                "source_symbol_kind": source_symbol["kind"],
-                "source_symbol_scope": source_symbol.get("scope"),
-            },
-        )
-        edges.append(edge)
+    state = _ReferenceMappingState(
+        conn=conn,
+        repo_id=target_symbol["repo_id"],
+        repo_root_path=target_doc.repo_root_path,
+        max_bytes=cfg.max_file_size_bytes,
+        target_symbol=target_symbol,
+        file_lines_cache={target_symbol["file_id"]: target_doc.target_lines},
+    )
+    edges = [
+        edge
+        for loc in locations
+        if (edge := _map_location_to_edge(loc, state)) is not None
+    ]
 
     refresh_metadata = {
         "target_symbol_id": target_symbol["id"],
         "available": True,
-        "last_refreshed_at": datetime.now(timezone.utc).isoformat(),
+        "last_refreshed_at": datetime.now(UTC).isoformat(),
         "refresh_status": "ok",
         "error_code": None,
     }
-
     replace_reference_edges_for_target(conn, target_symbol["id"], edges, refresh_metadata)
     return build_reference_stats(conn, target_symbol["id"])

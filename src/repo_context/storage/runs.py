@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
 import uuid
+from datetime import UTC, datetime
+from typing import Any, TypedDict, Unpack
 
 from sqlalchemy import insert, literal_column, select, update
 from sqlalchemy.engine import Connection
 
 from repo_context.storage.schema import index_runs_table
+
+
+class IndexRunFinishMetrics(TypedDict, total=False):
+    """Optional completion counters and metadata for an indexing run."""
+
+    files_scanned: int
+    nodes_extracted: int
+    edges_extracted: int
+    error_message: str | None
+    completed_at: str | None
 
 
 def record_index_run_start(
@@ -22,7 +32,7 @@ def record_index_run_start(
 ) -> str:
     """Record the start of an indexing run and return its ``run_id``."""
     resolved_id = run_id or f"run:{uuid.uuid4().hex[:12]}"
-    resolved_started_at = started_at or datetime.now(timezone.utc).isoformat()
+    resolved_started_at = started_at or datetime.now(UTC).isoformat()
     conn.execute(
         insert(index_runs_table).values(
             id=resolved_id,
@@ -44,25 +54,20 @@ def record_index_run_finish(
     conn: Connection,
     run_id: str,
     status: str,
-    *,
-    files_scanned: int = 0,
-    nodes_extracted: int = 0,
-    edges_extracted: int = 0,
-    error_message: str | None = None,
-    completed_at: str | None = None,
+    **metrics: Unpack[IndexRunFinishMetrics],
 ) -> None:
     """Update an existing indexing run with completion status and counters."""
-    resolved_completed_at = completed_at or datetime.now(timezone.utc).isoformat()
+    resolved_completed_at = metrics.get("completed_at") or datetime.now(UTC).isoformat()
     conn.execute(
         update(index_runs_table)
         .where(index_runs_table.c.id == run_id)
         .values(
             completed_at=resolved_completed_at,
             status=status,
-            files_scanned=files_scanned,
-            nodes_extracted=nodes_extracted,
-            edges_extracted=edges_extracted,
-            error_message=error_message,
+            files_scanned=metrics.get("files_scanned", 0),
+            nodes_extracted=metrics.get("nodes_extracted", 0),
+            edges_extracted=metrics.get("edges_extracted", 0),
+            error_message=metrics.get("error_message"),
         )
     )
 

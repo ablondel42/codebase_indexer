@@ -3,15 +3,14 @@
 import ast
 import hashlib
 import json
-import typing
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import repo_context.parsing.class_extractor
-from repo_context.models.file import FileRecord
 from repo_context.parsing.docstrings import get_doc_summary
+from repo_context.parsing.extraction_context import ExtractionContext, ScopeTarget
 from repo_context.parsing.hashing import compute_symbol_content_hash
 from repo_context.parsing.naming import (
-    DuplicateTracker,
     build_callable_qualified_name,
     build_nested_qualified_name,
     cap_signature,
@@ -23,7 +22,6 @@ from repo_context.parsing.ranges import (
     make_name_selection_range,
     make_range,
 )
-from repo_context.parsing.scope_tracker import ScopeTracker
 
 _NESTED_SCOPE_BOUNDARY_NODES = (
     ast.FunctionDef,
@@ -31,6 +29,24 @@ _NESTED_SCOPE_BOUNDARY_NODES = (
     ast.ClassDef,
     ast.Lambda,
 )
+
+_CALLABLE_KIND_BY_SCOPE: dict[tuple[str, bool], str] = {
+    ("module", False): "function",
+    ("module", True): "async_function",
+    ("class", False): "method",
+    ("class", True): "async_method",
+}
+
+
+@dataclass(frozen=True)
+class _CallablePlacement:
+    """Resolved structural and lexical placement for a callable node."""
+
+    kind: str
+    parent_id: str
+    lexical_parent_id: str | None
+    qualified_name: str
+    scope: str
 
 
 def _format_single_param(param: dict) -> str:
@@ -91,194 +107,167 @@ def _build_callable_signature(
     return cap_signature(f"{prefix}{callable_name}({', '.join(parts)}){ret_part}")
 
 
-def extract_callable_nodes(
-    repo_id: str,
-    file_record: FileRecord,
-    parent_id: str,
-    parent_qualified_name: str,
-    nodes: "typing.Sequence[ast.AST]",
-    scope_tracker: ScopeTracker,
-    duplicate_tracker: DuplicateTracker,
-    module_path: str,
-    file_text: str = "",
-    *,
-    lines: Sequence[str] | None = None,
-) -> list[dict]:
-    """Extract callable nodes from function/method definitions with nested scope support.
+def _resolve_callable_placement(
+    ctx: ExtractionContext,
+    target: ScopeTarget,
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> _CallablePlacement:
+    """Resolve kind, parent IDs, and qualified name for a callable AST node."""
+    is_async = isinstance(node, ast.AsyncFunctionDef)
+    current_scope = ctx.scope_tracker.get_current_scope()
+    enclosing_id = ctx.scope_tracker.get_lexical_parent_id()
 
-    Args:
-        repo_id: Repository ID.
-        file_record: File record for the source module.
-        parent_id: Enclosing structural parent node ID.
-        parent_qualified_name: Parent qualified name fallback when tracker is empty.
-        nodes: Sequence of AST nodes to process.
-        scope_tracker: Scope tracker for lexical nesting.
-        duplicate_tracker: Duplicate tracker for symbol ID disambiguation.
-        module_path: Module dotted path.
-        file_text: Full file text (used when ``lines`` is not provided).
-        lines: Optional pre-split source lines.
+    kind = _CALLABLE_KIND_BY_SCOPE.get(
+        (current_scope, is_async),
+        "local_async_function" if is_async else "local_function",
+    )
+    actual_parent_id = (
+        target.parent_id
+        if current_scope == "module" or enclosing_id is None
+        else enclosing_id
+    )
+    lexical_parent_id = enclosing_id if current_scope not in ("module", "class") else None
 
-    Returns:
-        List of callable and nested declaration node dictionaries.
-    """
-    file_lines = lines if lines is not None else (file_text.splitlines() if file_text else None)
-    extracted: list[dict] = []
-
-    for node in nodes:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-
-        callable_name = node.name
-        is_async = isinstance(node, ast.AsyncFunctionDef)
-        current_scope = scope_tracker.get_current_scope()
-        enclosing_id = scope_tracker.get_lexical_parent_id()
-
-        if current_scope == "module":
-            kind = "async_function" if is_async else "function"
-            actual_parent_id = parent_id
-            lexical_parent_id: str | None = None
-        elif current_scope == "class":
-            kind = "async_method" if is_async else "method"
-            actual_parent_id = enclosing_id if enclosing_id is not None else parent_id
-            lexical_parent_id = None
-        else:
-            kind = "local_async_function" if is_async else "local_function"
-            actual_parent_id = enclosing_id if enclosing_id is not None else parent_id
-            lexical_parent_id = enclosing_id
-
-        if scope_tracker.is_empty():
-            qualified_name = build_callable_qualified_name(parent_qualified_name, callable_name)
-        else:
-            qualified_name = build_nested_qualified_name(
-                module_path, scope_tracker.get_lexical_chain(), callable_name
-            )
-
-        node_id = duplicate_tracker.get_symbol_id(repo_id, kind, qualified_name)
-
-        decorators = [safe_unparse(decorator) for decorator in node.decorator_list]
-        parameters = extract_parameters(node.args)
-        return_annotation = safe_unparse(node.returns) if node.returns is not None else None
-        is_generator = _is_generator(node)
-        visibility_hint = compute_visibility_hint(callable_name, current_scope)
-        start_line, end_line = make_declaration_lines(node)
-        range_json = make_range(node, lines=file_lines)
-        selection_range_json = make_name_selection_range(node, lines=file_lines)
-        signature = _build_callable_signature(
-            callable_name, parameters, return_annotation, is_async
-        )
-        content_hash = compute_symbol_content_hash(node, file_lines, start_line, end_line)
-        semantic_hash = _compute_callable_semantic_hash(
-            qualified_name, kind, parameters, return_annotation, decorators, is_async
+    if ctx.scope_tracker.is_empty():
+        qualified_name = build_callable_qualified_name(target.parent_qualified_name, node.name)
+    else:
+        qualified_name = build_nested_qualified_name(
+            ctx.module_path, ctx.scope_tracker.get_lexical_chain(), node.name
         )
 
-        extracted.append(
-            {
-                "id": node_id,
-                "repo_id": repo_id,
-                "file_id": file_record.id,
-                "language": "python",
-                "kind": kind,
-                "name": callable_name,
-                "qualified_name": qualified_name,
-                "uri": file_record.uri,
-                "range_json": range_json,
-                "selection_range_json": selection_range_json,
-                "start_line": start_line,
-                "end_line": end_line,
-                "signature": signature,
-                "parent_id": actual_parent_id,
-                "visibility_hint": visibility_hint,
-                "doc_summary": get_doc_summary(node),
-                "content_hash": content_hash,
-                "semantic_hash": semantic_hash,
-                "source": "python-ast",
-                "confidence": 1.0,
-                "scope": current_scope,
-                "lexical_parent_id": lexical_parent_id,
-                "payload_json": json.dumps(
-                    {
-                        "parameters": parameters,
-                        "return_annotation": return_annotation,
-                        "decorators": decorators,
-                        "is_async": is_async,
-                        "is_method": current_scope == "class",
-                        "is_generator": is_generator,
-                    },
-                    sort_keys=True,
-                ),
-                "last_indexed_at": file_record.last_indexed_at,
-            }
-        )
+    return _CallablePlacement(
+        kind=kind,
+        parent_id=actual_parent_id,
+        lexical_parent_id=lexical_parent_id,
+        qualified_name=qualified_name,
+        scope=current_scope,
+    )
 
-        nested_nodes = _extract_nested_declarations(
-            repo_id=repo_id,
-            file_record=file_record,
-            func_node_id=node_id,
-            func_qualified_name=qualified_name,
-            func_node=node,
-            scope_tracker=scope_tracker,
-            duplicate_tracker=duplicate_tracker,
-            module_path=module_path,
-            file_text=file_text,
-            lines=file_lines,
-        )
-        extracted.extend(nested_nodes)
 
-    return extracted
+def _build_callable_metadata(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    qualified_name: str,
+    kind: str,
+    current_scope: str,
+) -> tuple[str, str, str]:
+    """Compute ``(signature, semantic_hash, payload_json)`` for a callable node."""
+    is_async = isinstance(node, ast.AsyncFunctionDef)
+    decorators = [safe_unparse(decorator) for decorator in node.decorator_list]
+    parameters = extract_parameters(node.args)
+    return_annotation = safe_unparse(node.returns) if node.returns is not None else None
+    signature = _build_callable_signature(node.name, parameters, return_annotation, is_async)
+    semantic_hash = _compute_callable_semantic_hash(
+        qualified_name, kind, parameters, return_annotation, decorators, is_async
+    )
+    payload_json = json.dumps(
+        {
+            "parameters": parameters,
+            "return_annotation": return_annotation,
+            "decorators": decorators,
+            "is_async": is_async,
+            "is_method": current_scope == "class",
+            "is_generator": _is_generator(node),
+        },
+        sort_keys=True,
+    )
+    return signature, semantic_hash, payload_json
+
+
+def _build_callable_node(
+    ctx: ExtractionContext,
+    target: ScopeTarget,
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict:
+    """Build a single callable symbol dictionary."""
+    placement = _resolve_callable_placement(ctx, target, node)
+    node_id = ctx.duplicate_tracker.get_symbol_id(
+        ctx.repo_id, placement.kind, placement.qualified_name
+    )
+    start_line, end_line = make_declaration_lines(node)
+    signature, semantic_hash, payload_json = _build_callable_metadata(
+        node, placement.qualified_name, placement.kind, placement.scope
+    )
+
+    return {
+        "id": node_id,
+        "repo_id": ctx.repo_id,
+        "file_id": ctx.file_record.id,
+        "language": "python",
+        "kind": placement.kind,
+        "name": node.name,
+        "qualified_name": placement.qualified_name,
+        "uri": ctx.file_record.uri,
+        "range_json": make_range(node, lines=ctx.lines),
+        "selection_range_json": make_name_selection_range(node, lines=ctx.lines),
+        "start_line": start_line,
+        "end_line": end_line,
+        "signature": signature,
+        "parent_id": placement.parent_id,
+        "visibility_hint": compute_visibility_hint(node.name, placement.scope),
+        "doc_summary": get_doc_summary(node),
+        "content_hash": compute_symbol_content_hash(node, ctx.lines, start_line, end_line),
+        "semantic_hash": semantic_hash,
+        "source": "python-ast",
+        "confidence": 1.0,
+        "scope": placement.scope,
+        "lexical_parent_id": placement.lexical_parent_id,
+        "payload_json": payload_json,
+        "last_indexed_at": ctx.file_record.last_indexed_at,
+    }
 
 
 def _extract_nested_declarations(
-    repo_id: str,
-    file_record: FileRecord,
-    func_node_id: str,
-    func_qualified_name: str,
+    ctx: ExtractionContext,
+    func_target: ScopeTarget,
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    scope_tracker: ScopeTracker,
-    duplicate_tracker: DuplicateTracker,
-    module_path: str,
-    file_text: str,
-    lines: Sequence[str] | None,
 ) -> list[dict]:
     """Extract nested functions and local classes directly within a function body."""
     extract_class_nodes = repo_context.parsing.class_extractor.extract_class_nodes
-
     nested: list[dict] = []
-    func_name = getattr(func_node, "name", "<unknown>")
 
-    with scope_tracker.scope_context(func_node_id, func_name, "function"):
+    with ctx.scope_tracker.scope_context(func_target.parent_id, func_node.name, "function"):
         for stmt in func_node.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                nested.extend(
-                    extract_callable_nodes(
-                        repo_id=repo_id,
-                        file_record=file_record,
-                        parent_id=func_node_id,
-                        parent_qualified_name=func_qualified_name,
-                        nodes=[stmt],
-                        scope_tracker=scope_tracker,
-                        duplicate_tracker=duplicate_tracker,
-                        module_path=module_path,
-                        file_text=file_text,
-                        lines=lines,
-                    )
-                )
+                nested.extend(extract_callable_nodes(ctx, func_target, [stmt]))
             elif isinstance(stmt, ast.ClassDef):
                 nested_class_nodes, _ = extract_class_nodes(
-                    repo_id=repo_id,
-                    file_record=file_record,
-                    module_node_id=func_node_id,
-                    module_path=module_path,
-                    tree=ast.Module(body=[stmt], type_ignores=[]),
-                    scope_tracker=scope_tracker,
-                    duplicate_tracker=duplicate_tracker,
-                    parent_id=func_node_id,
-                    parent_qualified_name=func_qualified_name,
-                    file_text=file_text,
-                    lines=lines,
+                    ctx,
+                    ast.Module(body=[stmt], type_ignores=[]),
+                    target=func_target,
                 )
                 nested.extend(nested_class_nodes)
 
     return nested
+
+
+def extract_callable_nodes(
+    ctx: ExtractionContext,
+    target: ScopeTarget,
+    nodes: Sequence[ast.AST],
+) -> list[dict]:
+    """Extract callable nodes from function/method definitions with nested scope support.
+
+    Args:
+        ctx: Shared per-file extraction context.
+        target: Enclosing structural target metadata.
+        nodes: Sequence of AST nodes to process.
+
+    Returns:
+        List of callable and nested declaration node dictionaries.
+    """
+    extracted: list[dict] = []
+    for node in nodes:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        callable_dict = _build_callable_node(ctx, target, node)
+        extracted.append(callable_dict)
+        func_target = ScopeTarget(
+            parent_id=callable_dict["id"],
+            parent_qualified_name=callable_dict["qualified_name"],
+            scope="function",
+        )
+        extracted.extend(_extract_nested_declarations(ctx, func_target, node))
+    return extracted
 
 
 def _build_param_dict(
@@ -357,16 +346,16 @@ def _compute_callable_semantic_hash(
 ) -> str:
     """Compute semantic hash preserving parameter order, annotations, and defaults."""
     hash_obj = hashlib.sha256()
-    hash_obj.update(f"kind:{kind}".encode("utf-8"))
-    hash_obj.update(f"qualified_name:{qualified_name}".encode("utf-8"))
-    hash_obj.update(f"is_async:{is_async}".encode("utf-8"))
+    hash_obj.update(f"kind:{kind}".encode())
+    hash_obj.update(f"qualified_name:{qualified_name}".encode())
+    hash_obj.update(f"is_async:{is_async}".encode())
 
     param_data = [
         (p["name"], p["kind"], p.get("annotation"), p.get("default_value_hint"))
         for p in parameters
     ]
-    hash_obj.update(f"parameters:{param_data}".encode("utf-8"))
-    hash_obj.update(f"return:{return_annotation}".encode("utf-8"))
-    hash_obj.update(f"decorators:{decorators}".encode("utf-8"))
+    hash_obj.update(f"parameters:{param_data}".encode())
+    hash_obj.update(f"return:{return_annotation}".encode())
+    hash_obj.update(f"decorators:{decorators}".encode())
 
     return f"sha256:{hash_obj.hexdigest()}"

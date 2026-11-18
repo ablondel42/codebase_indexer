@@ -1,7 +1,7 @@
 """Tests for path manipulation, ID derivation, and repository security utilities."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 

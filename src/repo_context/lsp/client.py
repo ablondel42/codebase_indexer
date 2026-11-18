@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import hashlib
 import json
 import shutil
@@ -99,6 +100,91 @@ class PyrightLspClient:
         """Return a snapshot of recent stderr lines drained from the server."""
         return list(self._stderr_lines)
 
+    def _reset_session_state(self) -> None:
+        """Reset per-session counters, caches, and tracking containers before spawn."""
+        self._closing = False
+        self._started = False
+        self._reader_error = None
+        self._next_id = 1
+        self._pending.clear()
+        self._stderr_lines.clear()
+        self._document_versions.clear()
+        self._document_hashes.clear()
+
+    def _spawn_server_process(self) -> None:
+        """Validate server executable, launch subprocess, and start stdio reader threads."""
+        if not self.server_cmd:
+            raise LspError("LSP server command cannot be empty.")
+
+        executable = self.server_cmd[0]
+        if shutil.which(executable) is None:
+            raise LspError(
+                f"LSP server executable '{executable}' not found in PATH.",
+                context={"executable": executable},
+            )
+
+        try:
+            self.proc = subprocess.Popen(
+                self.server_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            self.proc = None
+            raise LspError(
+                f"Failed to launch LSP server '{executable}': {exc}",
+                context={"server_cmd": self.server_cmd},
+            ) from exc
+
+        if self.proc.stdin is None or self.proc.stdout is None or self.proc.stderr is None:
+            self._cleanup_process(send_shutdown=False)
+            raise LspError("LSP server pipes were not created.")
+
+        self._stdout_thread = threading.Thread(
+            target=self._stdout_loop,
+            args=(self.proc.stdout,),
+            name="pyright-lsp-stdout",
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._stderr_loop,
+            args=(self.proc.stderr,),
+            name="pyright-lsp-stderr",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _initialize_workspace(self, repo_root: str | Path) -> None:
+        """Perform LSP initialize handshake for ``repo_root`` or clean up on failure."""
+        resolved_root = Path(repo_root).resolve()
+        root_uri = resolved_root.as_uri()
+        try:
+            self._send_request(
+                "initialize",
+                {
+                    "processId": None,
+                    "rootUri": root_uri,
+                    "capabilities": {},
+                    "workspaceFolders": [
+                        {
+                            "name": resolved_root.name or "workspace",
+                            "uri": root_uri,
+                        }
+                    ],
+                },
+                timeout=self.timeout,
+            )
+            self.notify("initialized", {})
+            self._repo_root = resolved_root
+            self._started = True
+        except Exception as exc:
+            self._cleanup_process(send_shutdown=False)
+            if isinstance(exc, LspError):
+                raise
+            raise LspError(f"LSP initialize failed: {exc}") from exc
+
     def start(self, repo_root: str | Path) -> None:
         """Start the LSP server subprocess and complete initialization."""
         with self._lifecycle_lock:
@@ -106,85 +192,9 @@ class PyrightLspClient:
                 return
             if self.proc is not None:
                 self._cleanup_process(send_shutdown=False)
-
-            if not self.server_cmd:
-                raise LspError("LSP server command cannot be empty.")
-
-            executable = self.server_cmd[0]
-            if shutil.which(executable) is None:
-                raise LspError(
-                    f"LSP server executable '{executable}' not found in PATH.",
-                    context={"executable": executable},
-                )
-
-            self._closing = False
-            self._started = False
-            self._reader_error = None
-            self._next_id = 1
-            self._pending.clear()
-            self._stderr_lines.clear()
-            self._document_versions.clear()
-            self._document_hashes.clear()
-
-            try:
-                self.proc = subprocess.Popen(
-                    self.server_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except OSError as exc:
-                self.proc = None
-                raise LspError(
-                    f"Failed to launch LSP server '{executable}': {exc}",
-                    context={"server_cmd": self.server_cmd},
-                ) from exc
-
-            if self.proc.stdin is None or self.proc.stdout is None or self.proc.stderr is None:
-                self._cleanup_process(send_shutdown=False)
-                raise LspError("LSP server pipes were not created.")
-
-            self._stdout_thread = threading.Thread(
-                target=self._stdout_loop,
-                args=(self.proc.stdout,),
-                name="pyright-lsp-stdout",
-                daemon=True,
-            )
-            self._stderr_thread = threading.Thread(
-                target=self._stderr_loop,
-                args=(self.proc.stderr,),
-                name="pyright-lsp-stderr",
-                daemon=True,
-            )
-            self._stdout_thread.start()
-            self._stderr_thread.start()
-
-            resolved_root = Path(repo_root).resolve()
-            root_uri = resolved_root.as_uri()
-            try:
-                self._send_request(
-                    "initialize",
-                    {
-                        "processId": None,
-                        "rootUri": root_uri,
-                        "capabilities": {},
-                        "workspaceFolders": [
-                            {
-                                "name": resolved_root.name or "workspace",
-                                "uri": root_uri,
-                            }
-                        ],
-                    },
-                    timeout=self.timeout,
-                )
-                self.notify("initialized", {})
-                self._repo_root = resolved_root
-                self._started = True
-            except Exception as exc:
-                self._cleanup_process(send_shutdown=False)
-                if isinstance(exc, LspError):
-                    raise
-                raise LspError(f"LSP initialize failed: {exc}") from exc
+            self._reset_session_state()
+            self._spawn_server_process()
+            self._initialize_workspace(repo_root)
 
     def _stderr_loop(self, stderr: IO[bytes]) -> None:
         """Drain stderr continuously into a bounded deque to prevent pipe stalls."""
@@ -291,8 +301,22 @@ class PyrightLspClient:
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def _read_message(self, stdout: IO[bytes]) -> dict[str, Any]:
-        """Read and validate one framed JSON-RPC message from stdout."""
+    @staticmethod
+    def _parse_header_line(stripped: bytes) -> tuple[str, str]:
+        """Decode and validate one ASCII ``Key: Value`` LSP header line."""
+        try:
+            decoded = stripped.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise LspError(f"Non-ASCII LSP header line: {exc}") from exc
+
+        if ":" not in decoded:
+            raise LspError(f"Malformed LSP header line: {decoded!r}")
+
+        key, value = decoded.split(":", 1)
+        return key.strip().lower(), value.strip()
+
+    def _read_headers(self, stdout: IO[bytes]) -> dict[str, str]:
+        """Read LSP message headers up to the blank delimiter within ``MAX_HEADER_BYTES``."""
         total_header_bytes = 0
         headers: dict[str, str] = {}
 
@@ -311,24 +335,15 @@ class PyrightLspClient:
             if total_header_bytes > MAX_HEADER_BYTES:
                 raise LspError(f"LSP header block exceeded {MAX_HEADER_BYTES} bytes.")
 
-            if line in (b"\r\n", b"\n"):
-                break
-
             stripped = line.rstrip(b"\r\n")
             if not stripped:
-                break
+                return headers
 
-            try:
-                decoded = stripped.decode("ascii")
-            except UnicodeDecodeError as exc:
-                raise LspError(f"Non-ASCII LSP header line: {exc}") from exc
+            key, value = self._parse_header_line(stripped)
+            headers[key] = value
 
-            if ":" not in decoded:
-                raise LspError(f"Malformed LSP header line: {decoded!r}")
-
-            key, value = decoded.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-
+    def _parse_content_length(self, headers: dict[str, str]) -> int:
+        """Extract and validate bounded positive ``Content-Length`` from LSP headers."""
         raw_length = headers.get("content-length")
         if raw_length is None:
             raise LspError("Missing Content-Length header in LSP message.")
@@ -347,7 +362,12 @@ class PyrightLspClient:
                 f"({self.max_payload_bytes}).",
                 context={"content_length": content_length, "limit": self.max_payload_bytes},
             )
+        return content_length
 
+    def _read_message(self, stdout: IO[bytes]) -> dict[str, Any]:
+        """Read and validate one framed JSON-RPC message from stdout."""
+        headers = self._read_headers(stdout)
+        content_length = self._parse_content_length(headers)
         body = self._read_exact(stdout, content_length)
         try:
             message = json.loads(body.decode("utf-8"))
@@ -522,6 +542,44 @@ class PyrightLspClient:
             timeout=timeout,
         )
 
+    def _send_graceful_shutdown(self, proc: subprocess.Popen[bytes]) -> None:
+        """Send best-effort LSP shutdown request and exit notification when healthy."""
+        if proc.poll() is not None or self._reader_error is not None:
+            return
+        with contextlib.suppress(Exception):
+            self._send_request("shutdown", {}, timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        with contextlib.suppress(Exception):
+            self.notify("exit", {})
+
+    @staticmethod
+    def _terminate_and_reap_proc(proc: subprocess.Popen[bytes]) -> None:
+        """Close stdin, terminate subprocess, and force-kill if wait times out."""
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+
+        try:
+            proc.wait(timeout=TERMINATE_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            proc.wait()
+
+    def _join_threads_and_close_pipes(self, proc: subprocess.Popen[bytes]) -> None:
+        """Join reader daemon threads briefly and close stdout/stderr pipes."""
+        for thread in (self._stdout_thread, self._stderr_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
+
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
+
     def _cleanup_process(self, *, send_shutdown: bool) -> None:
         """Terminate and reap the LSP subprocess without leaking pipes or zombies."""
         proc = self.proc
@@ -530,50 +588,13 @@ class PyrightLspClient:
             self._closing = False
             return
 
-        if send_shutdown and proc.poll() is None and self._reader_error is None:
-            try:
-                self._send_request("shutdown", {}, timeout=SHUTDOWN_TIMEOUT_SECONDS)
-            except Exception:
-                pass
-            try:
-                self.notify("exit", {})
-            except Exception:
-                pass
+        if send_shutdown:
+            self._send_graceful_shutdown(proc)
 
         self._closing = True
         self._fail_all_pending(LspError("LSP client closed."))
-
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-
-        try:
-            proc.wait(timeout=TERMINATE_WAIT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            proc.wait()
-
-        for thread in (self._stdout_thread, self._stderr_thread):
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=1.0)
-
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        self._terminate_and_reap_proc(proc)
+        self._join_threads_and_close_pipes(proc)
 
         self.proc = None
         self._started = False
@@ -647,10 +668,8 @@ class LspSessionPool:
                 return slot.client
 
             if slot.client is not None:
-                try:
+                with contextlib.suppress(Exception):
                     slot.client.close()
-                except Exception:
-                    pass
                 slot.client = None
                 slot.opened_uris.clear()
 
@@ -678,7 +697,8 @@ class LspSessionPool:
                 size_bytes = safe_path.stat().st_size
                 if size_bytes > cfg.max_file_size_bytes:
                     raise LspError(
-                        f"File {safe_path} ({size_bytes} bytes) exceeds max_file_size_bytes ({cfg.max_file_size_bytes})."
+                        f"File {safe_path} ({size_bytes} bytes) exceeds "
+                        f"max_file_size_bytes ({cfg.max_file_size_bytes})."
                     )
                 text = safe_path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
@@ -700,10 +720,8 @@ class LspSessionPool:
                 slot.opened_uris.add(uri)
                 return client
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     client.close()
-                except Exception:
-                    pass
                 slot.client = None
                 slot.opened_uris.clear()
                 raise
@@ -723,6 +741,20 @@ class LspSessionPool:
                     slot.client = None
                     slot.opened_uris.clear()
 
+    @staticmethod
+    def _close_slot(slot: _SessionSlot) -> None:
+        """Close and clear a single session slot safely."""
+        with slot.lock:
+            if slot.client is None:
+                return
+            try:
+                slot.client.close()
+            except Exception as exc:
+                logger.debug("Ignoring error closing pooled LSP client: %s", exc)
+            finally:
+                slot.client = None
+                slot.opened_uris.clear()
+
     def close_all(self) -> None:
         """Close and evict all cached LSP sessions."""
         with self._pool_lock:
@@ -730,15 +762,7 @@ class LspSessionPool:
             self._slots.clear()
 
         for slot in slots:
-            with slot.lock:
-                if slot.client is not None:
-                    try:
-                        slot.client.close()
-                    except Exception as exc:
-                        logger.debug("Ignoring error closing pooled LSP client: %s", exc)
-                    finally:
-                        slot.client = None
-                        slot.opened_uris.clear()
+            self._close_slot(slot)
 
     def __enter__(self) -> LspSessionPool:
         """Context manager entry."""

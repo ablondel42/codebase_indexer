@@ -358,6 +358,34 @@ def list_file_import_edges(conn: Connection, file_id: str) -> list[dict[str, Any
     return [row_to_edge(row) for row in conn.execute(stmt).mappings().all()]
 
 
+def _resolve_freshness_inputs(
+    conn: Connection | None,
+    file_id: str,
+    file_record: dict[str, Any] | None,
+    repo_root: str | Path | None,
+) -> tuple[dict[str, Any] | None, Path | None, str | None]:
+    """Resolve indexed file record and repository root directory for freshness check."""
+    record = file_record
+    if record is None and conn is not None:
+        record = get_file_by_id(conn, file_id)
+    if record is None:
+        return None, None, "file_record_missing"
+
+    raw_root = repo_root
+    if raw_root is None and conn is not None:
+        raw_root = conn.execute(
+            select(repos_table.c.root_path).where(repos_table.c.id == record["repo_id"]).limit(1)
+        ).scalar_one_or_none()
+    if not raw_root:
+        return None, None, "repo_record_missing"
+
+    root_path = Path(raw_root)
+    if not root_path.is_dir():
+        return None, None, "repo_root_missing"
+
+    return record, root_path, None
+
+
 def check_file_disk_freshness(
     conn: Connection | None,
     file_id: str,
@@ -366,37 +394,22 @@ def check_file_disk_freshness(
     repo_root: str | Path | None = None,
 ) -> tuple[bool, str | None]:
     """Verify indexed file freshness against disk existence, confinement, and SHA-256 hash."""
-    record = file_record
-    if record is None and conn is not None:
-        record = get_file_by_id(conn, file_id)
-    if record is None:
-        return False, "file_record_missing"
-
-    raw_root = repo_root
-    if raw_root is None and conn is not None:
-        raw_root = conn.execute(
-            select(repos_table.c.root_path).where(repos_table.c.id == record["repo_id"]).limit(1)
-        ).scalar_one_or_none()
-
-    if not raw_root:
-        return False, "repo_record_missing"
-
-    root_path = Path(raw_root)
-    if not root_path.is_dir():
-        return False, "repo_root_missing"
+    record, root_path, input_error = _resolve_freshness_inputs(
+        conn, file_id, file_record, repo_root
+    )
+    if input_error is not None or record is None or root_path is None:
+        return False, input_error
 
     rel_path = record["file_path"]
     try:
         safe_path = ensure_safe_repo_file(root_path, rel_path)
     except PathSecurityError:
         candidate = root_path / rel_path
-        if not candidate.exists() and not candidate.is_symlink():
-            return False, "file_missing"
-        return False, "path_security_violation"
+        is_missing = not candidate.exists() and not candidate.is_symlink()
+        return False, "file_missing" if is_missing else "path_security_violation"
 
     try:
-        max_bytes = get_config().max_file_size_bytes
-        disk_hash = sha256_file(safe_path, max_file_size_bytes=max_bytes)
+        disk_hash = sha256_file(safe_path, max_file_size_bytes=get_config().max_file_size_bytes)
     except (OSError, ParseError):
         return False, "file_unreadable"
 

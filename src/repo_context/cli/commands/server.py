@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
-from pathlib import Path
 import re
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+from typing import Any
 
 from repo_context.cli.utils import resolve_db_path
 from repo_context.config import get_config
@@ -78,25 +80,49 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+_LITERAL_SHORTHAND_VALUES: dict[str, bool | None] = {
+    "true": True,
+    "false": False,
+    "null": None,
+    "none": None,
+}
+
+
 def _coerce_shorthand_value(key: str, raw_value: str) -> Any:
     """Coerce a CLI shorthand ``key=value`` string into bool, int, JSON, or str."""
     lower = raw_value.lower()
-    if lower == "true":
-        return True
-    if lower == "false":
-        return False
-    if lower in ("null", "none"):
-        return None
+    if lower in _LITERAL_SHORTHAND_VALUES:
+        return _LITERAL_SHORTHAND_VALUES[lower]
     if re.fullmatch(r"-?\d+", raw_value):
         return int(raw_value)
     if raw_value.startswith(("[", "{")):
-        try:
+        with contextlib.suppress(json.JSONDecodeError):
             return json.loads(raw_value)
-        except json.JSONDecodeError:
-            pass
     if key == "symbols":
         return [part.strip() for part in raw_value.split(",") if part.strip()]
     return raw_value
+
+
+def _assign_positional_args(
+    tool_name: str,
+    positional: list[str],
+    parsed_kwargs: dict[str, Any],
+) -> None:
+    """Bind positional shorthand tokens to ``tool_name``'s primary parameter."""
+    if not positional:
+        return
+    primary_key = _PRIMARY_ARG_BY_TOOL.get(tool_name)
+    if not primary_key or primary_key in parsed_kwargs:
+        return
+    if primary_key == "symbols":
+        parsed_kwargs[primary_key] = [
+            part.strip()
+            for item in positional
+            for part in item.split(",")
+            if part.strip()
+        ]
+        return
+    parsed_kwargs[primary_key] = " ".join(positional)
 
 
 def _parse_mcp_call_args(tool_name: str, raw_tokens: list[str]) -> dict[str, Any]:
@@ -122,17 +148,7 @@ def _parse_mcp_call_args(tool_name: str, raw_tokens: list[str]) -> dict[str, Any
         else:
             positional.append(tok)
 
-    if positional:
-        primary_key = _PRIMARY_ARG_BY_TOOL.get(tool_name)
-        if primary_key and primary_key not in parsed_kwargs:
-            if primary_key == "symbols":
-                symbols: list[str] = []
-                for item in positional:
-                    symbols.extend(part.strip() for part in item.split(",") if part.strip())
-                parsed_kwargs[primary_key] = symbols
-            else:
-                parsed_kwargs[primary_key] = " ".join(positional)
-
+    _assign_positional_args(tool_name, positional, parsed_kwargs)
     return parsed_kwargs
 
 
@@ -148,9 +164,8 @@ def _normalize_tool_kwargs(
     if tool_name in ("get_symbol_source", "get_symbol_context", "get_symbol_references"):
         if "symbol" not in kwargs and "symbol_id_or_name" in kwargs:
             kwargs["symbol"] = kwargs.pop("symbol_id_or_name")
-    elif tool_name == "analyze_risk":
-        if "symbols" not in kwargs and "symbol_ids" in kwargs:
-            kwargs["symbols"] = kwargs.pop("symbol_ids")
+    elif tool_name == "analyze_risk" and "symbols" not in kwargs and "symbol_ids" in kwargs:
+        kwargs["symbols"] = kwargs.pop("symbol_ids")
 
     if repo_arg and "repo_id" not in kwargs:
         kwargs["repo_id"] = repo_arg
@@ -162,43 +177,25 @@ def _normalize_tool_kwargs(
     return kwargs
 
 
-def cmd_mcp_call(args: argparse.Namespace) -> int:
-    """Execute one of the 8 MCP tools locally via ``asyncio.run`` and inspect payload size."""
-    explicit_db_path: Path | None = getattr(args, "db_path", None)
-    db_path = resolve_db_path(args)
-    tool_name: str = args.tool_name
+def _extract_raw_tokens(args: argparse.Namespace) -> list[str]:
+    """Extract raw ``json_args`` CLI tokens as a normalized list of strings."""
     raw_arg_value = getattr(args, "json_args", [])
     if isinstance(raw_arg_value, str):
-        raw_tokens = [raw_arg_value] if raw_arg_value else []
-    else:
-        raw_tokens = list(raw_arg_value or [])
-    repo_arg: str | None = getattr(args, "repo", None)
+        return [raw_arg_value] if raw_arg_value else []
+    return list(raw_arg_value or [])
 
-    if tool_name not in _MCP_TOOL_REGISTRY:
+
+def _invoke_mcp_tool(tool_name: str, kwargs: dict[str, Any]) -> str:
+    """Execute a registered MCP tool coroutine via ``asyncio.run``."""
+    handler = _MCP_TOOL_REGISTRY.get(tool_name)
+    if handler is None:
         available = ", ".join(_MCP_TOOL_REGISTRY.keys())
         raise ValidationError(
             f"Unknown MCP tool {tool_name!r}. Available tools: {available}",
             context={"tool": tool_name},
         )
-
     try:
-        parsed_args = _parse_mcp_call_args(tool_name, raw_tokens)
-    except json.JSONDecodeError as exc:
-        raise ValidationError(f"Invalid JSON arguments: {exc}") from exc
-    except ValueError as exc:
-        raise ValidationError(str(exc)) from exc
-
-    handler = _MCP_TOOL_REGISTRY[tool_name]
-    kwargs = _normalize_tool_kwargs(
-        tool_name,
-        parsed_args,
-        explicit_db_path,
-        db_path,
-        repo_arg=repo_arg,
-    )
-
-    try:
-        raw_response = asyncio.run(handler(**kwargs))
+        return asyncio.run(handler(**kwargs))
     except TypeError as exc:
         raise ValidationError(
             f"Invalid arguments for {tool_name}: {exc}",
@@ -208,6 +205,9 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
         if tool_name == "get_symbol_references" and kwargs.get("refresh_lsp"):
             close_default_lsp_pool()
 
+
+def _format_mcp_call_output(tool_name: str, raw_response: str) -> tuple[dict[str, Any], int]:
+    """Measure payload bytes/tokens and decode tool response JSON."""
     byte_size = len(raw_response.encode("utf-8"))
     est_tokens = max(1, (byte_size + 3) // 4) if byte_size > 0 else 0
     try:
@@ -215,18 +215,43 @@ def cmd_mcp_call(args: argparse.Namespace) -> int:
     except json.JSONDecodeError:
         parsed_response = {"raw": raw_response}
 
-    print(
-        json.dumps(
-            {
-                "tool": tool_name,
-                "bytes": byte_size,
-                "estimated_tokens": est_tokens,
-                "result": parsed_response,
-            },
-            indent=2,
-        )
+    exit_code = 1 if isinstance(parsed_response, dict) and parsed_response.get("ok") is False else 0
+    return (
+        {
+            "tool": tool_name,
+            "bytes": byte_size,
+            "estimated_tokens": est_tokens,
+            "result": parsed_response,
+        },
+        exit_code,
     )
 
-    if isinstance(parsed_response, dict) and parsed_response.get("ok") is False:
-        return 1
-    return 0
+
+def cmd_mcp_call(args: argparse.Namespace) -> int:
+    """Execute one of the 8 MCP tools locally via ``asyncio.run`` and inspect payload size."""
+    tool_name: str = args.tool_name
+    if tool_name not in _MCP_TOOL_REGISTRY:
+        available = ", ".join(_MCP_TOOL_REGISTRY.keys())
+        raise ValidationError(
+            f"Unknown MCP tool {tool_name!r}. Available tools: {available}",
+            context={"tool": tool_name},
+        )
+
+    try:
+        parsed_args = _parse_mcp_call_args(tool_name, _extract_raw_tokens(args))
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"Invalid JSON arguments: {exc}") from exc
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+    kwargs = _normalize_tool_kwargs(
+        tool_name,
+        parsed_args,
+        getattr(args, "db_path", None),
+        resolve_db_path(args),
+        repo_arg=getattr(args, "repo", None),
+    )
+    raw_response = _invoke_mcp_tool(tool_name, kwargs)
+    payload, exit_code = _format_mcp_call_output(tool_name, raw_response)
+    print(json.dumps(payload, indent=2))
+    return exit_code

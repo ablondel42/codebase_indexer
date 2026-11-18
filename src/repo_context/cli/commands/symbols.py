@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.engine import Connection
 
 from repo_context.cli.utils import (
     _escape_like,
@@ -27,7 +28,10 @@ from repo_context.storage import (
 )
 
 
-def _serialize_symbol_entry(node: dict[str, Any], file_info: dict[str, Any] | None) -> dict[str, Any]:
+def _serialize_symbol_entry(
+    node: dict[str, Any],
+    file_info: dict[str, Any] | None,
+) -> dict[str, Any]:
     """Build clean JSON dict for search/list results."""
     return {
         "id": node["id"],
@@ -92,6 +96,70 @@ def cmd_symbols_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_symbol_list_filters(
+    repo_id: str,
+    kind: str | None,
+    file_filter: str | None,
+) -> list[Any]:
+    """Build SQLAlchemy WHERE clauses for paginated symbol listing."""
+    filters: list[Any] = [nodes_table.c.repo_id == repo_id]
+    if kind is not None:
+        filters.append(nodes_table.c.kind == kind)
+    if file_filter is not None:
+        cleaned = _normalize_file_filter(file_filter)
+        filters.append(
+            or_(
+                files_table.c.file_path == cleaned,
+                files_table.c.file_path.like(f"{_escape_like(cleaned)}/%", escape="\\"),
+            )
+        )
+    return filters
+
+
+def _fetch_paginated_symbols(
+    conn: Connection,
+    filters: list[Any],
+    *,
+    limit: int,
+    offset: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Count matching symbols and fetch one serialized page."""
+    joined = nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
+    total_count = int(
+        conn.execute(select(func.count()).select_from(joined).where(*filters)).scalar_one()
+    )
+    rows = (
+        conn.execute(
+            select(
+                nodes_table,
+                files_table.c.file_path.label("_file_path"),
+                files_table.c.module_path.label("_module_path"),
+            )
+            .select_from(joined)
+            .where(*filters)
+            .order_by(
+                files_table.c.file_path,
+                func.coalesce(nodes_table.c.start_line, 0),
+                nodes_table.c.kind,
+                nodes_table.c.qualified_name,
+                nodes_table.c.id,
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+        .mappings()
+        .all()
+    )
+    symbols = [
+        _serialize_symbol_entry(
+            row_to_node(r),
+            {"file_path": r["_file_path"], "module_path": r["_module_path"]},
+        )
+        for r in rows
+    ]
+    return total_count, symbols
+
+
 def cmd_symbols_list(args: argparse.Namespace) -> int:
     """List symbols with pagination and optional kind/file filters."""
     db_path = resolve_db_path(args)
@@ -102,73 +170,31 @@ def cmd_symbols_list(args: argparse.Namespace) -> int:
     if offset < 0:
         raise ValidationError("--offset must be >= 0", context={"offset": offset})
 
-    repo_arg: str | None = getattr(args, "repo", None)
-    kind: str | None = getattr(args, "kind", None)
-    file_filter: str | None = getattr(args, "file", None)
-
     with connection_scope(db_path, read_only=True) as conn:
         initialize_database(conn)
-        repo_id = resolve_repo_id(conn, repo_arg)
-
-        filters: list[Any] = [nodes_table.c.repo_id == repo_id]
-        if kind is not None:
-            filters.append(nodes_table.c.kind == kind)
-        if file_filter is not None:
-            cleaned = _normalize_file_filter(file_filter)
-            filters.append(
-                or_(
-                    files_table.c.file_path == cleaned,
-                    files_table.c.file_path.like(f"{_escape_like(cleaned)}/%", escape="\\"),
-                )
-            )
-
-        joined = nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
-        total_count = int(
-            conn.execute(select(func.count()).select_from(joined).where(*filters)).scalar_one()
+        repo_id = resolve_repo_id(conn, getattr(args, "repo", None))
+        filters = _build_symbol_list_filters(
+            repo_id,
+            getattr(args, "kind", None),
+            getattr(args, "file", None),
         )
-
-        rows = (
-            conn.execute(
-                select(
-                    nodes_table,
-                    files_table.c.file_path.label("_file_path"),
-                    files_table.c.module_path.label("_module_path"),
-                )
-                .select_from(joined)
-                .where(*filters)
-                .order_by(
-                    files_table.c.file_path,
-                    func.coalesce(nodes_table.c.start_line, 0),
-                    nodes_table.c.kind,
-                    nodes_table.c.qualified_name,
-                    nodes_table.c.id,
-                )
-                .limit(limit)
-                .offset(offset)
-            )
-            .mappings()
-            .all()
+        total_count, symbols = _fetch_paginated_symbols(
+            conn,
+            filters,
+            limit=limit,
+            offset=offset,
         )
-
-        nodes = [row_to_node(r) for r in rows]
-        file_meta = {
-            r["id"]: {"file_path": r["_file_path"], "module_path": r["_module_path"]}
-            for r in rows
-        }
 
     print(
         json.dumps(
             {
                 "repo_id": repo_id,
                 "total_count": total_count,
-                "returned_count": len(nodes),
+                "returned_count": len(symbols),
                 "offset": offset,
                 "limit": limit,
-                "has_more": (offset + len(nodes)) < total_count,
-                "symbols": [
-                    _serialize_symbol_entry(n, file_meta.get(n["id"]))
-                    for n in nodes
-                ],
+                "has_more": (offset + len(symbols)) < total_count,
+                "symbols": symbols,
             },
             indent=2,
         )

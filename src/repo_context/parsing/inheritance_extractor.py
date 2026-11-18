@@ -37,6 +37,42 @@ def _collect_class_asts(
     return by_qname_line, by_qname
 
 
+def _extract_class_base_edges(
+    repo_id: str,
+    file_record: FileRecord,
+    class_node_id: str,
+    ast_node: ast.ClassDef,
+    lines: Sequence[str] | None,
+) -> list[dict]:
+    """Build ``inherits`` edges for a single ``ast.ClassDef`` node."""
+    edges: list[dict] = []
+    seen_bases: dict[str, int] = {}
+    for base in ast_node.bases:
+        base_name = safe_unparse(base)
+        dup_count = seen_bases.get(base_name, 0)
+        seen_bases[base_name] = dup_count + 1
+        base_range = make_range(base, lines=lines)
+        edges.append(
+            {
+                "id": _make_inherits_edge_id(repo_id, class_node_id, base_name, dup_count),
+                "repo_id": repo_id,
+                "kind": EDGE_KIND_INHERITS,
+                "from_id": class_node_id,
+                "to_id": f"unresolved_base:{base_name}",
+                "source": "python-ast",
+                "confidence": 0.75,
+                "evidence_file_id": file_record.id,
+                "evidence_uri": file_record.uri,
+                "evidence_range_json": (
+                    json.dumps(base_range, sort_keys=True) if base_range else None
+                ),
+                "payload_json": json.dumps({"base_name": base_name}, sort_keys=True),
+                "last_indexed_at": file_record.last_indexed_at,
+            }
+        )
+    return edges
+
+
 def extract_inheritance_edges(
     repo_id: str,
     file_record: FileRecord,
@@ -67,47 +103,17 @@ def extract_inheritance_edges(
         if class_node.get("kind") != "class":
             continue
 
-        class_node_id = class_node["id"]
         qname = class_node["qualified_name"]
         start_line = class_node.get("start_line")
-
         ast_node = (
-            by_qname_line.get((qname, int(start_line)))
-            if start_line is not None
-            else None
-        )
-        if ast_node is None:
-            ast_node = by_qname.get(qname)
+            by_qname_line.get((qname, int(start_line))) if start_line is not None else None
+        ) or by_qname.get(qname)
         if ast_node is None:
             continue
 
-        seen_bases: dict[str, int] = {}
-        for base in ast_node.bases:
-            base_name = safe_unparse(base)
-            to_id = f"unresolved_base:{base_name}"
-            dup_count = seen_bases.get(base_name, 0)
-            seen_bases[base_name] = dup_count + 1
-            edge_id = _make_inherits_edge_id(repo_id, class_node_id, base_name, dup_count)
-            base_range = make_range(base, lines=lines)
-
-            edges.append(
-                {
-                    "id": edge_id,
-                    "repo_id": repo_id,
-                    "kind": EDGE_KIND_INHERITS,
-                    "from_id": class_node_id,
-                    "to_id": to_id,
-                    "source": "python-ast",
-                    "confidence": 0.75,
-                    "evidence_file_id": file_record.id,
-                    "evidence_uri": file_record.uri,
-                    "evidence_range_json": json.dumps(base_range, sort_keys=True)
-                    if base_range
-                    else None,
-                    "payload_json": json.dumps({"base_name": base_name}, sort_keys=True),
-                    "last_indexed_at": file_record.last_indexed_at,
-                }
-            )
+        edges.extend(
+            _extract_class_base_edges(repo_id, file_record, class_node["id"], ast_node, lines)
+        )
 
     return edges
 
