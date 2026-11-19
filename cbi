@@ -6,22 +6,22 @@ VENV="$DIR/venv"
 
 if [ "$#" -eq 0 ]; then
     cat <<'EOF'
-Usage: ./rc <command|path> [options]
+Usage: ./cbi <command|path> [options]
 
 Commands:
-  ./rc path/to/repo [--cli]   Index a repository and start the interactive CLI (--cli is optional; --no-cli exits)
-  ./rc demo [--cli]           Index '.' (including tests) and start the interactive CLI (--cli is optional)
-  ./rc dev                    Delete and recreate DB, run full indexing + LSP, and display system status
-  ./rc check [--tests ...]    Run fast Ruff + Pyright + Hexagonal AST gate (add --tests for pytest)
-  ./rc tests [pytest-args]    Execute the full test suite (ruff check + pytest)
+  ./cbi path/to/repo [--cli]   Index a repository and start the interactive CLI (--cli is optional; --no-cli exits)
+  ./cbi demo [--cli]           Index '.' (including tests) and start the interactive CLI (--cli is optional)
+  ./cbi dev                    Delete and recreate DB, run full indexing + LSP, and display system status
+  ./cbi check [--tests ...]    Run fast Ruff + Pyright + Hexagonal AST gate (add --tests for pytest)
+  ./cbi tests [pytest-args]    Execute the full test suite (ruff check + pytest)
 
-Forward any grouped subcommand directly: ./rc --help | ./rc db status | ./rc outline <file>
+Forward any grouped subcommand directly: ./cbi --help | ./cbi db status | ./cbi outline <file>
 EOF
     exit 0
 fi
 
 find_python() {
-    for p in "${RC_PYTHON:-}" "$VENV/bin/python" \
+    for p in "${CBI_PYTHON:-}" "$VENV/bin/python" \
         "$(command -v python3 2>/dev/null || true)" \
         "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" \
         "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"; do
@@ -35,7 +35,7 @@ find_python() {
 }
 
 ensure_env() {
-    if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
+    if [ "${CBI_NO_BOOTSTRAP:-0}" != "1" ] && [ ! -x "$VENV/bin/python" ]; then
         local host_py
         host_py="$(find_python)"
         echo "Bootstrapping venv..." >&2
@@ -45,7 +45,7 @@ ensure_env() {
             "$host_py" -m venv "$VENV" >&2 && "$VENV/bin/python" -m pip install -e "$DIR[dev]" >&2 || rm -rf "$VENV"
         fi
     fi
-    if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ -x "$VENV/bin/python" ]; then
+    if [ "${CBI_NO_BOOTSTRAP:-0}" != "1" ] && [ -x "$VENV/bin/python" ]; then
         export PATH="$VENV/bin:$PATH"
         export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
         PY="$VENV/bin/python"
@@ -63,14 +63,14 @@ if [ "$1" = "dev" ]; then
     shift
     cd "$DIR"
     export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
-    rm -f "$DIR/repo_context.db" "$DIR/repo_context.db-wal" "$DIR/repo_context.db-shm" "$DIR/repo_context.db-journal"
+    rm -f "$DIR/codebase_indexer.db" "$DIR/codebase_indexer.db-wal" "$DIR/codebase_indexer.db-shm" "$DIR/codebase_indexer.db-journal"
     exec "$PY" -m cli.main index . --include-tests --force --lsp ${@+"$@"}
 fi
 
 if [ "$1" = "check" ]; then
     shift
     cd "$DIR"
-    exec bash "$DIR/.agents/plugins/repo-context/scripts/check_arch.sh" ${@+"$@"}
+    exec bash "$DIR/.agents/plugins/codebase-indexer/scripts/check_arch.sh" ${@+"$@"}
 fi
 
 if [ "$1" = "tests" ]; then

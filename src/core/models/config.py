@@ -41,8 +41,8 @@ DEFAULT_IGNORED_DIRS: tuple[str, ...] = (
 class AppConfig(FrozenModel):
     """Immutable runtime configuration for indexing, storage, and LSP services."""
 
-    app_name: str = "repo-context-mcp"
-    db_path: Path = Path("repo_context.db")
+    app_name: str = "codebase-indexer"
+    db_path: Path = Path("codebase_indexer.db")
     debug: bool = False
     include_tests: bool = False
     max_file_size_bytes: int = 2 * 1024 * 1024

@@ -68,10 +68,10 @@ class CliApplication:
         self._shell = InteractiveShell(self._engine, self._parser_builder, self.dispatch)
 
     def _run_shell_cmd(self, args: argparse.Namespace) -> int:
-        """Delegate ``rc shell`` execution to ``self._shell``.
+        """Delegate ``cbi shell`` execution to ``self._shell``.
 
         Args:
-            args: Parsed ``rc shell`` CLI arguments.
+            args: Parsed ``cbi shell`` CLI arguments.
 
         Returns:
             Exit code returned by ``InteractiveShell.run_shell_command``.
@@ -174,7 +174,7 @@ class CliApplication:
             logger.debug("Database not found during CLI command: %s", exc)
             emit_cli_error(
                 exc.error_code,
-                f"{exc}. Run `rc index` first.",
+                f"{exc}. Run `cbi index` first.",
                 details=exc.context,
             )
         except IndexerError as exc:

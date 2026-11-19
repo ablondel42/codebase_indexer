@@ -96,7 +96,7 @@ def preprocess_argv(tokens: Sequence[str]) -> list[str]:
 
 
 def tokenize_shell_line(line: str) -> list[str]:
-    """Split a non-empty shell line via ``shlex`` and strip a leading ``rc`` prefix.
+    """Split a non-empty shell line via ``shlex`` and strip a leading ``cbi`` prefix.
 
     Args:
         line: Trimmed interactive shell command line.
@@ -108,7 +108,7 @@ def tokenize_shell_line(line: str) -> list[str]:
         ValueError: If ``line`` contains unbalanced quotes rejected by ``shlex.split``.
     """
     tokens = shlex.split(line)
-    if len(tokens) > 1 and tokens[0] == "rc":
+    if len(tokens) > 1 and tokens[0] == "cbi":
         return tokens[1:]
     return tokens
 

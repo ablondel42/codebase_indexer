@@ -29,7 +29,7 @@ _INDEXER_ERROR_RULES: tuple[
     (
         DatabaseNotFoundError,
         McpErrorCode.DATABASE_NOT_FOUND,
-        "Indexed database not found; run `rc index` first.",
+        "Indexed database not found; run `cbi index` first.",
         False,
     ),
     (DatabaseError, None, None, True),

@@ -1,4 +1,4 @@
-"""Unit tests for grouped ``rc`` CLI parsing, ``CliApplication``, and missing-DB safety."""
+"""Unit tests for grouped ``cbi`` CLI parsing, ``CliApplication``, and missing-DB safety."""
 
 import json
 from collections.abc import Iterator
@@ -71,14 +71,14 @@ def test_missing_db_path_fails_without_creating_zero_byte_file(
         err = json.loads(captured.err)
         assert err["ok"] is False
         assert err["error"]["code"] == "database_not_found"
-        assert "rc index" in err["error"]["message"]
+        assert "cbi index" in err["error"]["message"]
 
 
 def test_symbols_show_module_with_none_structural_parent_and_ambiguous_json_error(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``rc symbols show`` outputs JSON by default and emits structured candidates on ambiguity."""
+    """``cbi symbols show`` outputs JSON and emits structured candidates on ambiguity."""
     repo_root = tmp_path / "sample"
     repo_root.mkdir()
     (repo_root / "mod.py").write_text(

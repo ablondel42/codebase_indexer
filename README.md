@@ -1,6 +1,6 @@
-# Repo Context MCP (`repo-context-mcp` v0.2.0)
+# Codebase Indexer (`codebase-indexer` v0.2.0)
 
-Local repository intelligence for safer, token-lean AI-assisted code planning and UI code exploration. Indexes Python codebases into a local SQLite graph (WAL + FTS5) and exposes structural outlines, UI-ready raw/numbered symbol snippets, neighborhood subgraphs, AST/LSP references, and deterministic change-risk analysis over a headless Python `IndexerEngine`, an 8-tool MCP server, and the grouped `rc` CLI.
+Local repository intelligence for safer, token-lean AI-assisted code planning and UI code exploration. Indexes Python codebases into a local SQLite graph (WAL + FTS5) and exposes structural outlines, UI-ready raw/numbered symbol snippets, neighborhood subgraphs, AST/LSP references, and deterministic change-risk analysis over a headless Python `IndexerEngine`, an 8-tool MCP server, and the grouped `cbi` CLI.
 
 ---
 
@@ -10,7 +10,7 @@ All 10 domain packages live directly under `src/` using a strict **Hexagonal (Po
 
 ```text
 Driving Adapters (Thin Consumers)
-  ├── src/cli/{services,models,utils} + main.py     Grouped `rc` CLI & interactive `rc>` REPL
+  ├── src/cli/{services,models,utils} + main.py     Grouped `cbi` CLI & interactive `cbi>` REPL
   └── src/mcp_server/{services,models,utils}        8 token-lean MCP tools over stdio
 
 Application Layer (Headless & UI-Ready)
@@ -37,7 +37,7 @@ Innermost Core (Zero Sibling Dependencies)
 
 2. **Persistence Adapter (`src/storage/`)**
    - Isolates **100%** of SQLAlchemy 2.x Core and `sqlite3` operations (`SqlUnitOfWorkFactory`, `SqlUnitOfWork`, `ConnectionFactory`, `SchemaMigrator`) over SQLite schema `user_version = 2` (`repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and FTS5 `nodes_fts`).
-   - Enforces WAL mode, `foreign_keys = ON`, `busy_timeout = 5000`, read-only `query_only = ON` sessions, and SQLite's `SELECT`-only authorizer for `rc db sql`.
+   - Enforces WAL mode, `foreign_keys = ON`, `busy_timeout = 5000`, read-only `query_only = ON` sessions, and SQLite's `SELECT`-only authorizer for `cbi db sql`.
 
 3. **Static Analysis & Intra-Repo Linker (`src/parsing/`)**
    - `RepoScanner` walks repositories safely (`followlinks=False`, symlink/escape rejection, `ignored_dirs` globs, `--include-tests`, 2 MiB file cap).
@@ -52,9 +52,9 @@ Innermost Core (Zero Sibling Dependencies)
    - `BatchIndexer` executes hash-diffed repository indexing runs with optional `ReferenceEnricher` + `LspSessionPool` (`pyright-langserver --stdio`) enrichment.
    - `IncrementalIndexer` and `RepoWatcher` isolate per-file updates in SQLite savepoints, link once per debounced batch, preserve surviving callers' AST edges across file deletions for automatic re-linking, and emit typed lifecycle events via callbacks.
 
-6. **Headless `IndexerEngine`, MCP Server & `rc` CLI (`src/engine/`, `src/mcp_server/`, `src/cli/`)**
+6. **Headless `IndexerEngine`, MCP Server & `cbi` CLI (`src/engine/`, `src/mcp_server/`, `src/cli/`)**
    - `IndexerEngine` exposes `engine.queries` and `engine.commands`, with `engine.for_db(db_path)` sharing warm Pyright LSP sessions across databases with zero global mutable state.
-   - `McpServerRunner` / `McpToolRegistry` expose 8 compact MCP tools over `stdio`, and `CliApplication` (`python -m cli.main` / `./rc`) emits indented JSON to `stdout`.
+   - `McpServerRunner` / `McpToolRegistry` expose 8 compact MCP tools over `stdio`, and `CliApplication` (`python -m cli.main` / `./cbi`) emits indented JSON to `stdout`.
 
 ---
 
@@ -71,7 +71,7 @@ from engine import (
 )
 from indexing import BatchIndexOptions
 
-config = AppConfig(db_path="repo_context.db", include_tests=True)
+config = AppConfig(db_path="codebase_indexer.db", include_tests=True)
 
 with IndexerEngine(config) as engine:
     # 1. Index a repository
@@ -97,26 +97,29 @@ with IndexerEngine(config) as engine:
 
 ---
 
-## Quickstart (`./rc`)
+## Quickstart (`./cbi`)
 
-Use the root `./rc` bootstrap script (automatically sets up `venv/` on first run, falling back cleanly to Python 3.11+ with `PYTHONPATH=src` when offline):
+Use the root `./cbi` bootstrap script (automatically sets up `venv/` on first run, falling back cleanly to Python 3.11+ with `PYTHONPATH=src` when offline):
 
 ```bash
 # Show the quickstart commands
-./rc
+./cbi
 
-# Index any repository into ./repo_context.db and open the interactive `rc>` shell (--cli is optional)
-./rc path/to/repo --cli
-./rc path/to/repo --no-cli   # index only without entering the interactive shell
+# Index any repository into ./codebase_indexer.db and open the interactive `cbi>` shell (--cli is optional)
+./cbi path/to/repo --cli
+./cbi path/to/repo --no-cli   # index only without entering the interactive shell
 
-# Demo: index this repository (including tests) and start the interactive `rc>` shell
-./rc demo --cli
+# Demo: index this repository (including tests) and start the interactive `cbi>` shell
+./cbi demo --cli
 
-# Dev rebuild: recreate repo_context.db from scratch with tests + Pyright LSP enrichment
-./rc dev
+# Dev rebuild: recreate codebase_indexer.db from scratch with tests + Pyright LSP enrichment
+./cbi dev
+
+# Fast Ruff + Pyright + Hexagonal AST architecture gate (add --tests for pytest)
+./cbi check
 
 # Run the full test suite (ruff check + pytest)
-./rc tests
+./cbi tests
 ```
 
 Or install manually in editable mode (requires Python 3.11+):
@@ -125,92 +128,92 @@ Or install manually in editable mode (requires Python 3.11+):
 pip install -e ".[dev]"
 ```
 
-Run standalone CLI commands directly (`./rc <subcommand>`, `rc <subcommand>`, or `PYTHONPATH=src python -m cli.main <subcommand>`), or follow the copy-paste verification checklist in [MANUAL_TESTING.md](file:///Users/arnaud/dev/codebase_indexer/MANUAL_TESTING.md):
+Run standalone CLI commands directly (`./cbi <subcommand>`, `cbi <subcommand>`, or `PYTHONPATH=src python -m cli.main <subcommand>`), or follow the copy-paste verification checklist in [MANUAL_TESTING.md](file:///Users/arnaud/dev/codebase_indexer/MANUAL_TESTING.md):
 
 ```bash
-./rc index .
-./rc shell
+./cbi index .
+./cbi shell
 ```
 
 Inspect database health, schema version, table counts, and latest run:
 
 ```bash
-./rc db status
+./cbi db status
 ```
 
 Inspect a file outline (with symbol IDs, line ranges, kinds, and signatures):
 
 ```bash
-./rc outline src/engine/services/facade.py
+./cbi outline src/engine/services/facade.py
 ```
 
 Search symbols via FTS5:
 
 ```bash
-./rc symbols search IndexerEngine
+./cbi symbols search IndexerEngine
 ```
 
 Read bounded, line-numbered source for a symbol (by `sym:...` ID, qualified name, `file.py:symbol`, or unique name):
 
 ```bash
-./rc source IndexerEngine --max-lines 80
+./cbi source IndexerEngine --max-lines 80
 ```
 
 Run a guarded read-only SQL query against the index:
 
 ```bash
-./rc db sql "SELECT kind, COUNT(*) AS count FROM nodes GROUP BY kind ORDER BY count DESC"
+./cbi db sql "SELECT kind, COUNT(*) AS count FROM nodes GROUP BY kind ORDER BY count DESC"
 ```
 
 Invoke any of the 8 MCP tools locally and inspect payload byte/token metrics:
 
 ```bash
-./rc mcp-call get_repo_overview
-./rc mcp-call search_symbols '{"query": "SymbolLinker", "limit": 5}'
+./cbi mcp-call get_repo_overview
+./cbi mcp-call search_symbols '{"query": "SymbolLinker", "limit": 5}'
 ```
 
 ---
 
-## CLI Reference (`rc`)
+## CLI Reference (`cbi`)
 
-All CLI commands emit indented JSON objects to `stdout` (and structured JSON error objects to `stderr`). The global `--db-path PATH` flag works either before or after subcommands (e.g., `rc --db-path custom.db db status`).
+All CLI commands emit indented JSON objects to `stdout` (and structured JSON error objects to `stderr`). The global `--db-path PATH` flag works either before or after subcommands (e.g., `cbi --db-path custom.db db status`).
 
 | Command | Purpose |
 | --- | --- |
-| `rc index [repo_path] [--include-tests] [--lsp] [--force]` | Scan repo, extract changed files atomically, prune deleted files, link edges, and optionally enrich LSP references |
-| `rc db status [--repo]` | Show DB size, `user_version`, repo summary, table row counts, edge kinds, LSP coverage, and latest run |
-| `rc db repos` | List indexed repositories |
-| `rc db tables` | List SQLite tables and exact row counts |
-| `rc db runs [--repo] [--limit 20]` | List recent `index_runs` entries |
-| `rc db sql <query> [--limit 100]` | Execute a read-only SQL query guarded by SQLite's SELECT-only authorizer |
-| `rc files [pattern] [--repo] [--include-tests] [--limit 50]` | List tracked files with line count, symbol count, and live disk freshness (`fresh`/`modified`/`deleted`) |
-| `rc outline <file_path> [--repo] [--no-private] [--max-depth 3]` | Show hierarchical symbol outline for a file |
-| `rc symbols search <query> [--repo] [--kind] [--file] [--limit 20]` | Search symbols using FTS5 + ranking |
-| `rc symbols list [--repo] [--kind] [--file] [--limit 50] [--offset 0]` | Browse symbols with pagination |
-| `rc symbols show <id_or_name> [--repo] [--source]` | Inspect full symbol context (+ optional source snippet) |
-| `rc source <id_or_name> [--repo] [--max-lines 120] [--offset 0]` | Print line-numbered symbol source slice |
-| `rc refs <id_or_name> [--repo] [--direction incoming\|outgoing\|both] [--refresh] [--limit 50]` | List calls/references with `file:line` and 1-line previews (optionally refreshing via Pyright LSP) |
-| `rc risk <id_or_names...> [--repo]` | Compute risk score, decision, targets, facts, and issue codes |
-| `rc shell [--repo]` | Start interactive `rc>` REPL bound to the database and active repository |
-| `rc watch [repo_path] [--debounce-ms 500] [--include-tests] [--verbose]` | Watch repository for changes and incrementally update SQLite |
-| `rc serve [--debug]` | Start the MCP server on `stdio` |
-| `rc mcp-call <tool_name> [json_args]` | Execute one of the 8 MCP tools locally and print payload size + `~bytes/4` token estimate |
+| `cbi index [repo_path] [--include-tests] [--lsp] [--force]` | Scan repo, extract changed files atomically, prune deleted files, link edges, and optionally enrich LSP references |
+| `cbi db status [--repo]` | Show DB size, `user_version`, repo summary, table row counts, edge kinds, LSP coverage, and latest run |
+| `cbi db repos` | List indexed repositories |
+| `cbi db tables` | List SQLite tables and exact row counts |
+| `cbi db runs [--repo] [--limit 20]` | List recent `index_runs` entries |
+| `cbi db sql <query> [--limit 100]` | Execute a read-only SQL query guarded by SQLite's SELECT-only authorizer |
+| `cbi files [pattern] [--repo] [--include-tests] [--limit 50]` | List tracked files with line count, symbol count, and live disk freshness (`fresh`/`modified`/`deleted`) |
+| `cbi outline <file_path> [--repo] [--no-private] [--max-depth 3]` | Show hierarchical symbol outline for a file |
+| `cbi symbols search <query> [--repo] [--kind] [--file] [--limit 20]` | Search symbols using FTS5 + ranking |
+| `cbi symbols list [--repo] [--kind] [--file] [--limit 50] [--offset 0]` | Browse symbols with pagination |
+| `cbi symbols show <id_or_name> [--repo] [--source]` | Inspect full symbol context (+ optional source snippet) |
+| `cbi source <id_or_name> [--repo] [--max-lines 120] [--offset 0]` | Print line-numbered symbol source slice |
+| `cbi refs <id_or_name> [--repo] [--direction incoming\|outgoing\|both] [--refresh] [--limit 50]` | List calls/references with `file:line` and 1-line previews (optionally refreshing via Pyright LSP) |
+| `cbi risk <id_or_names...> [--repo]` | Compute risk score, decision, targets, facts, and issue codes |
+| `cbi shell [--repo]` | Start interactive `cbi>` REPL bound to the database and active repository |
+| `cbi watch [repo_path] [--debounce-ms 500] [--include-tests] [--verbose]` | Watch repository for changes and incrementally update SQLite |
+| `cbi serve [--debug]` | Start the MCP server on `stdio` |
+| `cbi mcp-call <tool_name> [json_args]` | Execute one of the 8 MCP tools locally and print payload size + `~bytes/4` token estimate |
 
 ---
 
 ## MCP Server Setup (`stdio`)
 
-Index your repository first, then configure your MCP client to launch `rc serve` pointing to the database file:
+Index your repository first, then configure your MCP client to launch `cbi serve` pointing to the database file:
 
 ```json
 {
   "mcpServers": {
-    "repo-context": {
-      "command": "rc",
+    "codebase-indexer": {
+      "command": "cbi",
       "args": [
         "serve",
         "--db-path",
-        "/absolute/path/to/repo_context.db"
+        "/absolute/path/to/codebase_indexer.db"
       ]
     }
   }

@@ -1,4 +1,4 @@
-"""Interactive ``rc>`` REPL session service."""
+"""Interactive ``cbi>`` REPL session service."""
 
 import argparse
 import sys
@@ -16,7 +16,7 @@ logger = get_logger("cli.services.shell")
 
 
 class InteractiveShell:
-    """Runs the interactive ``rc>`` command loop over an indexed SQLite database."""
+    """Runs the interactive ``cbi>`` command loop over an indexed SQLite database."""
 
     def __init__(
         self,
@@ -44,8 +44,8 @@ class InteractiveShell:
         """
         try:
             if sys.stdin.isatty():
-                return False, input("rc> ")
-            sys.stdout.write("rc> ")
+                return False, input("cbi> ")
+            sys.stdout.write("cbi> ")
             sys.stdout.flush()
             raw = sys.stdin.readline()
             if raw == "":
@@ -88,7 +88,7 @@ class InteractiveShell:
             return True, None
         if tokens[0] in ("help", "?", "shell"):
             if tokens[0] == "shell":
-                emit_cli_error("invalid_command", "Already inside rc shell.")
+                emit_cli_error("invalid_command", "Already inside cbi shell.")
             else:
                 parser.print_help()
             return False, None
@@ -96,7 +96,7 @@ class InteractiveShell:
         return False, inject_shell_defaults(tokens, state.db_path, state.active_repo_id)
 
     def run_session(self, db_path: Path, repo_arg: str | None = None) -> int:
-        """Start an interactive ``rc>`` REPL bound to ``db_path``.
+        """Start an interactive ``cbi>`` REPL bound to ``db_path``.
 
         Args:
             db_path: Target SQLite database path (must already exist).
@@ -112,7 +112,7 @@ class InteractiveShell:
         active_repo = self._engine.for_db(db_path).queries.resolve_active_repo(repo_arg)
         state = ShellSessionState(db_path=db_path, active_repo_id=active_repo)
         print(
-            f"Interactive rc shell (db: {state.db_path}, repo: {state.active_repo_id or 'auto'}). "
+            f"Interactive cbi shell (db: {state.db_path}, repo: {state.active_repo_id or 'auto'}). "
             "Type 'help' or 'exit'."
         )
         parser = self._parser_builder.build()
@@ -141,10 +141,10 @@ class InteractiveShell:
         return 0
 
     def run_shell_command(self, args: argparse.Namespace) -> int:
-        """Execute ``rc shell`` from parsed CLI arguments.
+        """Execute ``cbi shell`` from parsed CLI arguments.
 
         Args:
-            args: Parsed ``rc shell`` CLI arguments.
+            args: Parsed ``cbi shell`` CLI arguments.
 
         Returns:
             Exit code ``0`` when the session ends.

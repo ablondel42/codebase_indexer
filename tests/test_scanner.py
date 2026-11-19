@@ -91,7 +91,7 @@ def test_should_ignore_dir_supports_fnmatch_globs() -> None:
     patterns = (".git", ".nox", "*.egg-info")
     assert should_ignore_dir(".git", patterns) is True
     assert should_ignore_dir(".nox", patterns) is True
-    assert should_ignore_dir("repo_context.egg-info", patterns) is True
+    assert should_ignore_dir("codebase_indexer.egg-info", patterns) is True
     assert should_ignore_dir("egg-info", patterns) is False
     assert should_ignore_dir("src", patterns) is False
 
@@ -204,8 +204,8 @@ def test_invalid_repo_path_raises(tmp_path: Path) -> None:
         scanner.scan_repository(f)
 
 
-def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
-    """`rc index` scans and indexes sample_repo into a temporary DB."""
+def test_cbi_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
+    """`cbi index` scans and indexes sample_repo into a temporary DB."""
     db_path = tmp_path / "cli_index.db"
     result = subprocess.run(
         [

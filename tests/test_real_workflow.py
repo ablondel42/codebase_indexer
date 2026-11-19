@@ -1,4 +1,4 @@
-"""End-to-end hermetic workflow tests across ``IndexerEngine`` and ``rc`` CLI in ``tmp_path``."""
+"""End-to-end hermetic workflow tests across ``IndexerEngine`` and ``cbi`` CLI in ``tmp_path``."""
 
 import asyncio
 import json

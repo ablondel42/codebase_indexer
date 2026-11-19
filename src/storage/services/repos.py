@@ -126,7 +126,7 @@ class SqlRepoRepository:
         repos = self.list_all()
         if not repos:
             raise DatabaseError(
-                "No repositories found in database; run `rc index` first.",
+                "No repositories found in database; run `cbi index` first.",
                 error_code="repo_not_found",
             )
         if len(repos) > 1:

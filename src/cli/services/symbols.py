@@ -1,4 +1,4 @@
-"""CLI command handlers for ``rc files``, ``rc outline``, ``rc symbols``, and ``rc source``."""
+"""CLI command handlers for ``cbi files|outline|symbols|source``."""
 
 import argparse
 
@@ -66,7 +66,7 @@ class SymbolCliCommands:
         """List indexed files with line count, symbol count, and live disk freshness.
 
         Args:
-            args: Parsed ``rc files`` CLI arguments.
+            args: Parsed ``cbi files`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -79,7 +79,7 @@ class SymbolCliCommands:
         if limit < 1:
             raise ValidationError("--limit must be >= 1", context={"limit": limit})
 
-        logger.debug("Running rc files (db_path=%s, limit=%d)", db_path, limit)
+        logger.debug("Running cbi files (db_path=%s, limit=%d)", db_path, limit)
         page = self._engine.for_db(db_path).queries.list_files(
             ListFilesQuery(
                 repo=getattr(args, "repo", None),
@@ -97,7 +97,7 @@ class SymbolCliCommands:
         """Emit hierarchical symbol outline and imports for an indexed file.
 
         Args:
-            args: Parsed ``rc outline`` CLI arguments.
+            args: Parsed ``cbi outline`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -112,7 +112,7 @@ class SymbolCliCommands:
 
         include_private = not bool(getattr(args, "no_private", False))
         file_path_arg: str = args.file_path
-        logger.debug("Running rc outline for %s (db_path=%s)", file_path_arg, db_path)
+        logger.debug("Running cbi outline for %s (db_path=%s)", file_path_arg, db_path)
         outline = self._engine.for_db(db_path).queries.get_file_outline(
             OutlineQuery(
                 file_path=file_path_arg,
@@ -128,7 +128,7 @@ class SymbolCliCommands:
         """Search symbols via FTS5 with exact/prefix ranking and ``LIKE`` fallback.
 
         Args:
-            args: Parsed ``rc symbols search`` CLI arguments.
+            args: Parsed ``cbi symbols search`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -142,7 +142,7 @@ class SymbolCliCommands:
             raise ValidationError("--limit must be >= 1", context={"limit": limit})
 
         kind = self._parse_optional_kind(getattr(args, "kind", None))
-        logger.debug("Running rc symbols search %r (db_path=%s)", args.query, db_path)
+        logger.debug("Running cbi symbols search %r (db_path=%s)", args.query, db_path)
         page = self._engine.for_db(db_path).queries.search_symbols(
             SearchSymbolsQuery(
                 query=args.query,
@@ -159,7 +159,7 @@ class SymbolCliCommands:
         """List repository symbols with pagination and optional ``--kind``/``--file`` filters.
 
         Args:
-            args: Parsed ``rc symbols list`` CLI arguments.
+            args: Parsed ``cbi symbols list`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -177,7 +177,7 @@ class SymbolCliCommands:
 
         kind = self._parse_optional_kind(getattr(args, "kind", None))
         logger.debug(
-            "Running rc symbols list (db_path=%s, limit=%d, offset=%d)",
+            "Running cbi symbols list (db_path=%s, limit=%d, offset=%d)",
             db_path,
             limit,
             offset,
@@ -198,7 +198,7 @@ class SymbolCliCommands:
         """Emit rich symbol context including hierarchy, relationships, and freshness.
 
         Args:
-            args: Parsed ``rc symbols show`` CLI arguments.
+            args: Parsed ``cbi symbols show`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -206,7 +206,7 @@ class SymbolCliCommands:
         db_path = resolve_cli_db_path(args, self._engine.db_path)
         include_source = bool(getattr(args, "source", False))
         id_or_name: str = args.id_or_name
-        logger.debug("Running rc symbols show %r (db_path=%s)", id_or_name, db_path)
+        logger.debug("Running cbi symbols show %r (db_path=%s)", id_or_name, db_path)
         ctx = self._engine.for_db(db_path).queries.get_symbol_context(
             ContextQuery(
                 symbol=id_or_name,
@@ -225,7 +225,7 @@ class SymbolCliCommands:
         """Emit line-numbered source snippet for a symbol.
 
         Args:
-            args: Parsed ``rc source`` CLI arguments.
+            args: Parsed ``cbi source`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -242,7 +242,7 @@ class SymbolCliCommands:
             raise ValidationError("--offset must be >= 0", context={"offset": offset})
 
         id_or_name: str = args.id_or_name
-        logger.debug("Running rc source %r (db_path=%s)", id_or_name, db_path)
+        logger.debug("Running cbi source %r (db_path=%s)", id_or_name, db_path)
         snippet = self._engine.for_db(db_path).queries.get_symbol_source(
             SourceQuery(
                 symbol=id_or_name,

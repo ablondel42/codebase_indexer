@@ -1,4 +1,4 @@
-"""Structured CLI error and ``rc mcp-call`` payload envelope models."""
+"""Structured CLI error and ``cbi mcp-call`` payload envelope models."""
 
 from typing import Any
 
@@ -21,7 +21,7 @@ class CliErrorEnvelope(FrozenModel):
 
 
 class McpCallEnvelope(FrozenModel):
-    """Byte/token telemetry and decoded result envelope emitted by ``rc mcp-call``."""
+    """Byte/token telemetry and decoded result envelope emitted by ``cbi mcp-call``."""
 
     tool: str
     bytes: int

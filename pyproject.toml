@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "repo-context-mcp"
+name = "codebase-indexer"
 version = "0.2.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-rc = "cli.main:main"
+cbi = "cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

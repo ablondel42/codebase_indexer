@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "repo-context": {
-      "command": "bash",
-      "args": [".agents/plugins/repo-context/scripts/serve_mcp.sh"],
-      "cwd": "../../.."
-    }
-  }
-}

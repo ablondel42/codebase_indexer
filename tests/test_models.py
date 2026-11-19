@@ -54,9 +54,9 @@ def test_app_config_and_build_config_defaults() -> None:
     """AppConfig preserves external defaults and rejects unknown fields."""
     cfg = build_config(db_path="custom.db")
     assert isinstance(cfg, AppConfig)
-    assert cfg.app_name == "repo-context-mcp"
+    assert cfg.app_name == "codebase-indexer"
     assert cfg.db_path == Path("custom.db")
-    assert build_config().db_path == Path("repo_context.db")
+    assert build_config().db_path == Path("codebase_indexer.db")
 
     with pytest.raises(PydanticValidationError):
         AppConfig.model_validate({"unknown_option": 1})

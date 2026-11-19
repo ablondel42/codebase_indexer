@@ -162,7 +162,7 @@ class SchemaMigrator:
                 SCHEMA_VERSION,
             )
             raise DatabaseError(
-                "Database schema mismatch; run `rc index` to upgrade.",
+                "Database schema mismatch; run `cbi index` to upgrade.",
                 context={"current_version": current_version, "expected_version": SCHEMA_VERSION},
             )
 
@@ -191,7 +191,7 @@ class SchemaMigrator:
             if "readonly" in str(exc).lower():
                 logger.warning("Read-only operational error during schema migration: %s", exc)
                 raise DatabaseError(
-                    "Database schema mismatch; run `rc index` to upgrade.",
+                    "Database schema mismatch; run `cbi index` to upgrade.",
                     context={
                         "current_version": current_version,
                         "expected_version": SCHEMA_VERSION,

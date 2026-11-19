@@ -639,8 +639,6 @@ class TestHexagonalArchitectureBoundaryGate:
 
     def test_domain_package_layout_and_zero_service_suffixes(self) -> None:
         """``src/`` contains only the 10 Hexagonal packages with ``{services,models,utils}``."""
-        assert not (SRC_DIR / "repo_context").exists()
-
         top_entries = {
             entry.name
             for entry in SRC_DIR.iterdir()

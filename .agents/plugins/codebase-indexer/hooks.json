@@ -13,7 +13,7 @@
       }
     ]
   },
-  "repo-context-db-sync": {
+  "codebase-indexer-db-sync": {
     "PostToolUse": [
       {
         "matcher": "edit_file|write_file",

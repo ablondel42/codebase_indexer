@@ -1,4 +1,4 @@
-"""CLI command handlers for ``rc serve`` and ``rc mcp-call`` (sole CLI-to-MCP bridge)."""
+"""CLI command handlers for ``cbi serve`` and ``cbi mcp-call`` (sole CLI-to-MCP bridge)."""
 
 import argparse
 import asyncio
@@ -19,7 +19,7 @@ logger = get_logger("cli.services.server")
 
 
 class ServerCliCommands:
-    """Executes ``rc serve`` stdio MCP server and ``rc mcp-call`` local tool inspection."""
+    """Executes ``cbi serve`` stdio MCP server and ``cbi mcp-call`` local tool inspection."""
 
     def __init__(self, engine: IndexerEngine) -> None:
         """Initialize MCP server and local call CLI command handlers.
@@ -34,7 +34,7 @@ class ServerCliCommands:
         """Extract raw ``json_args`` CLI tokens as a normalized list of strings.
 
         Args:
-            args: Parsed ``rc mcp-call`` CLI arguments.
+            args: Parsed ``cbi mcp-call`` CLI arguments.
 
         Returns:
             List of raw string tokens supplied after ``tool_name``.
@@ -48,14 +48,14 @@ class ServerCliCommands:
         """Start the token-lean MCP server on ``stdio`` transport.
 
         Args:
-            args: Parsed ``rc serve`` CLI arguments.
+            args: Parsed ``cbi serve`` CLI arguments.
 
         Returns:
             Process exit code ``0`` when the ``stdio`` loop exits cleanly.
         """
         db_path = resolve_cli_db_path(args, self._engine.db_path)
         debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
-        logger.debug("Running rc serve (db_path=%s, debug=%s)", db_path, debug)
+        logger.debug("Running cbi serve (db_path=%s, debug=%s)", db_path, debug)
         runner = McpServerRunner(self._engine.config, engine=self._engine)
         runner.run_stdio(db_path=db_path, debug=debug)
         return 0
@@ -64,7 +64,7 @@ class ServerCliCommands:
         """Execute a registered MCP tool in-process and emit byte/token telemetry.
 
         Args:
-            args: Parsed ``rc mcp-call`` CLI arguments.
+            args: Parsed ``cbi mcp-call`` CLI arguments.
 
         Returns:
             Process exit code ``0`` on ``ok: true``, or ``1`` on ``ok: false``.

@@ -1,4 +1,4 @@
-"""PostToolUse incremental single-file SQLite sync into repo_context.db."""
+"""PostToolUse incremental single-file SQLite sync into codebase_indexer.db."""
 
 import json
 import sys
@@ -62,7 +62,7 @@ def _extract_repo_python_path(payload: dict[str, Any]) -> tuple[Path, str] | Non
 
 
 def _sync_file(db_path: Path, resolved: Path, repo_rel: str) -> None:
-    """Incrementally reindex ``resolved`` inside ``repo_context.db``."""
+    """Incrementally reindex ``resolved`` inside ``codebase_indexer.db``."""
     event = FileChangeEvent(
         event_type=FileEventType.MODIFIED,
         absolute_path=str(resolved),
@@ -76,7 +76,7 @@ def main() -> int:
     """Incrementally reindex the modified repository Python file and emit ``{}``."""
     try:
         payload = _parse_payload()
-        db_path = REPO_ROOT / "repo_context.db"
+        db_path = REPO_ROOT / "codebase_indexer.db"
         target_info = (
             _extract_repo_python_path(payload)
             if payload is not None and db_path.is_file()

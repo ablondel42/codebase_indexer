@@ -1,4 +1,4 @@
-"""CLI command handlers for ``rc refs`` and ``rc risk``."""
+"""CLI command handlers for ``cbi refs`` and ``cbi risk``."""
 
 import argparse
 
@@ -32,7 +32,7 @@ class AnalysisCliCommands:
         """Emit incoming/outgoing calls and references with optional Pyright LSP refresh.
 
         Args:
-            args: Parsed ``rc refs`` CLI arguments.
+            args: Parsed ``cbi refs`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -60,7 +60,7 @@ class AnalysisCliCommands:
         refresh = bool(getattr(args, "refresh", False))
         id_or_name: str = args.id_or_name
         logger.debug(
-            "Running rc refs %r (db_path=%s, direction=%s, refresh=%s)",
+            "Running cbi refs %r (db_path=%s, direction=%s, refresh=%s)",
             id_or_name,
             db_path,
             direction,
@@ -86,7 +86,7 @@ class AnalysisCliCommands:
         """Analyze deterministic change impact and risk for one or more symbols.
 
         Args:
-            args: Parsed ``rc risk`` CLI arguments.
+            args: Parsed ``cbi risk`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -94,7 +94,11 @@ class AnalysisCliCommands:
         db_path = resolve_cli_db_path(args, self._engine.db_path)
         repo_arg: str | None = getattr(args, "repo", None)
         symbol_refs: list[str] = list(args.id_or_names)
-        logger.debug("Running rc risk for %d target(s) (db_path=%s)", len(symbol_refs), db_path)
+        logger.debug(
+            "Running cbi risk for %d target(s) (db_path=%s)",
+            len(symbol_refs),
+            db_path,
+        )
 
         assessment = self._engine.for_db(db_path).queries.analyze_risk(
             symbol_refs,

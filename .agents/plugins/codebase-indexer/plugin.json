@@ -1,6 +1,6 @@
 {
-  "name": "repo-context",
-  "displayName": "Repo Context & Token Saver",
+  "name": "codebase-indexer",
+  "displayName": "Codebase Indexer & Token Saver",
   "version": "0.2.0",
   "description": "Token-lean MCP codebase navigation, zero-token Hexagonal AST guard and incremental DB sync hooks, and context-isolated architecture auditing.",
   "suggestedPrompts": [

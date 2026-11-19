@@ -1,4 +1,4 @@
-"""Hermetic MCP server registration, ``stdio`` handshake, and ``rc mcp-call`` tests."""
+"""Hermetic MCP server registration, ``stdio`` handshake, and ``cbi mcp-call`` tests."""
 
 import asyncio
 import json
@@ -175,7 +175,7 @@ def test_cli_serve_stdio_initialize_handshake(tmp_path: Path) -> None:
     response = json.loads(proc.stdout.strip())
     assert response["jsonrpc"] == "2.0"
     assert response["id"] == 1
-    assert response["result"]["serverInfo"]["name"] == "repo-context-mcp"
+    assert response["result"]["serverInfo"]["name"] == "codebase-indexer"
     assert not unindexed_db.exists()
 
 

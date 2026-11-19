@@ -98,7 +98,7 @@ def format_index_result_for_cli(
     include_tests: bool,
     force: bool,
 ) -> dict[str, Any]:
-    """Format a ``BatchIndexResult`` into the exact ``rc index`` JSON summary shape.
+    """Format a ``BatchIndexResult`` into the exact ``cbi index`` JSON summary shape.
 
     Args:
         result: Completed ``BatchIndexResult`` from ``CommandEngine.index_repository``.
@@ -106,7 +106,7 @@ def format_index_result_for_cli(
         force: Effective ``--force`` flag value.
 
     Returns:
-        Dictionary matching the legacy ``rc index`` JSON output keys.
+        Dictionary matching the legacy ``cbi index`` JSON output keys.
     """
     payload: dict[str, Any] = {
         "db_path": result.db_path,
@@ -134,7 +134,7 @@ def format_index_result_for_cli(
 
 
 def _format_watch_file_event(event: WatchFileProcessedEvent) -> dict[str, Any]:
-    """Format a ``WatchFileProcessedEvent`` into the ``rc watch`` JSON event shape.
+    """Format a ``WatchFileProcessedEvent`` into the ``cbi watch`` JSON event shape.
 
     Args:
         event: Per-file incremental watch event model.
@@ -184,7 +184,7 @@ def format_watch_event_payload(event: FrozenModel) -> dict[str, Any]:
         event: ``WatchStartedEvent``, ``WatchFileProcessedEvent``, or ``WatchStoppedEvent``.
 
     Returns:
-        JSON-serializable event dictionary for ``rc watch`` stdout output.
+        JSON-serializable event dictionary for ``cbi watch`` stdout output.
     """
     if isinstance(event, WatchStartedEvent):
         return {
@@ -204,13 +204,13 @@ def format_watch_event_payload(event: FrozenModel) -> dict[str, Any]:
 
 
 def format_files_for_cli(page: FileListPage) -> dict[str, Any]:
-    """Format a ``FileListPage`` into the ``rc files`` JSON output shape.
+    """Format a ``FileListPage`` into the ``cbi files`` JSON output shape.
 
     Args:
         page: Enriched ``FileListPage`` from ``QueryEngine.list_files``.
 
     Returns:
-        Dictionary matching the legacy ``rc files`` JSON structure.
+        Dictionary matching the legacy ``cbi files`` JSON structure.
     """
     return {
         "repo_id": page.repo_id,
@@ -235,13 +235,13 @@ def format_files_for_cli(page: FileListPage) -> dict[str, Any]:
 
 
 def format_outline_for_cli(outline: FileOutline) -> dict[str, Any]:
-    """Format a ``FileOutline`` into the ``rc outline`` JSON output shape.
+    """Format a ``FileOutline`` into the ``cbi outline`` JSON output shape.
 
     Args:
         outline: ``FileOutline`` model from ``QueryEngine.get_file_outline``.
 
     Returns:
-        Dictionary matching the legacy ``rc outline`` JSON structure.
+        Dictionary matching the legacy ``cbi outline`` JSON structure.
     """
     dumped = outline.model_dump(mode="json")
     if outline.is_fresh or outline.stale_reason is None:
@@ -250,7 +250,7 @@ def format_outline_for_cli(outline: FileOutline) -> dict[str, Any]:
 
 
 def _serialize_cli_symbol_entry(symbol: SymbolSummary) -> dict[str, Any]:
-    """Format one ``SymbolSummary`` into the ``rc symbols {search,list}`` item shape.
+    """Format one ``SymbolSummary`` into the ``cbi symbols {search,list}`` item shape.
 
     Args:
         symbol: ``SymbolSummary`` projection.
@@ -273,13 +273,13 @@ def _serialize_cli_symbol_entry(symbol: SymbolSummary) -> dict[str, Any]:
 
 
 def format_symbol_search_for_cli(page: SymbolSearchPage) -> dict[str, Any]:
-    """Format a ``SymbolSearchPage`` into the ``rc symbols search`` JSON output shape.
+    """Format a ``SymbolSearchPage`` into the ``cbi symbols search`` JSON output shape.
 
     Args:
         page: ``SymbolSearchPage`` model.
 
     Returns:
-        Dictionary matching the legacy ``rc symbols search`` JSON structure.
+        Dictionary matching the legacy ``cbi symbols search`` JSON structure.
     """
     return {
         "repo_id": page.repo_id,
@@ -290,13 +290,13 @@ def format_symbol_search_for_cli(page: SymbolSearchPage) -> dict[str, Any]:
 
 
 def format_symbol_list_for_cli(page: SymbolListPage) -> dict[str, Any]:
-    """Format a ``SymbolListPage`` into the ``rc symbols list`` JSON output shape.
+    """Format a ``SymbolListPage`` into the ``cbi symbols list`` JSON output shape.
 
     Args:
         page: ``SymbolListPage`` model.
 
     Returns:
-        Dictionary matching the legacy ``rc symbols list`` JSON structure.
+        Dictionary matching the legacy ``cbi symbols list`` JSON structure.
     """
     return {
         "repo_id": page.repo_id,
@@ -310,7 +310,7 @@ def format_symbol_list_for_cli(page: SymbolListPage) -> dict[str, Any]:
 
 
 def format_source_for_cli(snippet: SymbolSnippet) -> dict[str, Any]:
-    """Format a ``SymbolSnippet`` into the ``rc source`` JSON output shape.
+    """Format a ``SymbolSnippet`` into the ``cbi source`` JSON output shape.
 
     Args:
         snippet: ``SymbolSnippet`` model from ``QueryEngine.get_symbol_source``.
@@ -339,7 +339,7 @@ def format_source_for_cli(snippet: SymbolSnippet) -> dict[str, Any]:
 
 
 def _format_cli_focus_symbol(focus: FocusSymbol) -> dict[str, Any]:
-    """Serialize a ``FocusSymbol`` for ``rc symbols show`` without internal UI fields.
+    """Serialize a ``FocusSymbol`` for ``cbi symbols show`` without internal UI fields.
 
     Args:
         focus: Focus or parent ``FocusSymbol`` model.
@@ -374,7 +374,7 @@ def _format_cli_focus_symbol(focus: FocusSymbol) -> dict[str, Any]:
 
 
 def _format_cli_context_edge(edge: ContextEdge) -> dict[str, Any]:
-    """Serialize a ``ContextEdge`` for ``rc symbols show`` JSON output.
+    """Serialize a ``ContextEdge`` for ``cbi symbols show`` JSON output.
 
     Args:
         edge: ``ContextEdge`` model.
@@ -396,13 +396,13 @@ def _format_cli_context_edge(edge: ContextEdge) -> dict[str, Any]:
 
 
 def format_symbol_context_for_cli(ctx: SymbolContext) -> dict[str, Any]:
-    """Format a ``SymbolContext`` into the ``rc symbols show`` JSON output shape.
+    """Format a ``SymbolContext`` into the ``cbi symbols show`` JSON output shape.
 
     Args:
         ctx: Immutable ``SymbolContext`` model.
 
     Returns:
-        Dictionary matching the legacy ``rc symbols show`` JSON structure.
+        Dictionary matching the legacy ``cbi symbols show`` JSON structure.
     """
     return {
         "focus_symbol": _format_cli_focus_symbol(ctx.focus_symbol),
@@ -431,13 +431,13 @@ def format_symbol_context_for_cli(ctx: SymbolContext) -> dict[str, Any]:
 
 
 def _format_cli_ref_site(site: ReferenceSiteEntry) -> dict[str, Any]:
-    """Format one ``ReferenceSiteEntry`` for ``rc refs`` JSON output.
+    """Format one ``ReferenceSiteEntry`` for ``cbi refs`` JSON output.
 
     Args:
         site: ``ReferenceSiteEntry`` model.
 
     Returns:
-        Dictionary matching the legacy ``rc refs`` item shape.
+        Dictionary matching the legacy ``cbi refs`` item shape.
     """
     return {
         "direction": site.direction,
@@ -456,13 +456,13 @@ def _format_cli_ref_site(site: ReferenceSiteEntry) -> dict[str, Any]:
 
 
 def format_references_for_cli(report: SymbolReferencesReport) -> dict[str, Any]:
-    """Format a ``SymbolReferencesReport`` into the ``rc refs`` JSON output shape.
+    """Format a ``SymbolReferencesReport`` into the ``cbi refs`` JSON output shape.
 
     Args:
         report: ``SymbolReferencesReport`` model.
 
     Returns:
-        Dictionary matching the legacy ``rc refs`` JSON structure.
+        Dictionary matching the legacy ``cbi refs`` JSON structure.
     """
     sym = report.symbol
     return {
@@ -486,7 +486,7 @@ def format_references_for_cli(report: SymbolReferencesReport) -> dict[str, Any]:
 
 
 def _serialize_cli_risk_target(target: RiskTarget) -> dict[str, Any]:
-    """Format one ``RiskTarget`` for ``rc risk`` JSON output omitting null fields.
+    """Format one ``RiskTarget`` for ``cbi risk`` JSON output omitting null fields.
 
     Args:
         target: ``RiskTarget`` model.
@@ -509,13 +509,13 @@ def _serialize_cli_risk_target(target: RiskTarget) -> dict[str, Any]:
 
 
 def serialize_risk_for_cli(result: RiskAssessment) -> dict[str, Any]:
-    """Serialize a ``RiskAssessment`` into the deterministic ``rc risk`` JSON shape.
+    """Serialize a ``RiskAssessment`` into the deterministic ``cbi risk`` JSON shape.
 
     Args:
         result: ``RiskAssessment`` report.
 
     Returns:
-        Dictionary matching the legacy ``rc risk`` JSON structure.
+        Dictionary matching the legacy ``cbi risk`` JSON structure.
     """
     facts = result.facts
     return {

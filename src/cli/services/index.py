@@ -1,4 +1,4 @@
-"""CLI command handlers for ``rc index`` and ``rc watch``."""
+"""CLI command handlers for ``cbi index`` and ``cbi watch``."""
 
 import argparse
 from pathlib import Path
@@ -19,7 +19,7 @@ logger = get_logger("cli.services.index")
 
 
 class IndexCliCommands:
-    """Executes ``rc index`` batch indexing and ``rc watch`` incremental daemon commands."""
+    """Executes ``cbi index`` batch indexing and ``cbi watch`` incremental daemon commands."""
 
     def __init__(self, engine: IndexerEngine) -> None:
         """Initialize indexing CLI command handlers.
@@ -33,7 +33,7 @@ class IndexCliCommands:
         """Scan, extract, link, and optionally LSP-enrich a repository.
 
         Args:
-            args: Parsed ``rc index`` CLI arguments.
+            args: Parsed ``cbi index`` CLI arguments.
 
         Returns:
             Process exit code ``0`` on completion.
@@ -45,7 +45,7 @@ class IndexCliCommands:
         repo_root: Path = getattr(args, "repo_path", None) or Path.cwd()
 
         logger.debug(
-            "Running rc index on %s (db_path=%s, include_tests=%s, force=%s, lsp=%s)",
+            "Running cbi index on %s (db_path=%s, include_tests=%s, force=%s, lsp=%s)",
             repo_root,
             db_path,
             include_tests,
@@ -83,7 +83,7 @@ class IndexCliCommands:
         """Watch a repository directory and stream incremental JSON update events.
 
         Args:
-            args: Parsed ``rc watch`` CLI arguments.
+            args: Parsed ``cbi watch`` CLI arguments.
 
         Returns:
             Process exit code ``0`` when watch mode stops cleanly.
@@ -103,7 +103,7 @@ class IndexCliCommands:
         repo_root: Path = getattr(args, "repo_path", None) or Path.cwd()
 
         logger.debug(
-            "Running rc watch on %s (db_path=%s, debounce_ms=%d, include_tests=%s)",
+            "Running cbi watch on %s (db_path=%s, debounce_ms=%d, include_tests=%s)",
             repo_root,
             db_path,
             debounce_ms,

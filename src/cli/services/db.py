@@ -1,4 +1,4 @@
-"""CLI command handlers for ``rc db {status,repos,tables,runs,sql}``."""
+"""CLI command handlers for ``cbi db {status,repos,tables,runs,sql}``."""
 
 import argparse
 
@@ -25,14 +25,14 @@ class DbCliCommands:
         """Emit database health, schema version, table counts, and LSP coverage JSON.
 
         Args:
-            args: Parsed ``rc db status`` CLI arguments.
+            args: Parsed ``cbi db status`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
         """
         db_path = resolve_cli_db_path(args, self._engine.db_path)
         repo_arg: str | None = getattr(args, "repo", None)
-        logger.debug("Running rc db status (db_path=%s, repo=%s)", db_path, repo_arg)
+        logger.debug("Running cbi db status (db_path=%s, repo=%s)", db_path, repo_arg)
         report = self._engine.for_db(db_path).queries.get_db_status(repo_arg)
         emit_json(report.model_dump(mode="json"))
         return 0
@@ -41,13 +41,13 @@ class DbCliCommands:
         """Emit per-repository file, node, and edge storage summaries as JSON.
 
         Args:
-            args: Parsed ``rc db repos`` CLI arguments.
+            args: Parsed ``cbi db repos`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
         """
         db_path = resolve_cli_db_path(args, self._engine.db_path)
-        logger.debug("Running rc db repos (db_path=%s)", db_path)
+        logger.debug("Running cbi db repos (db_path=%s)", db_path)
         report = self._engine.for_db(db_path).queries.list_repos()
         emit_json(report.model_dump(mode="json"))
         return 0
@@ -56,13 +56,13 @@ class DbCliCommands:
         """Emit SQLite ``user_version`` and exact table row counts as JSON.
 
         Args:
-            args: Parsed ``rc db tables`` CLI arguments.
+            args: Parsed ``cbi db tables`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
         """
         db_path = resolve_cli_db_path(args, self._engine.db_path)
-        logger.debug("Running rc db tables (db_path=%s)", db_path)
+        logger.debug("Running cbi db tables (db_path=%s)", db_path)
         report = self._engine.for_db(db_path).queries.list_tables()
         emit_json(report.model_dump(mode="json"))
         return 0
@@ -71,7 +71,7 @@ class DbCliCommands:
         """Emit recent indexing run audit records as JSON.
 
         Args:
-            args: Parsed ``rc db runs`` CLI arguments.
+            args: Parsed ``cbi db runs`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -84,7 +84,12 @@ class DbCliCommands:
         if limit < 1:
             raise ValidationError("--limit must be >= 1", context={"limit": limit})
         repo_arg: str | None = getattr(args, "repo", None)
-        logger.debug("Running rc db runs (db_path=%s, repo=%s, limit=%d)", db_path, repo_arg, limit)
+        logger.debug(
+            "Running cbi db runs (db_path=%s, repo=%s, limit=%d)",
+            db_path,
+            repo_arg,
+            limit,
+        )
         report = self._engine.for_db(db_path).queries.list_index_runs(repo_arg, limit=limit)
         emit_json(report.model_dump(mode="json"))
         return 0
@@ -93,7 +98,7 @@ class DbCliCommands:
         """Execute an authorizer-guarded read-only SQL query and emit JSON rows.
 
         Args:
-            args: Parsed ``rc db sql`` CLI arguments.
+            args: Parsed ``cbi db sql`` CLI arguments.
 
         Returns:
             Process exit code ``0``.
@@ -106,7 +111,7 @@ class DbCliCommands:
         if limit < 1:
             raise ValidationError("--limit must be >= 1", context={"limit": limit})
         raw_query: str = getattr(args, "query", "")
-        logger.debug("Running rc db sql (db_path=%s, limit=%d)", db_path, limit)
+        logger.debug("Running cbi db sql (db_path=%s, limit=%d)", db_path, limit)
         report = self._engine.for_db(db_path).queries.execute_readonly_sql(raw_query, limit=limit)
         emit_json(report.model_dump(mode="json"), default=str)
         return 0

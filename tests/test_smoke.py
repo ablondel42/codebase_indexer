@@ -57,7 +57,7 @@ def test_import_config() -> None:
     """``AppConfig`` and ``build_config`` expose v0.2.0 defaults and Path coercion."""
     config = build_config()
     assert isinstance(config, AppConfig)
-    assert config.app_name == "repo-context-mcp"
+    assert config.app_name == "codebase-indexer"
     assert config.debug is False
     assert config.include_tests is False
     assert config.max_file_size_bytes == 2 * 1024 * 1024

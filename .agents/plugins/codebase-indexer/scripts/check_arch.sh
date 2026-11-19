@@ -13,9 +13,9 @@ if [ "${1:-}" = "--tests" ]; then
     shift
 fi
 
-"$REPO_ROOT/venv/bin/ruff" check src/ tests/ .agents/plugins/repo-context/scripts/*.py
+"$REPO_ROOT/venv/bin/ruff" check src/ tests/ .agents/plugins/codebase-indexer/scripts/*.py
 pyright
-pyright .agents/plugins/repo-context/scripts/*.py
+pyright .agents/plugins/codebase-indexer/scripts/*.py
 "$REPO_ROOT/venv/bin/pytest" -q --no-header \
     tests/test_engine_and_architecture.py \
     -k TestHexagonalArchitectureBoundaryGate

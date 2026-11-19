@@ -1,4 +1,4 @@
-"""Grouped ``rc`` CLI ``ArgumentParser`` builder service."""
+"""Grouped ``cbi`` CLI ``ArgumentParser`` builder service."""
 
 import argparse
 from collections.abc import Callable, Mapping
@@ -11,7 +11,7 @@ logger = get_logger("cli.services.parser")
 
 
 class CliParserBuilder:
-    """Builds the grouped ``rc`` CLI ``ArgumentParser`` and binds subcommand handlers."""
+    """Builds the grouped ``cbi`` CLI ``ArgumentParser`` and binds subcommand handlers."""
 
     def __init__(
         self,
@@ -37,7 +37,7 @@ class CliParserBuilder:
             "--db-path",
             type=Path,
             default=argparse.SUPPRESS,
-            help="Path to SQLite database file (default: repo_context.db)",
+            help="Path to SQLite database file (default: codebase_indexer.db)",
         )
         return common
 
@@ -59,7 +59,7 @@ class CliParserBuilder:
         subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register the ``rc index`` subcommand parser.
+        """Register the ``cbi index`` subcommand parser.
 
         Args:
             subparsers: Root subparsers action.
@@ -99,7 +99,7 @@ class CliParserBuilder:
             "--shell",
             action="store_true",
             default=False,
-            help="Start interactive `rc>` CLI shell immediately after indexing",
+            help="Start interactive `cbi>` CLI shell immediately after indexing",
         )
         self._bind_handler(index_parser, "index")
 
@@ -108,7 +108,7 @@ class CliParserBuilder:
         db_subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register ``rc db {status,repos,tables}`` subparsers.
+        """Register ``cbi db {status,repos,tables}`` subparsers.
 
         Args:
             db_subparsers: ``db`` group subparsers action.
@@ -149,7 +149,7 @@ class CliParserBuilder:
         db_subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register ``rc db {runs,sql}`` subparsers.
+        """Register ``cbi db {runs,sql}`` subparsers.
 
         Args:
             db_subparsers: ``db`` group subparsers action.
@@ -193,7 +193,7 @@ class CliParserBuilder:
         subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register the ``rc db`` subcommand group and its subcommands.
+        """Register the ``cbi db`` subcommand group and its subcommands.
 
         Args:
             subparsers: Root subparsers action.
@@ -214,7 +214,7 @@ class CliParserBuilder:
         sub_common: argparse.ArgumentParser,
         kind_choices: list[str],
     ) -> None:
-        """Register ``rc symbols search`` subparser.
+        """Register ``cbi symbols search`` subparser.
 
         Args:
             symbols_subparsers: ``symbols`` group subparsers action.
@@ -260,7 +260,7 @@ class CliParserBuilder:
         sub_common: argparse.ArgumentParser,
         kind_choices: list[str],
     ) -> None:
-        """Register ``rc symbols {list,show}`` subparsers.
+        """Register ``cbi symbols {list,show}`` subparsers.
 
         Args:
             symbols_subparsers: ``symbols`` group subparsers action.
@@ -334,7 +334,7 @@ class CliParserBuilder:
         subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register the ``rc symbols`` subcommand group and its subcommands.
+        """Register the ``cbi symbols`` subcommand group and its subcommands.
 
         Args:
             subparsers: Root subparsers action.
@@ -510,7 +510,7 @@ class CliParserBuilder:
         shell_parser = subparsers.add_parser(
             "shell",
             parents=[sub_common],
-            help="Start interactive `rc>` shell to inspect an indexed database",
+            help="Start interactive `cbi>` shell to inspect an indexed database",
         )
         shell_parser.add_argument("--repo", type=str, default=None, help="Repository selector")
         self._bind_handler(shell_parser, "shell")
@@ -580,14 +580,14 @@ class CliParserBuilder:
         self._bind_handler(mcp_call_parser, "mcp-call")
 
     def build(self) -> argparse.ArgumentParser:
-        """Construct the complete ``rc`` CLI ``ArgumentParser``.
+        """Construct the complete ``cbi`` CLI ``ArgumentParser``.
 
         Returns:
             Configured root ``ArgumentParser`` instance.
         """
         sub_common = self._make_subcommand_common_parser()
         parser = argparse.ArgumentParser(
-            prog="rc",
+            prog="cbi",
             description="Repository intelligence CLI and token-lean MCP server",
         )
         parser.add_argument(
@@ -599,7 +599,7 @@ class CliParserBuilder:
             "--db-path",
             type=Path,
             default=None,
-            help="Path to SQLite database file (default: repo_context.db)",
+            help="Path to SQLite database file (default: codebase_indexer.db)",
         )
         parser.add_argument(
             "--verbose",

@@ -8,7 +8,7 @@ globs: "**/src/**/*.py, **/tests/**/*.py"
 All Python files under `src/` and `tests/` must satisfy `TestHexagonalArchitectureBoundaryGate` in `tests/test_engine_and_architecture.py` and the Ruff/Pyright settings in `pyproject.toml`.
 
 ## 1. 10-Package Hexagonal Layout (`src/<domain>/`)
-- **Exact top-level packages**: `core`, `storage`, `lsp`, `parsing`, `graph`, `context`, `indexing`, `engine`, `mcp_server`, `cli`. Never recreate `src/repo_context/`.
+- **Exact top-level packages**: `core`, `storage`, `lsp`, `parsing`, `graph`, `context`, `indexing`, `engine`, `mcp_server`, `cli`. Do not add extra top-level packages under `src/`.
 - **Subpackages**: `core/{ports,models,utils}`; all other 9 domains strictly `{services,models,utils}`.
 - **Package root `.py` files**: only `__init__.py` (plus `src/cli/main.py`).
 - **Naming**: zero `*_service.py` filenames anywhere in `src/`.

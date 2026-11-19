@@ -1,4 +1,4 @@
-"""Comprehensive subprocess tests for all grouped ``rc`` CLI commands via ``cli.main``."""
+"""Comprehensive subprocess tests for all grouped ``cbi`` CLI commands via ``cli.main``."""
 
 import json
 import os
@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
 
-def _run_rc(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _run_cbi(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run ``python -m cli.main`` with ``src/`` prioritized on ``PYTHONPATH``."""
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
@@ -65,33 +65,33 @@ def cli_workspace(tmp_path: Path) -> tuple[Path, Path]:
 
 @pytest.fixture
 def indexed_workspace(cli_workspace: tuple[Path, Path]) -> tuple[Path, Path]:
-    """Run ``rc index`` on ``cli_workspace`` and return ``(repo_root, db_path)``."""
+    """Run ``cbi index`` on ``cli_workspace`` and return ``(repo_root, db_path)``."""
     repo_root, db_path = cli_workspace
-    res = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
+    res = _run_cbi("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert res.returncode == 0, res.stderr
     return repo_root, db_path
 
 
-def test_rc_index_initial_incremental_force_and_include_tests(
+def test_cbi_index_initial_incremental_force_and_include_tests(
     cli_workspace: tuple[Path, Path],
 ) -> None:
-    """``rc index`` handles initial, unchanged incremental, ``--force``, and ``--include-tests``."""
+    """``cbi index`` handles initial, incremental, ``--force``, and ``--include-tests`` runs."""
     repo_root, db_path = cli_workspace
 
-    init_res = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
+    init_res = _run_cbi("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert init_res.returncode == 0, init_res.stderr
     init_data = json.loads(init_res.stdout)
     assert init_data["files_scanned"] == 3
     assert init_data["files_indexed"] == 3
     assert init_data["linker"]["total_resolved"] >= 3
 
-    inc_res = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
+    inc_res = _run_cbi("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert inc_res.returncode == 0
     inc_data = json.loads(inc_res.stdout)
     assert inc_data["files_indexed"] == 0
     assert inc_data["files_unchanged"] == 3
 
-    force_res = _run_rc(
+    force_res = _run_cbi(
         "index",
         str(repo_root),
         "--db-path",
@@ -106,19 +106,19 @@ def test_rc_index_initial_incremental_force_and_include_tests(
     assert force_data["files_indexed"] == 4
 
 
-def test_rc_db_subcommands_and_read_only_sql_guard(
+def test_cbi_db_subcommands_and_read_only_sql_guard(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """``rc db {status,repos,tables,runs,sql}`` emit JSON objects and block SQL mutations."""
+    """``cbi db {status,repos,tables,runs,sql}`` emit JSON objects and block SQL mutations."""
     repo_root, db_path = indexed_workspace
 
     for sub in ("status", "repos", "tables", "runs"):
-        res = _run_rc("db", sub, "--db-path", str(db_path), cwd=repo_root)
+        res = _run_cbi("db", sub, "--db-path", str(db_path), cwd=repo_root)
         assert res.returncode == 0, f"db {sub} failed: {res.stderr}"
         parsed = json.loads(res.stdout)
         assert isinstance(parsed, dict)
 
-    select_res = _run_rc(
+    select_res = _run_cbi(
         "db",
         "sql",
         "SELECT name, kind FROM nodes WHERE kind = 'class' ORDER BY name",
@@ -140,20 +140,20 @@ def test_rc_db_subcommands_and_read_only_sql_guard(
         ),
     )
     for forbidden_sql in forbidden_queries:
-        bad_res = _run_rc("db", "sql", forbidden_sql, "--db-path", str(db_path), cwd=repo_root)
+        bad_res = _run_cbi("db", "sql", forbidden_sql, "--db-path", str(db_path), cwd=repo_root)
         assert bad_res.returncode != 0, f"Expected failure for {forbidden_sql}"
         bad_err = json.loads(bad_res.stderr)
         assert bad_err["ok"] is False
         assert "not authorized" in bad_err["error"]["message"]
 
 
-def test_rc_files_and_outline_json(
+def test_cbi_files_and_outline_json(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """``rc files`` reflects live disk freshness and ``rc outline`` emits hierarchical JSON."""
+    """``cbi files`` reflects live disk freshness and ``cbi outline`` emits hierarchical JSON."""
     repo_root, db_path = indexed_workspace
 
-    files_res = _run_rc("files", "--db-path", str(db_path), cwd=repo_root)
+    files_res = _run_cbi("files", "--db-path", str(db_path), cwd=repo_root)
     assert files_res.returncode == 0
     files_payload = json.loads(files_res.stdout)
     fresh_paths = {
@@ -164,13 +164,13 @@ def test_rc_files_and_outline_json(
 
     math_file = repo_root / "pkg" / "math_ops.py"
     math_file.write_text(math_file.read_text(encoding="utf-8") + "\n# modified\n", encoding="utf-8")
-    files_mod = _run_rc("files", "math_ops", "--db-path", str(db_path), cwd=repo_root)
+    files_mod = _run_cbi("files", "math_ops", "--db-path", str(db_path), cwd=repo_root)
     assert files_mod.returncode == 0
     entries = json.loads(files_mod.stdout)["files"]
     assert len(entries) == 1
     assert entries[0]["freshness"] == "modified"
 
-    outline_public = _run_rc(
+    outline_public = _run_cbi(
         "outline",
         "pkg/math_ops.py",
         "--no-private",
@@ -184,7 +184,7 @@ def test_rc_files_and_outline_json(
     assert calc_node["id"].startswith("sym:")
     assert [c["name"] for c in calc_node["children"]] == ["double"]
 
-    outline_full = _run_rc("outline", "pkg/math_ops.py", "--db-path", str(db_path), cwd=repo_root)
+    outline_full = _run_cbi("outline", "pkg/math_ops.py", "--db-path", str(db_path), cwd=repo_root)
     assert outline_full.returncode == 0
     outline_full_data = json.loads(outline_full.stdout)
     assert outline_full_data["module_path"] == "pkg.math_ops"
@@ -192,13 +192,13 @@ def test_rc_files_and_outline_json(
     assert "_internal" in [c["name"] for c in full_calc["children"]]
 
 
-def test_rc_symbols_and_source_commands(
+def test_cbi_symbols_and_source_commands(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """``rc symbols {search,list,show}`` and ``rc source`` emit valid structured JSON."""
+    """``cbi symbols {search,list,show}`` and ``cbi source`` emit valid structured JSON."""
     repo_root, db_path = indexed_workspace
 
-    search_res = _run_rc(
+    search_res = _run_cbi(
         "symbols",
         "search",
         "Calculator",
@@ -211,7 +211,7 @@ def test_rc_symbols_and_source_commands(
     qualified = {s["qualified_name"] for s in search_data["symbols"]}
     assert "pkg.math_ops.Calculator" in qualified
 
-    list_res = _run_rc(
+    list_res = _run_cbi(
         "symbols",
         "list",
         "--kind",
@@ -225,13 +225,13 @@ def test_rc_symbols_and_source_commands(
     assert len(modules) == 3
     mod_id = modules[0]["id"]
 
-    show_mod = _run_rc("symbols", "show", mod_id, "--db-path", str(db_path), cwd=repo_root)
+    show_mod = _run_cbi("symbols", "show", mod_id, "--db-path", str(db_path), cwd=repo_root)
     assert show_mod.returncode == 0, show_mod.stderr
     show_mod_data = json.loads(show_mod.stdout)
     assert show_mod_data["focus_symbol"]["id"] == mod_id
     assert show_mod_data["structural_parent"] is None
 
-    show_fn = _run_rc(
+    show_fn = _run_cbi(
         "symbols",
         "show",
         "pkg.math_ops.add",
@@ -243,7 +243,7 @@ def test_rc_symbols_and_source_commands(
     assert show_fn.returncode == 0
     assert "def add(" in json.loads(show_fn.stdout)["focus_symbol"]["source"]
 
-    src_res = _run_rc("source", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
+    src_res = _run_cbi("source", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
     assert src_res.returncode == 0
     src_data = json.loads(src_res.stdout)
     assert src_data["symbol_id"].startswith("sym:")
@@ -251,13 +251,13 @@ def test_rc_symbols_and_source_commands(
     assert "return a + b" in src_data["source"]
 
 
-def test_rc_refs_risk_and_mcp_call(
+def test_cbi_refs_risk_and_mcp_call(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """``rc refs``, ``rc risk``, daemon ``--help``, and ``rc mcp-call`` emit valid JSON."""
+    """``cbi refs``, ``cbi risk``, daemon ``--help``, and ``cbi mcp-call`` emit valid JSON."""
     repo_root, db_path = indexed_workspace
 
-    refs_res = _run_rc(
+    refs_res = _run_cbi(
         "refs",
         "pkg.math_ops.add",
         "--direction",
@@ -272,7 +272,7 @@ def test_rc_refs_risk_and_mcp_call(
     peers = {r["peer_name"] for r in refs_data["references"]}
     assert "pkg.runner.run_calc" in peers
 
-    risk_multi = _run_rc(
+    risk_multi = _run_cbi(
         "risk",
         "pkg.math_ops.add",
         "pkg.runner.run_calc",
@@ -283,13 +283,13 @@ def test_rc_refs_risk_and_mcp_call(
     assert risk_multi.returncode == 0
     assert json.loads(risk_multi.stdout)["facts"]["target_spans_multiple_modules"] is True
 
-    risk_single = _run_rc("risk", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
+    risk_single = _run_cbi("risk", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
     assert risk_single.returncode == 0
     assert json.loads(risk_single.stdout)["facts"]["cross_module_impact"] is True
 
-    assert _run_rc("watch", "--help").returncode == 0
-    assert _run_rc("serve", "--help").returncode == 0
-    mcp_res = _run_rc(
+    assert _run_cbi("watch", "--help").returncode == 0
+    assert _run_cbi("serve", "--help").returncode == 0
+    mcp_res = _run_cbi(
         "mcp-call",
         "get_repo_overview",
         "{}",
@@ -301,8 +301,8 @@ def test_rc_refs_risk_and_mcp_call(
     assert json.loads(mcp_res.stdout)["result"]["ok"] is True
 
 
-def test_rc_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) -> None:
-    """``rc symbols list/search --file .github/`` preserves leading dots without stripping."""
+def test_cbi_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) -> None:
+    """``cbi symbols list/search --file .github/`` preserves leading dots cleanly."""
     repo_root = tmp_path / "dot_cli_repo"
     (repo_root / ".github").mkdir(parents=True)
     (repo_root / "github").mkdir()
@@ -316,11 +316,11 @@ def test_rc_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) ->
     )
 
     db_path = tmp_path / "dot_cli.db"
-    idx_res = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
+    idx_res = _run_cbi("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
     assert idx_res.returncode == 0, idx_res.stderr
 
     for file_arg in (".github/", "./.github/", "./.github/ci.py"):
-        list_res = _run_rc(
+        list_res = _run_cbi(
             "symbols",
             "list",
             "--file",
@@ -335,7 +335,7 @@ def test_rc_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) ->
         assert {s["file_path"] for s in syms} == {".github/ci.py"}
         assert "check_ci" in {s["name"] for s in syms}
 
-    search_res = _run_rc(
+    search_res = _run_cbi(
         "symbols",
         "search",
         "check",

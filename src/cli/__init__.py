@@ -1,4 +1,4 @@
-"""Thin grouped ``rc`` CLI driving adapter over ``IndexerEngine``."""
+"""Thin grouped ``cbi`` CLI driving adapter over ``IndexerEngine``."""
 
 from cli.services import CliApplication, CliParserBuilder
 
