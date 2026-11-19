@@ -1,0 +1,30 @@
+{
+  "hexagonal-ast-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x ../../../venv/bin/python ]; then exec ../../../venv/bin/python ./scripts/pre_write_guard.py; else exec python3 ./scripts/pre_write_guard.py; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "repo-context-db-sync": {
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ./scripts/post_write_sync.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -12,6 +12,7 @@ Commands:
   ./rc path/to/repo [--cli]   Index a repository and start the interactive CLI (--cli is optional; --no-cli exits)
   ./rc demo [--cli]           Index '.' (including tests) and start the interactive CLI (--cli is optional)
   ./rc dev                    Delete and recreate DB, run full indexing + LSP, and display system status
+  ./rc check [--tests ...]    Run fast Ruff + Pyright + Hexagonal AST gate (add --tests for pytest)
   ./rc tests [pytest-args]    Execute the full test suite (ruff check + pytest)
 
 Forward any grouped subcommand directly: ./rc --help | ./rc db status | ./rc outline <file>
@@ -64,6 +65,12 @@ if [ "$1" = "dev" ]; then
     export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
     rm -f "$DIR/repo_context.db" "$DIR/repo_context.db-wal" "$DIR/repo_context.db-shm" "$DIR/repo_context.db-journal"
     exec "$PY" -m cli.main index . --include-tests --force --lsp ${@+"$@"}
+fi
+
+if [ "$1" = "check" ]; then
+    shift
+    cd "$DIR"
+    exec bash "$DIR/.agents/plugins/repo-context/scripts/check_arch.sh" ${@+"$@"}
 fi
 
 if [ "$1" = "tests" ]; then

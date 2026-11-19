@@ -1,0 +1,11 @@
+{
+  "name": "repo-context",
+  "displayName": "Repo Context & Token Saver",
+  "version": "0.2.0",
+  "description": "Token-lean MCP codebase navigation, zero-token Hexagonal AST guard and incremental DB sync hooks, and context-isolated architecture auditing.",
+  "suggestedPrompts": [
+    "Run /arch-check on my workspace changes",
+    "Analyze the blast radius of changing IndexerEngine",
+    "Show the outline and incoming references of QueryEngine"
+  ]
+}
