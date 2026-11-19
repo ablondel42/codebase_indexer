@@ -2,7 +2,7 @@
 
 import sqlite3
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
@@ -164,7 +164,7 @@ class SqlUnitOfWork:
             raise DatabaseError(f"Failed to roll back database transaction: {msg}") from exc
 
     @contextmanager
-    def savepoint(self) -> Iterator[None]:
+    def savepoint(self) -> Generator[None, None, None]:
         """Open a nested SQLite ``SAVEPOINT`` isolating per-item writes.
 
         Yields:
@@ -342,7 +342,7 @@ class SqlUnitOfWorkFactory:
         read_only: bool = False,
         must_exist: bool = False,
         initialize: bool = False,
-    ) -> Iterator[UnitOfWorkProtocol]:
+    ) -> Generator[UnitOfWorkProtocol, None, None]:
         """Open a scoped ``UnitOfWorkProtocol`` session over ``db_path``.
 
         Auto-commits write sessions on clean exit when a transaction remains open,

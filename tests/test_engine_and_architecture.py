@@ -598,6 +598,42 @@ def _inspect_except_handler(
     return errors
 
 
+_CONTEXT_MANAGER_RETURN_TYPES: dict[str, str] = {
+    "contextmanager": "Generator",
+    "asynccontextmanager": "AsyncGenerator",
+}
+
+
+def _terminal_name(node: ast.expr) -> str | None:
+    """Return the trailing identifier of a ``Name``, ``Attribute``, or ``Subscript`` node."""
+    if isinstance(node, ast.Subscript):
+        return _terminal_name(node.value)
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _check_context_manager_returns(rel_posix: str, tree: ast.Module) -> list[str]:
+    """Flag ``@contextmanager``/``@asynccontextmanager`` functions not returning a generator."""
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            expected = _CONTEXT_MANAGER_RETURN_TYPES.get(_terminal_name(decorator) or "")
+            if expected is None:
+                continue
+            actual = _terminal_name(node.returns) if node.returns is not None else None
+            if actual != expected:
+                errors.append(
+                    f"{rel_posix}:{node.lineno}: {node.name} must return {expected}[...], "
+                    f"got {actual}"
+                )
+    return errors
+
+
 class TestHexagonalArchitectureBoundaryGate:
     """AST static analysis gate enforcing Hexagonal package, import, model, and error rules."""
 
@@ -694,4 +730,18 @@ class TestHexagonalArchitectureBoundaryGate:
 
         unauthorized_broad = sorted(broad_catch_files - DOCUMENTED_BROAD_EXCEPT_FILES)
         assert unauthorized_broad == []
+        assert violations == []
+
+    def test_context_managers_annotate_generator_return_types(self) -> None:
+        """``@contextmanager`` returns ``Generator[...]`` (``Iterator[...]`` is deprecated)."""
+        tests_dir = PROJECT_ROOT / "tests"
+        candidates = [
+            *_iter_src_python_files(),
+            *(p for p in sorted(tests_dir.rglob("*.py")) if "fixtures" not in p.parts),
+        ]
+        violations: list[str] = []
+        for path in candidates:
+            rel_posix = path.relative_to(PROJECT_ROOT).as_posix()
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            violations.extend(_check_context_manager_returns(rel_posix, tree))
         assert violations == []
