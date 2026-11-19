@@ -46,6 +46,7 @@ ensure_env() {
     fi
     if [ "${RC_NO_BOOTSTRAP:-0}" != "1" ] && [ -x "$VENV/bin/python" ]; then
         export PATH="$VENV/bin:$PATH"
+        export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
         PY="$VENV/bin/python"
         RUFF="$(command -v "$VENV/bin/ruff" || command -v ruff || true)"
     else
@@ -62,7 +63,7 @@ if [ "$1" = "dev" ]; then
     cd "$DIR"
     export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
     rm -f "$DIR/repo_context.db" "$DIR/repo_context.db-wal" "$DIR/repo_context.db-shm" "$DIR/repo_context.db-journal"
-    exec "$PY" -m repo_context.cli.main index . --include-tests --force --lsp ${@+"$@"}
+    exec "$PY" -m cli.main index . --include-tests --force --lsp ${@+"$@"}
 fi
 
 if [ "$1" = "tests" ]; then
@@ -73,4 +74,4 @@ if [ "$1" = "tests" ]; then
     exec "$PY" -m pytest -v ${@+"$@"}
 fi
 
-exec "$PY" -m repo_context.cli.main "$@"
+exec "$PY" -m cli.main "$@"

@@ -1,55 +1,58 @@
-"""Logging configuration tests verifying stderr-only console output and safe level checks."""
+"""Logging configuration tests verifying stderr-only console output and level checks."""
 
 import logging
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-import repo_context.logging_config as logging_config
-from repo_context.logging_config import get_logger, setup_logging
+from core.utils.logging import (
+    ROOT_LOGGER_NAME,
+    configure_logging,
+    get_logger,
+    is_logging_configured,
+    reset_logging,
+)
 
 
 @pytest.fixture(autouse=True)
-def reset_logging_state() -> Iterator[None]:
-    """Reset ``repo_context`` logger handlers and initialization flag around each test."""
-    root_logger = logging.getLogger("repo_context")
-    old_handlers = list(root_logger.handlers)
-    old_level = root_logger.level
-    old_flag = logging_config.LOGGING_INITIALIZED
-    root_logger.handlers.clear()
-    logging_config.LOGGING_INITIALIZED = False
+def isolate_indexer_logging() -> Iterator[None]:
+    """Reset ``indexer`` root logger handlers and state around each test."""
+    reset_logging()
+    logging.getLogger(ROOT_LOGGER_NAME).propagate = True
     try:
         yield
     finally:
-        for handler in list(root_logger.handlers):
-            root_logger.removeHandler(handler)
-            if isinstance(handler, logging.FileHandler):
-                handler.close()
-        for handler in old_handlers:
-            root_logger.addHandler(handler)
-        root_logger.setLevel(old_level)
-        logging_config.LOGGING_INITIALIZED = old_flag
+        reset_logging()
+        logging.getLogger(ROOT_LOGGER_NAME).propagate = True
 
 
 class TestGetLogger:
     """Tests for ``get_logger``."""
 
     def test_get_logger_namespacing(self) -> None:
-        logger = get_logger("storage.nodes")
+        """Child loggers attach under the ``indexer`` root namespace."""
+        assert ROOT_LOGGER_NAME == "indexer"
+        logger = get_logger("storage.services.nodes")
         assert isinstance(logger, logging.Logger)
-        assert logger.name == "repo_context.storage.nodes"
-        assert logger is get_logger("storage.nodes")
+        assert logger.name == "indexer.storage.services.nodes"
+        assert logger is get_logger("storage.services.nodes")
+        assert get_logger("").name == "indexer"
 
 
-class TestSetupLogging:
-    """Tests for ``setup_logging``."""
+class TestConfigureLogging:
+    """Tests for ``configure_logging``, ``is_logging_configured``, and ``reset_logging``."""
 
     def test_console_handler_uses_stderr_not_stdout(self) -> None:
-        """Console logging MUST write to sys.stderr so MCP stdout stays clean."""
-        setup_logging(level="INFO")
-        root_logger = logging.getLogger("repo_context")
+        """Console logging MUST write to sys.stderr so CLI/MCP stdout stays clean."""
+        assert is_logging_configured() is False
+        configure_logging(level="INFO")
+        assert is_logging_configured() is True
+
+        root_logger = logging.getLogger(ROOT_LOGGER_NAME)
+        assert root_logger.propagate is False
         stream_handlers = [
             h
             for h in root_logger.handlers
@@ -58,35 +61,44 @@ class TestSetupLogging:
         assert len(stream_handlers) == 1
         assert stream_handlers[0].stream is sys.stderr
         assert stream_handlers[0].stream is not sys.stdout
-        assert logging_config.LOGGING_INITIALIZED is True
 
-    def test_setup_logging_skips_if_already_initialized(
-        self, caplog: pytest.LogCaptureFixture
+        reset_logging()
+        assert is_logging_configured() is False
+
+    def test_configure_logging_skips_if_already_configured(
+        self,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        setup_logging(level="INFO")
-        with caplog.at_level(logging.WARNING):
-            setup_logging(level="DEBUG")
-        assert "already initialized" in caplog.text.lower()
-        assert logging.getLogger("repo_context").level == logging.INFO
+        """Second configure_logging call logs a warning to stderr and preserves level."""
+        configure_logging(level="INFO")
+        configure_logging(level="DEBUG")
 
-    def test_setup_logging_respects_valid_levels(self) -> None:
-        root_logger = logging.getLogger("repo_context")
-        setup_logging(level="debug")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "already configured" in captured.err.lower()
+        assert logging.getLogger(ROOT_LOGGER_NAME).level == logging.INFO
+
+    def test_configure_logging_respects_valid_levels(self) -> None:
+        """Case-insensitive log levels including WARN map to standard logging constants."""
+        root_logger = logging.getLogger(ROOT_LOGGER_NAME)
+        configure_logging(level="debug")
         assert root_logger.level == logging.DEBUG
 
-        logging_config.LOGGING_INITIALIZED = False
-        setup_logging(level="WARN")
+        reset_logging()
+        configure_logging(level="WARN")
         assert root_logger.level == logging.WARNING
 
     @pytest.mark.parametrize("bad_level", ["TRACE", "INVALID", "", 123])
-    def test_setup_logging_rejects_invalid_levels(self, bad_level: object) -> None:
+    def test_configure_logging_rejects_invalid_levels(self, bad_level: Any) -> None:
+        """Unrecognized or non-string log levels raise ValueError."""
         with pytest.raises(ValueError):
-            setup_logging(level=bad_level)  # type: ignore[arg-type]
+            configure_logging(level=bad_level)
 
-    def test_setup_logging_with_file_handler(self, tmp_path: Path) -> None:
+    def test_configure_logging_with_file_handler(self, tmp_path: Path) -> None:
+        """Optional log_file attaches a UTF-8 FileHandler."""
         log_file = tmp_path / "app.log"
-        setup_logging(level="INFO", log_file=log_file)
-        root_logger = logging.getLogger("repo_context")
+        configure_logging(level="INFO", log_file=log_file)
+        root_logger = logging.getLogger(ROOT_LOGGER_NAME)
 
         assert any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
         assert log_file.exists()
@@ -103,9 +115,9 @@ class TestSetupLogging:
     ) -> None:
         """If FileHandler fails to open, console handler stays at requested level on stderr."""
         bad_log_path = tmp_path / "missing_dir" / "app.log"
-        setup_logging(level="DEBUG", log_file=bad_log_path)
+        configure_logging(level="DEBUG", log_file=bad_log_path)
 
-        root_logger = logging.getLogger("repo_context")
+        root_logger = logging.getLogger(ROOT_LOGGER_NAME)
         assert root_logger.level == logging.DEBUG
         stream_handlers = [
             h

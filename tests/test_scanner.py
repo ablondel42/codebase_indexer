@@ -8,35 +8,22 @@ import sys
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
 
-from repo_context.config import AppConfig
-from repo_context.exceptions import ParseError, PathSecurityError
-from repo_context.parsing.scanner import (
-    build_file_record,
-    build_repo_record,
+from core.models import AppConfig, ParseError, PathSecurityError
+from parsing import RepoScanner
+from parsing.utils.filters import (
     is_supported_source_file,
     is_test_path,
-    scan_repository,
     should_ignore_dir,
 )
-from repo_context.storage import (
-    close_connection,
-    connection_scope,
-    files_table,
-    get_connection,
-    get_repo_by_id,
-    initialize_database,
-    list_files_for_repo,
-    upsert_files,
-    upsert_repo,
-)
+from storage import SqlUnitOfWorkFactory
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
 
 def _subprocess_env() -> dict[str, str]:
+    """Build subprocess environment pointing PYTHONPATH at src/."""
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{existing}" if existing else str(SRC_DIR)
@@ -85,12 +72,13 @@ def test_build_repo_and_file_record_v2_ids(tmp_path: Path) -> None:
     root_init = repo_dir / "__init__.py"
     root_init.write_text("VERSION = '1'\nLINE_TWO = 2\n", encoding="utf-8")
 
-    repo = build_repo_record(repo_dir)
+    scanner = RepoScanner()
+    repo = scanner.build_repo_record(repo_dir)
     assert re.fullmatch(r"repo:my_project:[0-9a-f]{8}", repo.id)
     assert repo.name == "my_project"
     assert repo.root_path == str(repo_dir.resolve())
 
-    rec = build_file_record(repo.id, repo_dir, root_init)
+    rec = scanner.scan_file(repo.id, repo_dir, root_init)
     assert rec.id == f"file:{repo.id}:__init__.py"
     assert rec.module_path == "my_project"
     assert rec.line_count == 2
@@ -118,8 +106,9 @@ def test_is_test_path_and_supported_extensions() -> None:
 
 
 def test_scanner_respects_ignored_globs_root_init_and_include_tests(sample_repo: Path) -> None:
-    """scan_repository ignores *.egg-info/.nox and gates test files by include_tests."""
-    repo, files_no_tests = scan_repository(sample_repo, AppConfig(include_tests=False))
+    """RepoScanner ignores *.egg-info/.nox and gates test files by include_tests."""
+    report_no_tests = RepoScanner(AppConfig(include_tests=False)).scan_repository(sample_repo)
+    files_no_tests = report_no_tests.files
     paths_no_tests = [f.file_path for f in files_no_tests]
 
     assert paths_no_tests == [
@@ -134,7 +123,8 @@ def test_scanner_respects_ignored_globs_root_init_and_include_tests(sample_repo:
     assert by_path["app/services/auth.py"].line_count == 2
     assert all(not f.is_test for f in files_no_tests)
 
-    _, files_with_tests = scan_repository(sample_repo, AppConfig(include_tests=True))
+    report_with_tests = RepoScanner(AppConfig(include_tests=True)).scan_repository(sample_repo)
+    files_with_tests = report_with_tests.files
     paths_with_tests = [f.file_path for f in files_with_tests]
     assert "tests/test_auth.py" in paths_with_tests
     assert "test/test_main.py" in paths_with_tests
@@ -146,7 +136,7 @@ def test_scanner_respects_ignored_globs_root_init_and_include_tests(sample_repo:
 
 
 def test_scanner_rejects_symlinks_outside_root_and_survives_broken_symlinks(tmp_path: Path) -> None:
-    """scan_repository rejects external symlinks and skips broken symlinks cleanly."""
+    """RepoScanner rejects external symlinks and skips broken symlinks cleanly."""
     repo = tmp_path / "sec_repo"
     repo.mkdir()
     (repo / "good.py").write_text("OK = 1\n", encoding="utf-8")
@@ -161,15 +151,16 @@ def test_scanner_rejects_symlinks_outside_root_and_survives_broken_symlinks(tmp_
     (repo / "ext_dir_link").symlink_to(outside_dir)
     (repo / "broken_link.py").symlink_to(tmp_path / "missing_target.py")
 
-    _repo_rec, files = scan_repository(repo, AppConfig())
-    assert [f.file_path for f in files] == ["good.py"]
+    scanner = RepoScanner(AppConfig())
+    report = scanner.scan_repository(repo)
+    assert [f.file_path for f in report.files] == ["good.py"]
 
     with pytest.raises(PathSecurityError):
-        build_file_record(_repo_rec.id, repo, repo / "ext_link.py")
+        scanner.scan_file(report.repo.id, repo, repo / "ext_link.py")
 
 
 def test_scanner_enforces_max_file_size_bytes(tmp_path: Path) -> None:
-    """Oversized .py files are skipped by scan_repository and rejected by build_file_record."""
+    """Oversized .py files are skipped by scan_repository and rejected by scan_file."""
     repo = tmp_path / "size_repo"
     repo.mkdir()
     small = repo / "small.py"
@@ -177,42 +168,40 @@ def test_scanner_enforces_max_file_size_bytes(tmp_path: Path) -> None:
     large = repo / "large.py"
     large.write_text("x = 'a'\n" * 100, encoding="utf-8")
 
-    cfg = AppConfig(max_file_size_bytes=100)
-    repo_rec, files = scan_repository(repo, cfg)
-    assert [f.file_path for f in files] == ["small.py"]
+    scanner = RepoScanner(AppConfig(max_file_size_bytes=100))
+    report = scanner.scan_repository(repo)
+    assert [f.file_path for f in report.files] == ["small.py"]
 
     with pytest.raises(ParseError, match="max_file_size_bytes"):
-        build_file_record(repo_rec.id, repo, large, max_file_size_bytes=100)
+        scanner.scan_file(report.repo.id, repo, large)
 
 
 def test_scan_persists_records_with_include_tests_filter(sample_repo: Path, tmp_path: Path) -> None:
-    """Persisted FileRecords support is_test filtering in list_files_for_repo."""
+    """Persisted FileRecords support is_test filtering in uow.files.list_for_repo."""
     db_path = tmp_path / "test.db"
-    conn = get_connection(db_path)
-    try:
-        initialize_database(conn)
-        repo, file_records = scan_repository(sample_repo, AppConfig(include_tests=True))
-        upsert_repo(conn, repo)
-        upsert_files(conn, file_records)
-        conn.commit()
+    uow_factory = SqlUnitOfWorkFactory(db_path)
+    report = RepoScanner(AppConfig(include_tests=True)).scan_repository(sample_repo)
 
-        assert get_repo_by_id(conn, repo.id) is not None
-        assert len(list_files_for_repo(conn, repo.id, include_tests=True)) == 6
-        assert len(list_files_for_repo(conn, repo.id, include_tests=False)) == 4
-    finally:
-        close_connection(conn)
+    with uow_factory.open(initialize=True) as uow:
+        uow.repos.upsert(report.repo)
+        uow.files.upsert_many(report.files)
+
+    with uow_factory.open(read_only=True) as ro_uow:
+        assert ro_uow.repos.get_by_id(report.repo.id) is not None
+        assert len(ro_uow.files.list_for_repo(report.repo.id, include_tests=True)) == 6
+        assert len(ro_uow.files.list_for_repo(report.repo.id, include_tests=False)) == 4
 
 
 def test_invalid_repo_path_raises(tmp_path: Path) -> None:
     """Nonexistent or non-directory repo roots raise clear errors."""
-    cfg = AppConfig()
+    scanner = RepoScanner(AppConfig())
     with pytest.raises(FileNotFoundError):
-        scan_repository(tmp_path / "missing", cfg)
+        scanner.scan_repository(tmp_path / "missing")
 
     f = tmp_path / "not_dir.txt"
     f.write_text("hi", encoding="utf-8")
     with pytest.raises(NotADirectoryError):
-        scan_repository(f, cfg)
+        scanner.scan_repository(f)
 
 
 def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
@@ -222,7 +211,7 @@ def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
         [
             sys.executable,
             "-m",
-            "repo_context.cli.main",
+            "cli.main",
             "index",
             str(sample_repo),
             "--db-path",
@@ -238,6 +227,7 @@ def test_rc_index_cli_command(sample_repo: Path, tmp_path: Path) -> None:
     assert payload["files_indexed"] == 4
     assert db_path.exists()
 
-    with connection_scope(db_path, read_only=True) as conn:
-        count = int(conn.execute(select(func.count()).select_from(files_table)).scalar_one())
-        assert count == 4
+    uow_factory = SqlUnitOfWorkFactory(db_path)
+    with uow_factory.open(read_only=True) as uow:
+        files = uow.files.list_for_repo(payload["repo_id"], include_tests=True)
+        assert len(files) == 4

@@ -1,10 +1,10 @@
-"""RepoRecord Pydantic model tests."""
+"""RepoRecord Pydantic FrozenModel tests."""
 
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
-from repo_context.constants import Language
-from repo_context.models.repo import RepoRecord
+from core.models.enums import Language
+from core.models.repo import RepoRecord
 
 
 class TestRepoRecordValid:
@@ -66,12 +66,14 @@ class TestRepoRecordIdValidation:
     def test_reject_none_id(self) -> None:
         """Test that None ID is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord(
-                id=None,  # type: ignore[arg-type]
-                root_path="/path/to/repo",
-                name="test-repo",
-                default_language=Language.PYTHON,
-                created_at="2026-01-01T00:00:00Z",
+            RepoRecord.model_validate(
+                {
+                    "id": None,
+                    "root_path": "/path/to/repo",
+                    "name": "test-repo",
+                    "default_language": Language.PYTHON,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
             )
 
 
@@ -103,12 +105,14 @@ class TestRepoRecordRootPathValidation:
     def test_reject_none_root_path(self) -> None:
         """Test that None root_path is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord(
-                id="repo:test",
-                root_path=None,  # type: ignore[arg-type]
-                name="test-repo",
-                default_language=Language.PYTHON,
-                created_at="2026-01-01T00:00:00Z",
+            RepoRecord.model_validate(
+                {
+                    "id": "repo:test",
+                    "root_path": None,
+                    "name": "test-repo",
+                    "default_language": Language.PYTHON,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
             )
 
 
@@ -164,7 +168,6 @@ class TestRepoRecordLanguageValidation:
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             )
-        # Error should mention invalid enum value
         assert "python" in str(exc_info.value).lower()
 
     def test_reject_empty_language(self) -> None:
@@ -218,10 +221,8 @@ class TestRepoRecordTimestampValidation:
             )
         assert "iso" in str(exc_info.value).lower() or "datetime" in str(exc_info.value).lower()
 
-    def test_reject_date_only_timestamp(self) -> None:
-        """Test that date-only timestamp is accepted (Pydantic allows it as valid ISO 8601)."""
-        # Pydantic's datetime.fromisoformat accepts date-only strings
-        # This is valid ISO 8601, so we allow it
+    def test_accept_date_only_timestamp(self) -> None:
+        """Test that date-only timestamp is accepted as valid ISO 8601."""
         repo = RepoRecord(
             id="repo:test",
             root_path="/path/to/repo",
@@ -256,7 +257,7 @@ class TestRepoRecordTimestampValidation:
 
 
 class TestRepoRecordModelBehavior:
-    """Tests for RepoRecord model behavior."""
+    """Tests for RepoRecord FrozenModel behavior."""
 
     def test_model_dump(self) -> None:
         """Test model_dump() returns dict with all fields."""
@@ -290,8 +291,8 @@ class TestRepoRecordModelBehavior:
         assert "repo:test" in json_str
         assert "test-repo" in json_str
 
-    def test_from_dict(self) -> None:
-        """Test creating from dict using model_validate."""
+    def test_from_dict_and_forbid_extra_fields(self) -> None:
+        """Test creating from dict using model_validate and rejecting extra keys."""
         data = {
             "id": "repo:test",
             "root_path": "/path/to/repo",
@@ -303,8 +304,11 @@ class TestRepoRecordModelBehavior:
         assert repo.id == "repo:test"
         assert repo.name == "test-repo"
 
+        with pytest.raises(PydanticValidationError):
+            RepoRecord.model_validate({**data, "extra_key": "forbidden"})
+
     def test_immutable_by_default(self) -> None:
-        """Test that model instances are immutable."""
+        """Test that FrozenModel instances are immutable."""
         repo = RepoRecord(
             id="repo:test",
             root_path="/path/to/repo",

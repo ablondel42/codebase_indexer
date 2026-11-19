@@ -1,59 +1,37 @@
-"""Graph query layer tests covering FTS5 search, escaped LIKE, directed edges, and freshness."""
+"""Graph query layer tests covering GraphNavigator, ReferenceAnalyzer, FTS5, and freshness."""
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy.engine import Connection
 
-from repo_context.constants import (
-    EDGE_KIND_CALLS,
-    EDGE_KIND_CONTAINS,
-    EDGE_KIND_IMPORTS,
-    EDGE_KIND_INHERITS,
-    EDGE_KIND_SCOPE_PARENT,
+from core.models import (
+    Edge,
+    EdgeKind,
+    FileRecord,
+    FreshnessStatus,
+    Position,
+    Range,
+    RepoRecord,
+    SymbolKind,
+    SymbolNode,
+    SymbolNotFoundError,
+    SymbolScope,
+    SymbolSearchQuery,
 )
-from repo_context.graph import (
-    check_file_disk_freshness,
-    find_symbols_by_name,
-    get_child_symbols,
-    get_file_for_outline,
-    get_files_by_ids,
-    get_incoming_calls,
-    get_incoming_edges,
-    get_incoming_imports,
-    get_incoming_inherits,
-    get_lexical_child_symbols,
-    get_lexical_parent_symbol,
-    get_outgoing_calls,
-    get_outgoing_edges,
-    get_outgoing_imports,
-    get_outgoing_inherits,
-    get_parent_symbol,
-    get_symbol,
-    get_symbol_by_qualified_name,
-    get_symbols_by_ids,
-    list_file_import_edges,
-    list_file_outline_symbols,
-    search_symbols_fts,
+from core.utils.hashing import sha256_file
+from graph import (
+    GraphNavigator,
+    ReferenceAnalyzer,
+    ReferenceDirection,
+    ReferenceQueryOptions,
+    SubgraphOptions,
 )
-from repo_context.models.file import FileRecord
-from repo_context.models.repo import RepoRecord
-from repo_context.parsing.hashing import sha256_file
-from repo_context.storage import (
-    close_connection,
-    get_connection,
-    initialize_database,
-    upsert_edges,
-    upsert_files,
-    upsert_nodes,
-    upsert_repo,
-)
+from storage import SqlUnitOfWorkFactory
 
 
 @pytest.fixture
-def query_db(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
-    """Yield an initialized DB populated with real files on disk and rich graph edges."""
+def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
+    """Create an initialized DB populated with real files on disk and rich graph edges."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     mod1_path = repo_root / "mod1.py"
@@ -61,344 +39,368 @@ def query_db(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
     mod2_path = repo_root / "mod2.py"
     mod2_path.write_text("from mod1 import Class1\n", encoding="utf-8")
 
-    conn = get_connection(tmp_path / "query.db")
-    try:
-        initialize_database(conn)
-        repo_id = "repo:test:12345678"
-        upsert_repo(
-            conn,
+    factory = SqlUnitOfWorkFactory(tmp_path / "query.db")
+    repo_id = "repo:test:12345678"
+    f1 = FileRecord(
+        id=f"file:{repo_id}:mod1.py",
+        repo_id=repo_id,
+        file_path="mod1.py",
+        uri=mod1_path.as_uri(),
+        module_path="mod1",
+        content_hash=sha256_file(mod1_path),
+        size_bytes=mod1_path.stat().st_size,
+        line_count=2,
+        last_modified_at="2026-01-01T00:00:00Z",
+    )
+    f2 = FileRecord(
+        id=f"file:{repo_id}:mod2.py",
+        repo_id=repo_id,
+        file_path="mod2.py",
+        uri=mod2_path.as_uri(),
+        module_path="mod2",
+        content_hash=sha256_file(mod2_path),
+        size_bytes=mod2_path.stat().st_size,
+        line_count=1,
+        last_modified_at="2026-01-01T00:00:00Z",
+    )
+    nodes = [
+        SymbolNode(
+            id="sym:mod1",
+            repo_id=repo_id,
+            file_id=f1.id,
+            kind=SymbolKind.MODULE,
+            name="mod1",
+            qualified_name="mod1",
+            uri=f1.uri,
+            start_line=1,
+            end_line=20,
+            visibility_hint="module",
+            doc_summary="Module one",
+            content_hash="sha256:a",
+            semantic_hash="sha256:b",
+            scope=SymbolScope.MODULE,
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+        SymbolNode(
+            id="sym:cls1",
+            repo_id=repo_id,
+            file_id=f1.id,
+            kind=SymbolKind.CLASS,
+            name="Class1",
+            qualified_name="mod1.Class1",
+            uri=f1.uri,
+            start_line=1,
+            end_line=2,
+            signature="class Class1",
+            parent_id="sym:mod1",
+            visibility_hint="public",
+            doc_summary="Base class",
+            content_hash="sha256:c",
+            semantic_hash="sha256:d",
+            scope=SymbolScope.MODULE,
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+        SymbolNode(
+            id="sym:func_pct",
+            repo_id=repo_id,
+            file_id=f1.id,
+            kind=SymbolKind.FUNCTION,
+            name="compute_100%_rate",
+            qualified_name="mod1.compute_100%_rate",
+            uri=f1.uri,
+            start_line=5,
+            end_line=10,
+            signature="def compute_100%_rate()",
+            parent_id="sym:mod1",
+            visibility_hint="public",
+            doc_summary="Exact percent handler",
+            content_hash="sha256:e",
+            semantic_hash="sha256:f",
+            scope=SymbolScope.MODULE,
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+        SymbolNode(
+            id="sym:inner",
+            repo_id=repo_id,
+            file_id=f1.id,
+            kind=SymbolKind.LOCAL_FUNCTION,
+            name="inner",
+            qualified_name="mod1.compute_100%_rate.inner",
+            uri=f1.uri,
+            start_line=6,
+            end_line=8,
+            parent_id="sym:func_pct",
+            visibility_hint="local",
+            doc_summary="Inner helper",
+            content_hash="sha256:g",
+            semantic_hash="sha256:h",
+            scope=SymbolScope.FUNCTION,
+            lexical_parent_id="sym:func_pct",
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+        SymbolNode(
+            id="sym:mod2",
+            repo_id=repo_id,
+            file_id=f2.id,
+            kind=SymbolKind.MODULE,
+            name="mod2",
+            qualified_name="mod2",
+            uri=f2.uri,
+            start_line=1,
+            end_line=5,
+            visibility_hint="module",
+            content_hash="sha256:i",
+            semantic_hash="sha256:j",
+            scope=SymbolScope.MODULE,
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+        SymbolNode(
+            id="sym:sub",
+            repo_id=repo_id,
+            file_id=f2.id,
+            kind=SymbolKind.CLASS,
+            name="SubClass",
+            qualified_name="mod2.SubClass",
+            uri=f2.uri,
+            start_line=2,
+            end_line=5,
+            parent_id="sym:mod2",
+            visibility_hint="public",
+            content_hash="sha256:k",
+            semantic_hash="sha256:l",
+            scope=SymbolScope.MODULE,
+            last_indexed_at="2026-01-01T00:00:00Z",
+        ),
+    ]
+    edges = [
+        Edge(
+            id="edge:contains",
+            repo_id=repo_id,
+            kind=EdgeKind.CONTAINS,
+            from_id="sym:mod1",
+            to_id="sym:cls1",
+            evidence_file_id=f1.id,
+            evidence_uri=f1.uri,
+        ),
+        Edge(
+            id="edge:scope",
+            repo_id=repo_id,
+            kind=EdgeKind.SCOPE_PARENT,
+            from_id="sym:inner",
+            to_id="sym:func_pct",
+            evidence_file_id=f1.id,
+            evidence_uri=f1.uri,
+        ),
+        Edge(
+            id="edge:imp",
+            repo_id=repo_id,
+            kind=EdgeKind.IMPORTS,
+            from_id="sym:mod2",
+            to_id="sym:cls1",
+            confidence=0.9,
+            evidence_file_id=f2.id,
+            evidence_uri=f2.uri,
+            evidence_range=Range(
+                start=Position(line=0, character=0),
+                end=Position(line=0, character=23),
+            ),
+            payload={"import_type": "from", "module": "mod1", "symbol": "Class1"},
+        ),
+        Edge(
+            id="edge:inh",
+            repo_id=repo_id,
+            kind=EdgeKind.INHERITS,
+            from_id="sym:sub",
+            to_id="sym:cls1",
+            confidence=0.9,
+            evidence_file_id=f2.id,
+            evidence_uri=f2.uri,
+            payload={"base_name": "Class1"},
+        ),
+        Edge(
+            id="edge:call",
+            repo_id=repo_id,
+            kind=EdgeKind.CALLS,
+            from_id="sym:sub",
+            to_id="sym:func_pct",
+            confidence=0.9,
+            evidence_file_id=f2.id,
+            evidence_uri=f2.uri,
+            payload={"target": "compute_100%_rate"},
+        ),
+    ]
+
+    with factory.open(initialize=True) as uow:
+        uow.repos.upsert(
             RepoRecord(
                 id=repo_id,
                 root_path=str(repo_root),
                 name="test",
                 created_at="2026-01-01T00:00:00Z",
                 last_indexed_at="2026-01-01T00:00:00Z",
-            ),
+            )
         )
-        f1 = FileRecord(
-            id=f"file:{repo_id}:mod1.py",
-            repo_id=repo_id,
-            file_path="mod1.py",
-            uri=mod1_path.as_uri(),
-            module_path="mod1",
-            content_hash=sha256_file(mod1_path),
-            size_bytes=mod1_path.stat().st_size,
-            line_count=2,
-            last_modified_at="2026-01-01T00:00:00Z",
+        uow.files.upsert_many([f1, f2])
+        uow.nodes.upsert_many(nodes)
+        uow.edges.upsert_many(edges)
+
+    return factory, repo_root
+
+
+def test_symbol_and_hierarchy_lookups(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
+    """Symbol lookups, batch ID fetches, members, and parent/child navigation work cleanly."""
+    factory, _ = query_env
+    repo_id = "repo:test:12345678"
+    navigator = GraphNavigator()
+
+    with factory.open(read_only=True) as uow:
+        cls1 = navigator.get_symbol(uow, "sym:cls1")
+        assert cls1 is not None
+        summary = navigator.get_symbol_summary(uow, "sym:cls1")
+        assert summary is not None and summary.file_path == "mod1.py"
+
+        by_qname = uow.nodes.get_by_qualified_name(repo_id, "mod1.Class1", SymbolKind.CLASS)
+        assert by_qname is not None and by_qname.id == "sym:cls1"
+        parent_sym = navigator.get_parent(uow, cls1)
+        assert parent_sym is not None and parent_sym.id == "sym:mod1"
+
+        inner = navigator.get_symbol(uow, "sym:inner")
+        assert inner is not None
+        lex_parent = navigator.get_lexical_parent(uow, inner)
+        assert lex_parent is not None and lex_parent.id == "sym:func_pct"
+        assert [c.id for c in navigator.get_lexical_children(uow, "sym:func_pct")] == ["sym:inner"]
+        assert {c.id for c in navigator.get_children(uow, "sym:mod1")} == {
+            "sym:cls1",
+            "sym:func_pct",
+        }
+        assert {m.id for m in navigator.get_members(uow, "sym:mod1")} == {
+            "sym:cls1",
+            "sym:func_pct",
+        }
+        with pytest.raises(SymbolNotFoundError):
+            navigator.get_members(uow, "sym:missing")
+
+        batched_syms = uow.nodes.get_by_ids(["sym:cls1", "sym:sub", "sym:missing"])
+        assert set(batched_syms.keys()) == {"sym:cls1", "sym:sub"}
+
+        batched_files = uow.files.get_by_ids(
+            [f"file:{repo_id}:mod1.py", f"file:{repo_id}:mod2.py"]
         )
-        f2 = FileRecord(
-            id=f"file:{repo_id}:mod2.py",
-            repo_id=repo_id,
-            file_path="mod2.py",
-            uri=mod2_path.as_uri(),
-            module_path="mod2",
-            content_hash=sha256_file(mod2_path),
-            size_bytes=mod2_path.stat().st_size,
-            line_count=1,
-            last_modified_at="2026-01-01T00:00:00Z",
+        assert len(batched_files) == 2
+
+
+def test_directed_edge_queries_subgraph_and_reference_report(
+    query_env: tuple[SqlUnitOfWorkFactory, Path],
+) -> None:
+    """Directed edge queries, SubgraphSlice BFS, and ReferenceAnalyzer reports work cleanly."""
+    factory, _ = query_env
+    navigator = GraphNavigator()
+    ref_analyzer = ReferenceAnalyzer()
+
+    with factory.open(read_only=True) as uow:
+        assert len(navigator.list_outgoing_edges(uow, "sym:mod1")) == 1
+        assert len(navigator.list_incoming_edges(uow, "sym:func_pct")) == 2  # scope_parent + calls
+
+        assert len(navigator.list_incoming_edges(uow, "sym:func_pct", EdgeKind.CALLS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "sym:sub", EdgeKind.CALLS)) == 1
+        assert len(navigator.list_incoming_edges(uow, "sym:cls1", EdgeKind.IMPORTS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "sym:mod2", EdgeKind.IMPORTS)) == 1
+        assert len(navigator.list_incoming_edges(uow, "sym:cls1", EdgeKind.INHERITS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "sym:sub", EdgeKind.INHERITS)) == 1
+
+        subgraph = navigator.build_subgraph(
+            uow,
+            ["sym:cls1"],
+            SubgraphOptions(depth=1, max_nodes=10),
         )
-        upsert_files(conn, [f1, f2])
+        node_ids = {n.id for n in subgraph.nodes}
+        assert {"sym:cls1", "sym:mod1", "sym:mod2", "sym:sub"}.issubset(node_ids)
+        assert subgraph.truncated is False
 
-        nodes = [
-            {
-                "id": "sym:mod1",
-                "repo_id": repo_id,
-                "file_id": f1.id,
-                "language": "python",
-                "kind": "module",
-                "name": "mod1",
-                "qualified_name": "mod1",
-                "uri": f1.uri,
-                "start_line": 1,
-                "end_line": 20,
-                "parent_id": None,
-                "visibility_hint": "module",
-                "doc_summary": "Module one",
-                "content_hash": "sha256:a",
-                "semantic_hash": "sha256:b",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "module",
-                "lexical_parent_id": None,
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-            {
-                "id": "sym:cls1",
-                "repo_id": repo_id,
-                "file_id": f1.id,
-                "language": "python",
-                "kind": "class",
-                "name": "Class1",
-                "qualified_name": "mod1.Class1",
-                "uri": f1.uri,
-                "start_line": 1,
-                "end_line": 2,
-                "signature": "class Class1",
-                "parent_id": "sym:mod1",
-                "visibility_hint": "public",
-                "doc_summary": "Base class",
-                "content_hash": "sha256:c",
-                "semantic_hash": "sha256:d",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "module",
-                "lexical_parent_id": None,
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-            {
-                "id": "sym:func_pct",
-                "repo_id": repo_id,
-                "file_id": f1.id,
-                "language": "python",
-                "kind": "function",
-                "name": "compute_100%_rate",
-                "qualified_name": "mod1.compute_100%_rate",
-                "uri": f1.uri,
-                "start_line": 5,
-                "end_line": 10,
-                "signature": "def compute_100%_rate()",
-                "parent_id": "sym:mod1",
-                "visibility_hint": "public",
-                "doc_summary": "Exact percent handler",
-                "content_hash": "sha256:e",
-                "semantic_hash": "sha256:f",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "module",
-                "lexical_parent_id": None,
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-            {
-                "id": "sym:inner",
-                "repo_id": repo_id,
-                "file_id": f1.id,
-                "language": "python",
-                "kind": "local_function",
-                "name": "inner",
-                "qualified_name": "mod1.compute_100%_rate.inner",
-                "uri": f1.uri,
-                "start_line": 6,
-                "end_line": 8,
-                "parent_id": "sym:func_pct",
-                "visibility_hint": "local",
-                "doc_summary": "Inner helper",
-                "content_hash": "sha256:g",
-                "semantic_hash": "sha256:h",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "function",
-                "lexical_parent_id": "sym:func_pct",
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-            {
-                "id": "sym:mod2",
-                "repo_id": repo_id,
-                "file_id": f2.id,
-                "language": "python",
-                "kind": "module",
-                "name": "mod2",
-                "qualified_name": "mod2",
-                "uri": f2.uri,
-                "start_line": 1,
-                "end_line": 5,
-                "parent_id": None,
-                "visibility_hint": "module",
-                "doc_summary": None,
-                "content_hash": "sha256:i",
-                "semantic_hash": "sha256:j",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "module",
-                "lexical_parent_id": None,
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-            {
-                "id": "sym:sub",
-                "repo_id": repo_id,
-                "file_id": f2.id,
-                "language": "python",
-                "kind": "class",
-                "name": "SubClass",
-                "qualified_name": "mod2.SubClass",
-                "uri": f2.uri,
-                "start_line": 2,
-                "end_line": 5,
-                "parent_id": "sym:mod2",
-                "visibility_hint": "public",
-                "doc_summary": None,
-                "content_hash": "sha256:k",
-                "semantic_hash": "sha256:l",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "payload_json": "{}",
-                "scope": "module",
-                "lexical_parent_id": None,
-                "last_indexed_at": "2026-01-01T00:00:00Z",
-            },
-        ]
-        upsert_nodes(conn, nodes)
+        trunc_sub = navigator.build_subgraph(
+            uow,
+            ["sym:cls1"],
+            SubgraphOptions(depth=1, max_nodes=2),
+        )
+        assert len(trunc_sub.nodes) == 2
+        assert trunc_sub.truncated is True
 
-        edges = [
-            {
-                "id": "edge:contains",
-                "repo_id": repo_id,
-                "kind": EDGE_KIND_CONTAINS,
-                "from_id": "sym:mod1",
-                "to_id": "sym:cls1",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "evidence_file_id": f1.id,
-                "evidence_uri": f1.uri,
-                "payload_json": "{}",
-            },
-            {
-                "id": "edge:scope",
-                "repo_id": repo_id,
-                "kind": EDGE_KIND_SCOPE_PARENT,
-                "from_id": "sym:inner",
-                "to_id": "sym:func_pct",
-                "source": "python-ast",
-                "confidence": 1.0,
-                "evidence_file_id": f1.id,
-                "evidence_uri": f1.uri,
-                "payload_json": "{}",
-            },
-            {
-                "id": "edge:imp",
-                "repo_id": repo_id,
-                "kind": EDGE_KIND_IMPORTS,
-                "from_id": "sym:mod2",
-                "to_id": "sym:cls1",
-                "source": "python-ast",
-                "confidence": 0.9,
-                "evidence_file_id": f2.id,
-                "evidence_uri": f2.uri,
-                "payload_json": {"import_type": "from", "module": "mod1", "symbol": "Class1"},
-            },
-            {
-                "id": "edge:inh",
-                "repo_id": repo_id,
-                "kind": EDGE_KIND_INHERITS,
-                "from_id": "sym:sub",
-                "to_id": "sym:cls1",
-                "source": "python-ast",
-                "confidence": 0.9,
-                "evidence_file_id": f2.id,
-                "evidence_uri": f2.uri,
-                "payload_json": {"base_name": "Class1"},
-            },
-            {
-                "id": "edge:call",
-                "repo_id": repo_id,
-                "kind": EDGE_KIND_CALLS,
-                "from_id": "sym:sub",
-                "to_id": "sym:func_pct",
-                "source": "python-ast",
-                "confidence": 0.9,
-                "evidence_file_id": f2.id,
-                "evidence_uri": f2.uri,
-                "payload_json": {"target": "compute_100%_rate"},
-            },
-        ]
-        upsert_edges(conn, edges)
-        conn.commit()
-        yield conn, repo_root
-    finally:
-        close_connection(conn)
+        report = ref_analyzer.inspect_references(
+            uow,
+            "sym:cls1",
+            ReferenceQueryOptions(direction=ReferenceDirection.INCOMING),
+        )
+        assert report.total_count == 2  # imports + inherits
+        assert any(r.preview == "from mod1 import Class1" for r in report.references)
 
 
-def test_symbol_and_hierarchy_lookups(query_db: tuple[Connection, Path]) -> None:
-    """Symbol lookups, batch ID fetches, and parent/child navigation work cleanly."""
-    conn, _ = query_db
+def test_fts5_search_and_escaped_like(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
+    """search_fts handles exact/prefix ranking, filters, and special tokens safely."""
+    factory, _ = query_env
     repo_id = "repo:test:12345678"
 
-    cls1 = get_symbol(conn, "sym:cls1")
-    assert cls1 is not None
-    by_qname = get_symbol_by_qualified_name(conn, repo_id, "mod1.Class1", "class")
-    assert by_qname is not None and by_qname["id"] == "sym:cls1"
-    parent_sym = get_parent_symbol(conn, cls1)
-    assert parent_sym is not None and parent_sym["id"] == "sym:mod1"
+    with factory.open(read_only=True) as uow:
+        exact_hits = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query="Class1"))
+        assert exact_hits and exact_hits[0].id == "sym:cls1"
 
-    inner = get_symbol(conn, "sym:inner")
-    assert inner is not None
-    lex_parent = get_lexical_parent_symbol(conn, inner)
-    assert lex_parent is not None and lex_parent["id"] == "sym:func_pct"
-    assert [c["id"] for c in get_lexical_child_symbols(conn, "sym:func_pct")] == ["sym:inner"]
-    assert {c["id"] for c in get_child_symbols(conn, "sym:mod1")} == {"sym:cls1", "sym:func_pct"}
+        prefix_hits = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query="Sub"))
+        assert [h.id for h in prefix_hits] == ["sym:sub"]
 
-    batched_syms = get_symbols_by_ids(conn, ["sym:cls1", "sym:sub", "sym:missing"])
-    assert set(batched_syms.keys()) == {"sym:cls1", "sym:sub"}
+        filtered = uow.nodes.search_fts(
+            SymbolSearchQuery(
+                repo_id=repo_id,
+                query="Class",
+                kind=SymbolKind.CLASS,
+                file_path="mod2.py",
+            )
+        )
+        assert [h.id for h in filtered] == ["sym:sub"]
 
-    batched_files = get_files_by_ids(conn, [f"file:{repo_id}:mod1.py", f"file:{repo_id}:mod2.py"])
-    assert len(batched_files) == 2
+        # Escaped LIKE: '%' and '_' must NOT act as SQLite wildcards
+        pct_hits = uow.nodes.find_by_name(repo_id, "100%")
+        assert {h.id for h in pct_hits} == {"sym:func_pct", "sym:inner"}
+        rate_hits = uow.nodes.find_by_name(repo_id, "%_rate", kind=SymbolKind.FUNCTION)
+        assert [h.id for h in rate_hits] == ["sym:func_pct"]
+        assert uow.nodes.find_by_name(repo_id, "100_rate") == []
 
+        fts_special = uow.nodes.search_fts(
+            SymbolSearchQuery(repo_id=repo_id, query="100%", kind=SymbolKind.FUNCTION)
+        )
+        assert [h.id for h in fts_special] == ["sym:func_pct"]
 
-def test_directed_edge_queries(query_db: tuple[Connection, Path]) -> None:
-    """Directed edge queries return incoming/outgoing calls, imports, and inherits."""
-    conn, _ = query_db
-
-    assert len(get_outgoing_edges(conn, "sym:mod1")) == 1
-    assert len(get_incoming_edges(conn, "sym:func_pct")) == 2  # scope_parent + calls
-
-    assert len(get_incoming_calls(conn, "sym:func_pct")) == 1
-    assert len(get_outgoing_calls(conn, "sym:sub")) == 1
-    assert len(get_incoming_imports(conn, "sym:cls1")) == 1
-    assert len(get_outgoing_imports(conn, "sym:mod2")) == 1
-    assert len(get_incoming_inherits(conn, "sym:cls1")) == 1
-    assert len(get_outgoing_inherits(conn, "sym:sub")) == 1
+        # FTS operator / punctuation edge cases never raise sqlite3.OperationalError
+        bad_fts = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query='NOT OR * "bad"'))
+        assert bad_fts == []
 
 
-def test_fts5_search_and_escaped_like(query_db: tuple[Connection, Path]) -> None:
-    """search_symbols_fts handles exact/prefix ranking, filters, and special tokens safely."""
-    conn, _ = query_db
+def test_outline_helpers_and_disk_freshness(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
+    """Outline helpers and check_file_freshness reflect live disk edits."""
+    factory, repo_root = query_env
     repo_id = "repo:test:12345678"
+    navigator = GraphNavigator()
 
-    exact_hits = search_symbols_fts(conn, repo_id, "Class1")
-    assert exact_hits and exact_hits[0]["id"] == "sym:cls1"
+    with factory.open(read_only=True) as uow:
+        f1 = navigator.get_file_for_outline(uow, repo_id, "./mod1.py")
+        assert f1 is not None
+        assert len(navigator.list_file_symbols(uow, f1.id)) == 4
 
-    prefix_hits = search_symbols_fts(conn, repo_id, "Sub")
-    assert [h["id"] for h in prefix_hits] == ["sym:sub"]
+        f2 = navigator.get_file_for_outline(uow, repo_id, "mod2.py")
+        assert f2 is not None
+        assert len(navigator.list_file_imports(uow, f2.id)) == 1
 
-    filtered = search_symbols_fts(conn, repo_id, "Class", kind="class", file_path="mod2.py")
-    assert [h["id"] for h in filtered] == ["sym:sub"]
+        fresh = navigator.check_file_freshness(uow, f1.id)
+        assert fresh.is_fresh is True
+        assert fresh.stale_reason is None
+        assert fresh.freshness == FreshnessStatus.FRESH
 
-    # Escaped LIKE: '%' and '_' must NOT act as SQLite wildcards
-    pct_hits = find_symbols_by_name(conn, repo_id, "100%")
-    assert {h["id"] for h in pct_hits} == {"sym:func_pct", "sym:inner"}
-    assert [h["id"] for h in find_symbols_by_name(conn, repo_id, "%_rate", kind="function")] == [
-        "sym:func_pct"
-    ]
-    assert find_symbols_by_name(conn, repo_id, "100_rate") == []
+        (repo_root / "mod1.py").write_text("class Class1:\n    x = 1\n", encoding="utf-8")
+        stale = navigator.check_file_freshness(uow, f1.id)
+        assert stale.is_fresh is False
+        assert stale.stale_reason == "content_hash_mismatch"
+        assert stale.freshness == FreshnessStatus.STALE
 
-    fts_special = search_symbols_fts(conn, repo_id, "100%", kind="function")
-    assert [h["id"] for h in fts_special] == ["sym:func_pct"]
-
-    # FTS operator / punctuation edge cases never raise sqlite3.OperationalError
-    assert search_symbols_fts(conn, repo_id, "NOT OR * \"bad\"") == []
-
-
-def test_outline_helpers_and_disk_freshness(query_db: tuple[Connection, Path]) -> None:
-    """Outline helpers and check_file_disk_freshness reflect live disk edits."""
-    conn, repo_root = query_db
-    repo_id = "repo:test:12345678"
-
-    f1 = get_file_for_outline(conn, repo_id, "./mod1.py")
-    assert f1 is not None
-    assert len(list_file_outline_symbols(conn, f1["id"])) == 4
-
-    f2 = get_file_for_outline(conn, repo_id, "mod2.py")
-    assert f2 is not None
-    assert len(list_file_import_edges(conn, f2["id"])) == 1
-
-    assert check_file_disk_freshness(conn, f1["id"]) == (True, None)
-
-    (repo_root / "mod1.py").write_text("class Class1:\n    x = 1\n", encoding="utf-8")
-    assert check_file_disk_freshness(conn, f1["id"]) == (False, "content_hash_mismatch")
-
-    (repo_root / "mod1.py").unlink()
-    assert check_file_disk_freshness(conn, f1["id"]) == (False, "file_missing")
+        (repo_root / "mod1.py").unlink()
+        missing = navigator.check_file_freshness(uow, f1.id)
+        assert missing.is_fresh is False
+        assert missing.stale_reason == "file_missing"
+        assert missing.freshness == FreshnessStatus.MISSING

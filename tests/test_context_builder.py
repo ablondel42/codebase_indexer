@@ -1,37 +1,33 @@
-"""Context builder, file outline, and source reader tests (v0.2.0)."""
+"""SymbolContextBuilder, OutlineBuilder, and SourceReader tests."""
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.engine import Connection
+from pydantic import ValidationError as PydanticValidationError
 
-from repo_context.config import AppConfig
-from repo_context.context import (
-    build_file_outline,
-    build_symbol_context,
-    read_file_snippet,
-    read_symbol_source,
+from context import (
+    ContextBuildOptions,
+    OutlineBuilder,
+    SnippetOptions,
+    SourceReader,
+    SymbolContextBuilder,
 )
-from repo_context.exceptions import PathSecurityError, RepoContextError, ValidationError
-from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.scanner import scan_repository
-from repo_context.storage import (
-    close_connection,
-    get_connection,
-    initialize_database,
-    nodes_table,
-    replace_file_graph,
-    upsert_files,
-    upsert_repo,
+from core.models import (
+    AST_DEPENDENCY_EDGE_KINDS,
+    AppConfig,
+    IndexerError,
+    PathSecurityError,
+    SymbolKind,
+    SymbolNotFoundError,
+    ValidationError,
 )
+from parsing import AstExtractionPipeline, RepoScanner, SymbolLinker
+from storage import SqlUnitOfWorkFactory
 
 
 @pytest.fixture
-def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[Connection, Path, str]]:
-    """Index a multi-file repository in ``tmp_path`` and yield ``(conn, root, repo_id)``."""
+def indexed_context_repo(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path, str]:
+    """Index a multi-file repository in ``tmp_path`` and return ``(factory, root, repo_id)``."""
     repo_root = tmp_path / "ctx_repo"
     repo_root.mkdir()
 
@@ -72,148 +68,196 @@ def indexed_context_repo(tmp_path: Path) -> Iterator[tuple[Connection, Path, str
         encoding="utf-8",
     )
 
-    conn = get_connection(tmp_path / "context.db")
-    try:
-        initialize_database(conn)
-        cfg = AppConfig()
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        upsert_files(conn, files)
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-        resolve_repo_edges(conn, repo.id)
-        conn.commit()
-        yield conn, repo_root, repo.id
-    finally:
-        close_connection(conn)
+    cfg = AppConfig()
+    scan_report = RepoScanner(cfg).scan_repository(repo_root)
+    pipeline = AstExtractionPipeline(cfg)
+    linker = SymbolLinker()
+    factory = SqlUnitOfWorkFactory(tmp_path / "context.db")
+
+    with factory.open(initialize=True) as uow:
+        uow.repos.upsert(scan_report.repo)
+        for rec in scan_report.files:
+            ext = pipeline.extract_file(repo_root, rec)
+            uow.replace_file_graph(rec, ext.nodes, ext.edges)
+        nodes = uow.nodes.list_for_repo(scan_report.repo.id)
+        cand_edges = uow.edges.list_for_repo(
+            scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
+        )
+        link_res = linker.resolve(
+            scan_report.repo.id, scan_report.repo.name, nodes, cand_edges
+        )
+        uow.edges.update_resolved_targets(link_res.updates)
+
+    return factory, repo_root, scan_report.repo.id
 
 
-def _find_node_id(conn: Connection, name: str, kind: str | None = None) -> str:
-    stmt = select(nodes_table.c.id).where(nodes_table.c.name == name)
-    if kind is not None:
-        stmt = stmt.where(nodes_table.c.kind == kind)
-    node_id = conn.execute(stmt.limit(1)).scalar_one_or_none()
-    assert node_id is not None, f"Node not found: {name} ({kind})"
-    return str(node_id)
+def _find_node_id(
+    factory: SqlUnitOfWorkFactory,
+    repo_id: str,
+    name: str,
+    kind: SymbolKind,
+) -> str:
+    """Resolve a symbol ID by short name and kind inside ``repo_id``."""
+    with factory.open(read_only=True) as uow:
+        matches = [
+            n
+            for n in uow.nodes.find_by_name(repo_id, name, kind=kind)
+            if n.name == name
+        ]
+    assert matches, f"Node not found: {name} ({kind})"
+    return matches[0].id
 
 
 def test_build_symbol_context_separates_structural_and_lexical_no_duplicates(
-    indexed_context_repo: tuple[Connection, Path, str],
+    indexed_context_repo: tuple[SqlUnitOfWorkFactory, Path, str],
 ) -> None:
     """Class context has structural children only; method has no bogus lexical_parent."""
-    conn, _, _ = indexed_context_repo
+    factory, _, repo_id = indexed_context_repo
+    builder = SymbolContextBuilder()
 
-    cls_id = _find_node_id(conn, "Service", "class")
-    cls_ctx = build_symbol_context(conn, cls_id, edge_limit=20, include_source=True)
-    assert cls_ctx is not None
-    assert cls_ctx.structural_parent is not None
-    assert cls_ctx.structural_parent["kind"] == "module"
-    assert cls_ctx.lexical_parent is None
-    assert [c["name"] for c in cls_ctx.structural_children] == ["run", "_private_method"]
-    assert cls_ctx.lexical_children == []
-    assert "source" in cls_ctx.focus_symbol
-    assert cls_ctx.freshness["is_fresh"] is True
-    assert cls_ctx.freshness["context_source"] == "ast_only"
+    cls_id = _find_node_id(factory, repo_id, "Service", SymbolKind.CLASS)
+    run_id = _find_node_id(factory, repo_id, "run", SymbolKind.METHOD)
+    inner_id = _find_node_id(factory, repo_id, "inner_fn", SymbolKind.LOCAL_FUNCTION)
 
-    run_id = _find_node_id(conn, "run", "method")
-    run_ctx = build_symbol_context(conn, run_id)
-    assert run_ctx is not None
-    assert run_ctx.structural_parent is not None
-    assert run_ctx.structural_parent["id"] == cls_id
-    # Class methods are structural class members, NOT lexical declarations
-    assert run_ctx.lexical_parent is None
-    assert [c["name"] for c in run_ctx.lexical_children] == ["_local"]
-    assert run_ctx.structural_summary["is_nested_declaration"] is False
-    assert run_ctx.structural_summary["relationship_counts"]["callees"] >= 2
+    with factory.open(read_only=True) as uow:
+        cls_ctx = builder.build_context(
+            uow,
+            cls_id,
+            ContextBuildOptions(edge_limit=20, include_source=True),
+        )
+        assert cls_ctx.structural_parent is not None
+        assert cls_ctx.structural_parent.kind == SymbolKind.MODULE
+        assert cls_ctx.lexical_parent is None
+        assert [c.name for c in cls_ctx.structural_children] == ["run", "_private_method"]
+        assert cls_ctx.lexical_children == []
+        assert cls_ctx.focus_symbol.source is not None
+        assert cls_ctx.focus_symbol.raw_source is not None
+        assert cls_ctx.freshness.is_fresh is True
+        assert cls_ctx.freshness.context_source == "ast_only"
 
-    inner_id = _find_node_id(conn, "inner_fn", "local_function")
-    inner_ctx = build_symbol_context(conn, inner_id)
-    assert inner_ctx is not None
-    assert inner_ctx.lexical_parent is not None
-    assert inner_ctx.lexical_parent["name"] == "outer_fn"
-    assert inner_ctx.structural_summary["is_local_declaration"] is True
-    assert inner_ctx.structural_summary["is_nested_declaration"] is True
+        run_ctx = builder.build_context(uow, run_id)
+        assert run_ctx.structural_parent is not None
+        assert run_ctx.structural_parent.id == cls_id
+        # Class methods are structural class members, NOT lexical declarations
+        assert run_ctx.lexical_parent is None
+        assert [c.name for c in run_ctx.lexical_children] == ["_local"]
+        assert run_ctx.structural_summary.is_nested_declaration is False
+        assert run_ctx.structural_summary.relationship_counts.callees >= 2
+
+        inner_ctx = builder.build_context(uow, inner_id)
+        assert inner_ctx.lexical_parent is not None
+        assert inner_ctx.lexical_parent.name == "outer_fn"
+        assert inner_ctx.structural_summary.is_local_declaration is True
+        assert inner_ctx.structural_summary.is_nested_declaration is True
 
 
 def test_build_symbol_context_edge_limit_and_missing(
-    indexed_context_repo: tuple[Connection, Path, str],
+    indexed_context_repo: tuple[SqlUnitOfWorkFactory, Path, str],
 ) -> None:
-    """build_symbol_context respects edge_limit, rejects <0, and returns None when missing."""
-    conn, _, _ = indexed_context_repo
-    assert build_symbol_context(conn, "sym:nonexistent") is None
-    with pytest.raises(ValidationError):
-        build_symbol_context(conn, _find_node_id(conn, "Service", "class"), edge_limit=-1)
+    """ContextBuildOptions rejects negative limits and build_context raises SymbolNotFoundError."""
+    factory, _, _ = indexed_context_repo
+    builder = SymbolContextBuilder()
+
+    with pytest.raises(PydanticValidationError):
+        ContextBuildOptions(edge_limit=-1)
+
+    with pytest.raises(SymbolNotFoundError), factory.open(read_only=True) as uow:
+        builder.build_context(uow, "sym:nonexistent")
 
 
 def test_build_file_outline_structure_and_filters(
-    indexed_context_repo: tuple[Connection, Path, str],
+    indexed_context_repo: tuple[SqlUnitOfWorkFactory, Path, str],
 ) -> None:
-    """build_file_outline returns start_line-ordered symbols and deduplicated imports."""
-    conn, _, repo_id = indexed_context_repo
+    """OutlineBuilder returns start_line-ordered symbols and deduplicated imports."""
+    factory, _, repo_id = indexed_context_repo
+    outline_builder = OutlineBuilder()
 
-    outline = build_file_outline(conn, repo_id, "service.py")
-    assert outline["file_path"] == "service.py"
-    assert outline["module_path"] == "service"
-    assert outline["is_fresh"] is True
-    assert outline["doc"] == "Service module docstring."
-    assert outline["imports"] == ["helpers.helper"]
-    assert [s["name"] for s in outline["symbols"]] == ["dec", "Service", "outer_fn"]
+    with factory.open(read_only=True) as uow:
+        outline = outline_builder.build_outline(uow, repo_id, "service.py")
+        assert outline.file_path == "service.py"
+        assert outline.module_path == "service"
+        assert outline.is_fresh is True
+        assert outline.doc == "Service module docstring."
+        assert outline.imports == ["helpers.helper"]
+        assert [s.name for s in outline.symbols] == ["dec", "Service", "outer_fn"]
 
-    svc_entry = outline["symbols"][1]
-    assert [c["name"] for c in svc_entry["children"]] == ["run", "_private_method"]
+        svc_entry = outline.symbols[1]
+        assert [c.name for c in svc_entry.children] == ["run", "_private_method"]
 
-    # include_private=False drops _private_method and _local
-    public_outline = build_file_outline(conn, repo_id, "service.py", include_private=False)
-    public_svc = public_outline["symbols"][1]
-    assert [c["name"] for c in public_svc["children"]] == ["run"]
-    assert public_svc["children"][0]["children"] == []
+        # include_private=False drops _private_method and _local
+        public_outline = outline_builder.build_outline(
+            uow, repo_id, "service.py", include_private=False
+        )
+        public_svc = public_outline.symbols[1]
+        assert [c.name for c in public_svc.children] == ["run"]
+        assert public_svc.children[0].children == []
 
-    # max_depth=1 omits method children
-    shallow_outline = build_file_outline(conn, repo_id, "service.py", max_depth=1)
-    assert shallow_outline["symbols"][1]["children"] == []
+        # max_depth=1 omits method children
+        shallow_outline = outline_builder.build_outline(uow, repo_id, "service.py", max_depth=1)
+        assert shallow_outline.symbols[1].children == []
 
-    with pytest.raises(RepoContextError) as missing_exc:
-        build_file_outline(conn, repo_id, "missing.py")
-    assert missing_exc.value.error_code == "file_not_found"
+        with pytest.raises(ValidationError):
+            outline_builder.build_outline(uow, repo_id, "service.py", max_depth=-1)
+
+        with pytest.raises(IndexerError) as missing_exc:
+            outline_builder.build_outline(uow, repo_id, "missing.py")
+        assert missing_exc.value.error_code == "file_not_found"
 
 
-def test_read_symbol_source_pagination_staleness_and_path_security(
-    indexed_context_repo: tuple[Connection, Path, str],
+def test_read_symbol_source_pagination_batch_staleness_and_path_security(
+    indexed_context_repo: tuple[SqlUnitOfWorkFactory, Path, str],
     tmp_path: Path,
 ) -> None:
-    """read_symbol_source slices 1-based lines, paginates, detects staleness, and blocks escapes."""
-    conn, repo_root, _ = indexed_context_repo
-    run_id = _find_node_id(conn, "run", "method")
+    """SourceReader slices lines, paginates, batches, detects staleness, and blocks escapes."""
+    factory, repo_root, repo_id = indexed_context_repo
+    reader = SourceReader()
+    run_id = _find_node_id(factory, repo_id, "run", SymbolKind.METHOD)
+    helper_id = _find_node_id(factory, repo_id, "helper", SymbolKind.FUNCTION)
 
-    page1 = read_symbol_source(conn, run_id, max_lines=3, offset=0)
-    assert page1["is_fresh"] is True
-    assert page1["truncated"] is True
-    assert page1["total_lines"] == 6  # lines 11..16 inclusive of @dec
-    assert page1["returned_lines"] == 3
-    assert page1["next_offset"] == 3
-    assert "11:     @dec" in page1["source"]
+    with factory.open(read_only=True) as uow:
+        page1 = reader.read_symbol_snippet(
+            uow, run_id, SnippetOptions(max_lines=3, offset=0)
+        )
+        assert page1.is_fresh is True
+        assert page1.truncated is True
+        assert page1.total_lines == 6  # lines 11..16 inclusive of @dec
+        assert page1.returned_lines == 3
+        assert page1.next_offset == 3
+        assert "11:     @dec" in page1.numbered_source
+        assert page1.raw_source.startswith("    @dec")
+        assert "11:" not in page1.raw_source
 
-    page2 = read_symbol_source(conn, run_id, max_lines=10, offset=page1["next_offset"])
-    assert page2["truncated"] is False
-    assert page2["next_offset"] is None
-    assert "16:         return helper(_local(x))" in page2["source"]
+        page2 = reader.read_symbol_snippet(
+            uow, run_id, SnippetOptions(max_lines=10, offset=page1.next_offset)
+        )
+        assert page2.truncated is False
+        assert page2.next_offset is None
+        assert "16:         return helper(_local(x))" in page2.numbered_source
 
-    # Path security: symlink / traversal rejected by read_file_snippet
+        batched = reader.read_symbol_snippets(
+            uow, [run_id, helper_id], SnippetOptions(padding_lines=1)
+        )
+        assert [s.symbol_id for s in batched] == [run_id, helper_id]
+        assert batched[0].window_start_line == page1.start_line - 1
+
+    # Path security and line bound validation on read_file_snippet
     outside = tmp_path / "secret.py"
     outside.write_text("SECRET = 1\n", encoding="utf-8")
     (repo_root / "escape.py").symlink_to(outside)
 
     with pytest.raises(PathSecurityError):
-        read_file_snippet(repo_root, "escape.py", 1, 1)
+        reader.read_file_snippet(repo_root, "escape.py", 1, 1)
     with pytest.raises(PathSecurityError):
-        read_file_snippet(repo_root, "../secret.py", 1, 1)
+        reader.read_file_snippet(repo_root, "../secret.py", 1, 1)
+    with pytest.raises(ValidationError):
+        reader.read_file_snippet(repo_root, "service.py", 0, 1)
 
     # Disk staleness detection
     service_file = repo_root / "service.py"
     service_file.write_text(
         service_file.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
     )
-    stale_src = read_symbol_source(conn, run_id)
-    assert stale_src["is_fresh"] is False
-    assert stale_src["stale_reason"] == "content_hash_mismatch"
+    with factory.open(read_only=True) as uow:
+        stale_src = reader.read_symbol_snippet(uow, run_id)
+        assert stale_src.is_fresh is False
+        assert stale_src.stale_reason == "content_hash_mismatch"

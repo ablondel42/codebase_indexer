@@ -1,4 +1,4 @@
-"""Comprehensive tests for all grouped ``rc`` CLI commands (default JSON output)."""
+"""Comprehensive subprocess tests for all grouped ``rc`` CLI commands via ``cli.main``."""
 
 import json
 import os
@@ -13,12 +13,12 @@ SRC_DIR = PROJECT_ROOT / "src"
 
 
 def _run_rc(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    """Run ``python -m repo_context.cli.main`` with ``src/`` prioritized on ``PYTHONPATH``."""
+    """Run ``python -m cli.main`` with ``src/`` prioritized on ``PYTHONPATH``."""
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{existing}" if existing else str(SRC_DIR)
     return subprocess.run(
-        [sys.executable, "-m", "repo_context.cli.main", *args],
+        [sys.executable, "-m", "cli.main", *args],
         capture_output=True,
         text=True,
         cwd=str(cwd or PROJECT_ROOT),
@@ -56,7 +56,8 @@ def cli_workspace(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     (repo_root / "tests" / "test_math.py").write_text(
-        "def test_add():\n    assert 1 + 1 == 2\n", encoding="utf-8"
+        "def test_add() -> None:\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
     )
     db_path = tmp_path / "cli_test.db"
     return repo_root, db_path
@@ -74,7 +75,7 @@ def indexed_workspace(cli_workspace: tuple[Path, Path]) -> tuple[Path, Path]:
 def test_rc_index_initial_incremental_force_and_include_tests(
     cli_workspace: tuple[Path, Path],
 ) -> None:
-    """`rc index` handles initial, unchanged incremental, --force, and --include-tests."""
+    """``rc index`` handles initial, unchanged incremental, ``--force``, and ``--include-tests``."""
     repo_root, db_path = cli_workspace
 
     init_res = _run_rc("index", str(repo_root), "--db-path", str(db_path), cwd=repo_root)
@@ -108,7 +109,7 @@ def test_rc_index_initial_incremental_force_and_include_tests(
 def test_rc_db_subcommands_and_read_only_sql_guard(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """`rc db {status,repos,tables,runs,sql}` emit JSON objects and block SQL mutations."""
+    """``rc db {status,repos,tables,runs,sql}`` emit JSON objects and block SQL mutations."""
     repo_root, db_path = indexed_workspace
 
     for sub in ("status", "repos", "tables", "runs"):
@@ -117,17 +118,19 @@ def test_rc_db_subcommands_and_read_only_sql_guard(
         parsed = json.loads(res.stdout)
         assert isinstance(parsed, dict)
 
-    # SELECT and PRAGMA allowed
     select_res = _run_rc(
-        "db", "sql", "SELECT name, kind FROM nodes WHERE kind = 'class' ORDER BY name",
-        "--db-path", str(db_path), cwd=repo_root
+        "db",
+        "sql",
+        "SELECT name, kind FROM nodes WHERE kind = 'class' ORDER BY name",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert select_res.returncode == 0, select_res.stderr
     rows = json.loads(select_res.stdout)["rows"]
     assert rows == [{"name": "Calculator", "kind": "class"}]
 
-    # Write/DDL mutations MUST be blocked by SQLite authorizer and return JSON error on stderr
-    for forbidden_sql in (
+    forbidden_queries = (
         "DELETE FROM nodes",
         "DROP TABLE nodes",
         "UPDATE nodes SET name = 'hacked'",
@@ -135,7 +138,8 @@ def test_rc_db_subcommands_and_read_only_sql_guard(
             "INSERT INTO repos (id, root_path, name, default_language, created_at) "
             "VALUES ('a','b','c','python','2026-01-01T00:00:00Z')"
         ),
-    ):
+    )
+    for forbidden_sql in forbidden_queries:
         bad_res = _run_rc("db", "sql", forbidden_sql, "--db-path", str(db_path), cwd=repo_root)
         assert bad_res.returncode != 0, f"Expected failure for {forbidden_sql}"
         bad_err = json.loads(bad_res.stderr)
@@ -146,18 +150,18 @@ def test_rc_db_subcommands_and_read_only_sql_guard(
 def test_rc_files_and_outline_json(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """`rc files` reflects live disk freshness and `rc outline` emits hierarchical JSON."""
+    """``rc files`` reflects live disk freshness and ``rc outline`` emits hierarchical JSON."""
     repo_root, db_path = indexed_workspace
 
     files_res = _run_rc("files", "--db-path", str(db_path), cwd=repo_root)
     assert files_res.returncode == 0
     files_payload = json.loads(files_res.stdout)
-    assert any(
-        f["file_path"] == "pkg/math_ops.py" and f["freshness"] == "fresh"
-        for f in files_payload["files"]
-    )
+    fresh_paths = {
+        item["file_path"]: item["freshness"]
+        for item in files_payload["files"]
+    }
+    assert fresh_paths.get("pkg/math_ops.py") == "fresh"
 
-    # Modify one file on disk and verify rc files detects 'modified'
     math_file = repo_root / "pkg" / "math_ops.py"
     math_file.write_text(math_file.read_text(encoding="utf-8") + "\n# modified\n", encoding="utf-8")
     files_mod = _run_rc("files", "math_ops", "--db-path", str(db_path), cwd=repo_root)
@@ -167,7 +171,12 @@ def test_rc_files_and_outline_json(
     assert entries[0]["freshness"] == "modified"
 
     outline_public = _run_rc(
-        "outline", "pkg/math_ops.py", "--no-private", "--db-path", str(db_path), cwd=repo_root
+        "outline",
+        "pkg/math_ops.py",
+        "--no-private",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert outline_public.returncode == 0, outline_public.stderr
     outline_pub_data = json.loads(outline_public.stdout)
@@ -183,31 +192,39 @@ def test_rc_files_and_outline_json(
     assert "_internal" in [c["name"] for c in full_calc["children"]]
 
 
-def test_rc_symbols_source_refs_risk_and_mcp_call(
+def test_rc_symbols_and_source_commands(
     indexed_workspace: tuple[Path, Path],
 ) -> None:
-    """`rc symbols`, `rc source`, `rc refs`, `rc risk`, and `rc mcp-call` emit valid JSON."""
+    """``rc symbols {search,list,show}`` and ``rc source`` emit valid structured JSON."""
     repo_root, db_path = indexed_workspace
 
     search_res = _run_rc(
-        "symbols", "search", "Calculator", "--db-path", str(db_path), cwd=repo_root
+        "symbols",
+        "search",
+        "Calculator",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert search_res.returncode == 0
     search_data = json.loads(search_res.stdout)
-    assert any(
-        s["id"].startswith("sym:") and s["qualified_name"] == "pkg.math_ops.Calculator"
-        for s in search_data["symbols"]
-    )
+    qualified = {s["qualified_name"] for s in search_data["symbols"]}
+    assert "pkg.math_ops.Calculator" in qualified
 
     list_res = _run_rc(
-        "symbols", "list", "--kind", "module", "--db-path", str(db_path), cwd=repo_root
+        "symbols",
+        "list",
+        "--kind",
+        "module",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert list_res.returncode == 0
     modules = json.loads(list_res.stdout)["symbols"]
     assert len(modules) == 3
     mod_id = modules[0]["id"]
 
-    # symbols show on module (structural_parent is None)
     show_mod = _run_rc("symbols", "show", mod_id, "--db-path", str(db_path), cwd=repo_root)
     assert show_mod.returncode == 0, show_mod.stderr
     show_mod_data = json.loads(show_mod.stdout)
@@ -215,12 +232,17 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
     assert show_mod_data["structural_parent"] is None
 
     show_fn = _run_rc(
-        "symbols", "show", "pkg.math_ops.add", "--source", "--db-path", str(db_path), cwd=repo_root
+        "symbols",
+        "show",
+        "pkg.math_ops.add",
+        "--source",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert show_fn.returncode == 0
     assert "def add(" in json.loads(show_fn.stdout)["focus_symbol"]["source"]
 
-    # rc source
     src_res = _run_rc("source", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
     assert src_res.returncode == 0
     src_data = json.loads(src_res.stdout)
@@ -228,7 +250,13 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
     assert "def add(" in src_data["source"]
     assert "return a + b" in src_data["source"]
 
-    # rc refs
+
+def test_rc_refs_risk_and_mcp_call(
+    indexed_workspace: tuple[Path, Path],
+) -> None:
+    """``rc refs``, ``rc risk``, daemon ``--help``, and ``rc mcp-call`` emit valid JSON."""
+    repo_root, db_path = indexed_workspace
+
     refs_res = _run_rc(
         "refs",
         "pkg.math_ops.add",
@@ -241,11 +269,16 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
     assert refs_res.returncode == 0
     refs_data = json.loads(refs_res.stdout)
     assert refs_data["total_count"] >= 2
-    assert any(r["peer_name"] == "pkg.runner.run_calc" for r in refs_data["references"])
+    peers = {r["peer_name"] for r in refs_data["references"]}
+    assert "pkg.runner.run_calc" in peers
 
-    # rc risk
     risk_multi = _run_rc(
-        "risk", "pkg.math_ops.add", "pkg.runner.run_calc", "--db-path", str(db_path), cwd=repo_root
+        "risk",
+        "pkg.math_ops.add",
+        "pkg.runner.run_calc",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert risk_multi.returncode == 0
     assert json.loads(risk_multi.stdout)["facts"]["target_spans_multiple_modules"] is True
@@ -254,26 +287,32 @@ def test_rc_symbols_source_refs_risk_and_mcp_call(
     assert risk_single.returncode == 0
     assert json.loads(risk_single.stdout)["facts"]["cross_module_impact"] is True
 
-    # rc watch / serve help & rc mcp-call
     assert _run_rc("watch", "--help").returncode == 0
     assert _run_rc("serve", "--help").returncode == 0
     mcp_res = _run_rc(
-        "mcp-call", "get_repo_overview", "{}", "--db-path", str(db_path), cwd=repo_root
+        "mcp-call",
+        "get_repo_overview",
+        "{}",
+        "--db-path",
+        str(db_path),
+        cwd=repo_root,
     )
     assert mcp_res.returncode == 0, mcp_res.stderr
     assert json.loads(mcp_res.stdout)["result"]["ok"] is True
 
 
 def test_rc_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) -> None:
-    """`rc symbols list/search --file .github/` must preserve leading dots without stripping."""
+    """``rc symbols list/search --file .github/`` preserves leading dots without stripping."""
     repo_root = tmp_path / "dot_cli_repo"
     (repo_root / ".github").mkdir(parents=True)
     (repo_root / "github").mkdir()
     (repo_root / ".github" / "ci.py").write_text(
-        "def check_ci() -> int:\n    return 1\n", encoding="utf-8"
+        "def check_ci() -> int:\n    return 1\n",
+        encoding="utf-8",
     )
     (repo_root / "github" / "ci.py").write_text(
-        "def check_non_dot() -> int:\n    return 2\n", encoding="utf-8"
+        "def check_non_dot() -> int:\n    return 2\n",
+        encoding="utf-8",
     )
 
     db_path = tmp_path / "dot_cli.db"
@@ -293,8 +332,8 @@ def test_rc_symbols_list_and_search_preserve_dot_prefix_paths(tmp_path: Path) ->
         assert list_res.returncode == 0, list_res.stderr
         syms = json.loads(list_res.stdout)["symbols"]
         assert syms
-        assert all(s["file_path"] == ".github/ci.py" for s in syms)
-        assert any(s["name"] == "check_ci" for s in syms)
+        assert {s["file_path"] for s in syms} == {".github/ci.py"}
+        assert "check_ci" in {s["name"] for s in syms}
 
     search_res = _run_rc(
         "symbols",

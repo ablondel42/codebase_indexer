@@ -1,0 +1,51 @@
+"""Stateless CLI argv parsing and JSON output formatting helpers."""
+
+from cli.utils.argv import (
+    KNOWN_COMMANDS,
+    inject_shell_defaults,
+    normalize_mcp_tool_kwargs,
+    parse_mcp_call_args,
+    preprocess_argv,
+    tokenize_shell_line,
+)
+from cli.utils.output import (
+    emit_cli_error,
+    emit_json,
+    format_files_for_cli,
+    format_index_result_for_cli,
+    format_mcp_call_envelope,
+    format_outline_for_cli,
+    format_references_for_cli,
+    format_source_for_cli,
+    format_symbol_context_for_cli,
+    format_symbol_list_for_cli,
+    format_symbol_search_for_cli,
+    format_watch_event_payload,
+    resolve_cli_db_path,
+    serialize_risk_for_cli,
+    silence_broken_pipe,
+)
+
+__all__ = [
+    "KNOWN_COMMANDS",
+    "emit_cli_error",
+    "emit_json",
+    "format_files_for_cli",
+    "format_index_result_for_cli",
+    "format_mcp_call_envelope",
+    "format_outline_for_cli",
+    "format_references_for_cli",
+    "format_source_for_cli",
+    "format_symbol_context_for_cli",
+    "format_symbol_list_for_cli",
+    "format_symbol_search_for_cli",
+    "format_watch_event_payload",
+    "inject_shell_defaults",
+    "normalize_mcp_tool_kwargs",
+    "parse_mcp_call_args",
+    "preprocess_argv",
+    "resolve_cli_db_path",
+    "serialize_risk_for_cli",
+    "silence_broken_pipe",
+    "tokenize_shell_line",
+]

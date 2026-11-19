@@ -1,102 +1,102 @@
-"""AST extraction, hierarchy, UTF-8 range, assignment, call, and linker tests (v0.2.0)."""
+"""AST extraction, hierarchy, UTF-8 range, assignment, call, and SymbolLinker tests."""
 
 import ast
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.engine import Connection
 
-from repo_context.config import AppConfig
-from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_CONTAINS, EDGE_KIND_SCOPE_PARENT
-from repo_context.exceptions import ParseError
-from repo_context.parsing.ast_loader import load_file_text, parse_file
-from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pathing import derive_repo_id
-from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.ranges import (
+from core.models import (
+    AST_DEPENDENCY_EDGE_KINDS,
+    AppConfig,
+    EdgeKind,
+    LineSpan,
+    ParseError,
+    SymbolKind,
+    SymbolNode,
+    SymbolScope,
+)
+from core.utils.pathing import derive_repo_id
+from parsing import AstExtractionPipeline, FileGraphExtraction, RepoScanner, SymbolLinker
+from parsing.utils.ast_helpers import load_python_source, parse_python_ast
+from parsing.utils.ranges import (
     make_declaration_lines,
     make_name_selection_range,
     make_range,
 )
-from repo_context.parsing.scanner import build_file_record, build_repo_record, scan_repository
-from repo_context.storage import (
-    close_connection,
-    edges_table,
-    get_connection,
-    initialize_database,
-    nodes_table,
-    replace_file_graph,
-    upsert_files,
-    upsert_repo,
-)
+from storage import SqlUnitOfWorkFactory
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 @pytest.fixture
-def initialized_conn(tmp_path: Path) -> Iterator[Connection]:
-    """Yield an initialized v2 SQLite connection and close it on teardown."""
-    conn = get_connection(tmp_path / "ast.db")
-    try:
-        initialize_database(conn)
-        yield conn
-    finally:
-        close_connection(conn)
+def uow_factory(tmp_path: Path) -> SqlUnitOfWorkFactory:
+    """Create an initialized SQLite UnitOfWorkFactory for persistence assertions."""
+    factory = SqlUnitOfWorkFactory(tmp_path / "ast.db")
+    with factory.open(initialize=True):
+        pass
+    return factory
+
+
+def _extract_single_file(repo_root: Path, rel_path: str) -> FileGraphExtraction:
+    """Scan and extract a single Python file inside ``repo_root``."""
+    scanner = RepoScanner()
+    pipeline = AstExtractionPipeline()
+    repo_id = derive_repo_id(repo_root)
+    file_rec = scanner.scan_file(repo_id, repo_root, repo_root / rel_path)
+    return pipeline.extract_file(repo_root, file_rec)
 
 
 def _persist_single_file(
-    conn: Connection,
+    uow_factory: SqlUnitOfWorkFactory,
     repo_root: Path,
     rel_path: str,
-) -> tuple[str, list[dict], list[dict]]:
+) -> FileGraphExtraction:
     """Index and persist a single file inside ``repo_root`` respecting v2 FKs."""
-    repo = build_repo_record(repo_root)
-    file_rec = build_file_record(repo.id, repo_root, repo_root / rel_path)
-    nodes, edges, _ = extract_file_graph(repo.id, file_rec, repo_root)
-    upsert_repo(conn, repo)
-    upsert_files(conn, [file_rec])
-    replace_file_graph(conn, file_rec.id, nodes, edges)
-    conn.commit()
-    return repo.id, nodes, edges
+    scanner = RepoScanner()
+    pipeline = AstExtractionPipeline()
+    repo = scanner.build_repo_record(repo_root)
+    file_rec = scanner.scan_file(repo.id, repo_root, repo_root / rel_path)
+    extraction = pipeline.extract_file(repo_root, file_rec)
+    with uow_factory.open() as uow:
+        uow.repos.upsert(repo)
+        uow.replace_file_graph(file_rec, extraction.nodes, extraction.edges)
+    return extraction
 
 
-def test_contains_hierarchy_and_no_module_to_method_edges(tmp_path: Path) -> None:
+def test_contains_hierarchy_and_no_module_to_method_edges() -> None:
     """Module contains only top-level symbols; classes contain their direct methods."""
-    repo_root = FIXTURES_DIR / "simple_package"
-    repo_id = derive_repo_id(repo_root)
-    file_rec = build_file_record(repo_id, repo_root, repo_root / "services.py")
-    nodes, edges, _ = extract_file_graph(repo_id, file_rec, repo_root)
+    extraction = _extract_single_file(FIXTURES_DIR / "simple_package", "services.py")
+    nodes = extraction.nodes
+    edges = extraction.edges
 
-    by_id = {n["id"]: n for n in nodes}
-    module_node = next(n for n in nodes if n["kind"] == "module")
-    auth_cls = next(n for n in nodes if n["name"] == "AuthService")
-    login_method = next(n for n in nodes if n["name"] == "login")
-    create_fn = next(n for n in nodes if n["name"] == "create_service")
+    by_id = {n.id: n for n in nodes}
+    module_node = next(n for n in nodes if n.kind == SymbolKind.MODULE)
+    auth_cls = next(n for n in nodes if n.name == "AuthService")
+    login_method = next(n for n in nodes if n.name == "login")
+    create_fn = next(n for n in nodes if n.name == "create_service")
 
-    assert auth_cls["parent_id"] == module_node["id"]
-    assert auth_cls["lexical_parent_id"] is None
-    assert login_method["parent_id"] == auth_cls["id"]
-    assert login_method["lexical_parent_id"] is None
-    assert login_method["scope"] == "class"
-    assert create_fn["parent_id"] == module_node["id"]
+    assert auth_cls.parent_id == module_node.id
+    assert auth_cls.lexical_parent_id is None
+    assert login_method.parent_id == auth_cls.id
+    assert login_method.lexical_parent_id is None
+    assert login_method.scope == SymbolScope.CLASS
+    assert create_fn.parent_id == module_node.id
 
-    contains = [e for e in edges if e["kind"] == EDGE_KIND_CONTAINS]
-    pairs = {(e["from_id"], e["to_id"]) for e in contains}
-    assert (module_node["id"], auth_cls["id"]) in pairs
-    assert (module_node["id"], create_fn["id"]) in pairs
-    assert (auth_cls["id"], login_method["id"]) in pairs
+    contains = [e for e in edges if e.kind == EdgeKind.CONTAINS]
+    pairs = {(e.from_id, e.to_id) for e in contains}
+    assert (module_node.id, auth_cls.id) in pairs
+    assert (module_node.id, create_fn.id) in pairs
+    assert (auth_cls.id, login_method.id) in pairs
 
     # Strictly zero module -> method contains edges
     for src, dst in pairs:
-        if by_id[src]["kind"] == "module":
-            assert by_id[dst]["kind"] not in ("method", "async_method")
+        if by_id[src].kind == SymbolKind.MODULE:
+            assert by_id[dst].kind not in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
 
 
 def test_selection_range_for_class_def_async_def_and_utf8_columns(tmp_path: Path) -> None:
-    """selection_range_json pinpoints identifier names on class/def/async def and UTF-8 lines."""
+    """selection_range pinpoints identifier names on class/def/async def and UTF-8 lines."""
     repo = tmp_path / "utf8_repo"
     repo.mkdir()
     src_file = repo / "mod.py"
@@ -114,20 +114,19 @@ def test_selection_range_for_class_def_async_def_and_utf8_columns(tmp_path: Path
         'héllo = "😀"; café = 2\n',
         encoding="utf-8",
     )
-    repo_id = derive_repo_id(repo)
-    file_rec = build_file_record(repo_id, repo, src_file)
-    nodes, _, _ = extract_file_graph(repo_id, file_rec, repo)
+    extraction = _extract_single_file(repo, "mod.py")
     lines = src_file.read_text(encoding="utf-8").splitlines()
 
-    def _slice_sel(node: dict) -> str:
-        sel = node["selection_range_json"]
-        line_txt = lines[sel["start"]["line"]]
-        return line_txt[sel["start"]["character"] : sel["end"]["character"]]
+    def _slice_sel(node: SymbolNode) -> str:
+        assert node.selection_range is not None
+        sel = node.selection_range
+        line_txt = lines[sel.start.line]
+        return line_txt[sel.start.character : sel.end.character]
 
-    foo = next(n for n in nodes if n["name"] == "Foo")
-    fn_f = next(n for n in nodes if n["name"] == "f")
-    async_sync = next(n for n in nodes if n["name"] == "sync")
-    cafe = next(n for n in nodes if n["name"] == "café")
+    foo = next(n for n in extraction.nodes if n.name == "Foo")
+    fn_f = next(n for n in extraction.nodes if n.name == "f")
+    async_sync = next(n for n in extraction.nodes if n.name == "sync")
+    cafe = next(n for n in extraction.nodes if n.name == "café")
 
     assert _slice_sel(foo) == "Foo"
     assert _slice_sel(fn_f) == "f"
@@ -137,19 +136,17 @@ def test_selection_range_for_class_def_async_def_and_utf8_columns(tmp_path: Path
 
 def test_decorator_inclusive_lines() -> None:
     """Decorated functions/classes include decorator lines in start_line..end_line."""
-    repo_root = FIXTURES_DIR / "decorators_case"
-    repo_id = derive_repo_id(repo_root)
-    file_rec = build_file_record(repo_id, repo_root, repo_root / "decorated.py")
-    nodes, _, _ = extract_file_graph(repo_id, file_rec, repo_root)
+    extraction = _extract_single_file(FIXTURES_DIR / "decorators_case", "decorated.py")
+    nodes = extraction.nodes
 
-    compute = next(n for n in nodes if n["name"] == "compute")
-    cached_cls = next(n for n in nodes if n["name"] == "CachedClass")
-    get_val = next(n for n in nodes if n["name"] == "get_value")
+    compute = next(n for n in nodes if n.name == "compute")
+    cached_cls = next(n for n in nodes if n.name == "CachedClass")
+    get_val = next(n for n in nodes if n.name == "get_value")
 
-    assert compute["start_line"] == 34  # @logged line above def compute on line 36
-    assert compute["end_line"] == 38
-    assert cached_cls["start_line"] == 41
-    assert get_val["start_line"] == 48
+    assert compute.start_line == 34  # @logged line above def compute on line 36
+    assert compute.end_line == 38
+    assert cached_cls.start_line == 41
+    assert get_val.start_line == 48
 
 
 def test_nested_classes_and_local_classes_without_doubled_name(tmp_path: Path) -> None:
@@ -165,46 +162,39 @@ def test_nested_classes_and_local_classes_without_doubled_name(tmp_path: Path) -
         "            return 1\n",
         encoding="utf-8",
     )
-    repo_id = derive_repo_id(repo)
-    file_rec = build_file_record(repo_id, repo, repo / "nested.py")
-    nodes, edges, _ = extract_file_graph(repo_id, file_rec, repo)
+    extraction = _extract_single_file(repo, "nested.py")
+    nodes = extraction.nodes
 
-    outer = next(n for n in nodes if n["name"] == "Outer")
-    inner = next(n for n in nodes if n["name"] == "Inner")
-    inner_val = next(n for n in nodes if n["name"] == "VALUE")
-    ping = next(n for n in nodes if n["name"] == "ping")
+    outer = next(n for n in nodes if n.name == "Outer")
+    inner = next(n for n in nodes if n.name == "Inner")
+    inner_val = next(n for n in nodes if n.name == "VALUE")
+    ping = next(n for n in nodes if n.name == "ping")
 
-    assert inner["qualified_name"] == "nested.Outer.Inner"
-    assert inner["parent_id"] == outer["id"]
-    assert inner["lexical_parent_id"] is None
-    assert inner["scope"] == "class"
-    assert inner_val["kind"] == "attribute"
-    assert inner_val["parent_id"] == inner["id"]
-    assert ping["parent_id"] == inner["id"]
-    assert ping["qualified_name"] == "nested.Outer.Inner.ping"
+    assert inner.qualified_name == "nested.Outer.Inner"
+    assert inner.parent_id == outer.id
+    assert inner.lexical_parent_id is None
+    assert inner.scope == SymbolScope.CLASS
+    assert inner_val.kind == SymbolKind.ATTRIBUTE
+    assert inner_val.parent_id == inner.id
+    assert ping.parent_id == inner.id
+    assert ping.qualified_name == "nested.Outer.Inner.ping"
 
     # Local class from fixture must not double the factory function name
-    local_root = FIXTURES_DIR / "nested_scope_case"
-    local_repo_id = derive_repo_id(local_root)
-    local_rec = build_file_record(local_repo_id, local_root, local_root / "local_classes.py")
-    local_nodes, local_edges, _ = extract_file_graph(local_repo_id, local_rec, local_root)
+    local_ext = _extract_single_file(FIXTURES_DIR / "nested_scope_case", "local_classes.py")
+    factory = next(n for n in local_ext.nodes if n.name == "factory")
+    local_cls = next(n for n in local_ext.nodes if n.name == "LocalClass")
+    local_method = next(n for n in local_ext.nodes if n.name == "method")
 
-    factory = next(n for n in local_nodes if n["name"] == "factory")
-    local_cls = next(n for n in local_nodes if n["name"] == "LocalClass")
-    local_method = next(n for n in local_nodes if n["name"] == "method")
-
-    assert local_cls["qualified_name"] == "local_classes.factory.LocalClass"
-    assert local_cls["scope"] == "function"
-    assert local_cls["parent_id"] == factory["id"]
-    assert local_cls["lexical_parent_id"] == factory["id"]
-    assert local_method["parent_id"] == local_cls["id"]
-    assert local_method["lexical_parent_id"] is None
-    assert local_method["scope"] == "class"
+    assert local_cls.qualified_name == "local_classes.factory.LocalClass"
+    assert local_cls.scope == SymbolScope.FUNCTION
+    assert local_cls.parent_id == factory.id
+    assert local_cls.lexical_parent_id == factory.id
+    assert local_method.parent_id == local_cls.id
+    assert local_method.lexical_parent_id is None
+    assert local_method.scope == SymbolScope.CLASS
     assert any(
-        e["kind"] == EDGE_KIND_SCOPE_PARENT
-        and e["from_id"] == local_cls["id"]
-        and e["to_id"] == factory["id"]
-        for e in local_edges
+        e.kind == EdgeKind.SCOPE_PARENT and e.from_id == local_cls.id and e.to_id == factory.id
+        for e in local_ext.edges
     )
 
 
@@ -223,28 +213,26 @@ def test_assignments_constants_attributes_and_type_aliases(tmp_path: Path) -> No
         "    RETRIES = 3\n",
         encoding="utf-8",
     )
-    repo_id = derive_repo_id(repo)
-    file_rec = build_file_record(repo_id, repo, repo / "defs.py")
-    nodes, _, summary = extract_file_graph(repo_id, file_rec, repo)
+    extraction = _extract_single_file(repo, "defs.py")
+    by_name = {n.name: n for n in extraction.nodes}
 
-    by_name = {n["name"]: n for n in nodes}
-    assert by_name["MAX_SIZE"]["kind"] == "constant"
-    assert by_name["A"]["kind"] == "constant"
-    assert by_name["B"]["kind"] == "constant"
-    assert by_name["UserId"]["kind"] == "type_alias"
-    assert by_name["AliasList"]["kind"] == "type_alias"
-    assert by_name["timeout"]["kind"] == "attribute"
-    assert by_name["RETRIES"]["kind"] == "attribute"
-    assert summary["constant_count"] == 3
-    assert summary["attribute_count"] == 2
-    assert summary["type_alias_count"] == 2
+    assert by_name["MAX_SIZE"].kind == SymbolKind.CONSTANT
+    assert by_name["A"].kind == SymbolKind.CONSTANT
+    assert by_name["B"].kind == SymbolKind.CONSTANT
+    assert by_name["UserId"].kind == SymbolKind.TYPE_ALIAS
+    assert by_name["AliasList"].kind == SymbolKind.TYPE_ALIAS
+    assert by_name["timeout"].kind == SymbolKind.ATTRIBUTE
+    assert by_name["RETRIES"].kind == SymbolKind.ATTRIBUTE
+    assert extraction.metrics.constant_count == 3
+    assert extraction.metrics.attribute_count == 2
+    assert extraction.metrics.type_alias_count == 2
 
 
-def test_relative_imports_calls_and_linker_resolution(
-    initialized_conn: Connection,
+def test_relative_imports_calls_linker_resolution_and_broken_target_reset(
+    uow_factory: SqlUnitOfWorkFactory,
     tmp_path: Path,
 ) -> None:
-    """Extracts relative imports & call qualifiers, and resolves intra-repo edges cleanly."""
+    """SymbolLinker resolves intra-repo edges and resets broken targets back to placeholders."""
     repo = tmp_path / "app_repo"
     (repo / "pkg").mkdir(parents=True)
     (repo / "pkg" / "__init__.py").write_text(
@@ -275,68 +263,61 @@ def test_relative_imports_calls_and_linker_resolution(
     )
 
     cfg = AppConfig()
-    repo_rec, files = scan_repository(repo, cfg)
-    upsert_repo(initialized_conn, repo_rec)
-    upsert_files(initialized_conn, files)
-    for file_rec in files:
-        nodes, edges, _ = extract_file_graph(repo_rec.id, file_rec, repo, config=cfg)
-        replace_file_graph(initialized_conn, file_rec.id, nodes, edges)
+    scan_report = RepoScanner(cfg).scan_repository(repo)
+    pipeline = AstExtractionPipeline(cfg)
+    linker = SymbolLinker()
 
-    link_stats = resolve_repo_edges(initialized_conn, repo_rec.id)
-    initialized_conn.commit()
+    with uow_factory.open() as uow:
+        uow.repos.upsert(scan_report.repo)
+        for file_rec in scan_report.files:
+            ext = pipeline.extract_file(repo, file_rec)
+            uow.replace_file_graph(file_rec, ext.nodes, ext.edges)
 
-    assert link_stats["imports_resolved"] >= 3
-    assert link_stats["inherits_resolved"] >= 1
-    assert link_stats["calls_resolved"] >= 3
-
-    def _node_id(name: str) -> str:
-        return str(
-            initialized_conn.execute(
-                select(nodes_table.c.id).where(nodes_table.c.name == name)
-            ).scalar_one()
+        nodes = uow.nodes.list_for_repo(scan_report.repo.id)
+        candidate_edges = uow.edges.list_for_repo(
+            scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
         )
-
-    worker_cls = _node_id("Worker")
-    base_cls = _node_id("BaseService")
-    step_fn = _node_id("step")
-    compute_fn = _node_id("compute")
-    helper_fn = _node_id("helper")
-    run_fn = _node_id("run")
-
-    inh_to = initialized_conn.execute(
-        select(edges_table.c.to_id).where(
-            edges_table.c.kind == "inherits",
-            edges_table.c.from_id == worker_cls,
+        link_report = linker.resolve(
+            scan_report.repo.id, scan_report.repo.name, nodes, candidate_edges
         )
-    ).scalar_one()
-    assert inh_to == base_cls
+        uow.edges.update_resolved_targets(link_report.updates)
 
-    call_targets = set(
-        initialized_conn.execute(
-            select(edges_table.c.to_id).where(
-                edges_table.c.kind == EDGE_KIND_CALLS,
-                edges_table.c.from_id == run_fn,
-            )
-        ).scalars()
-    )
-    assert {step_fn, compute_fn, helper_fn}.issubset(call_targets)
+    assert link_report.imports_resolved >= 3
+    assert link_report.inherits_resolved >= 1
+    assert link_report.calls_resolved >= 3
+
+    with uow_factory.open() as uow:
+        by_name = {n.name: n.id for n in uow.nodes.list_for_repo(scan_report.repo.id)}
+        inh_edges = uow.edges.list_outgoing(by_name["Worker"], EdgeKind.INHERITS)
+        assert [e.to_id for e in inh_edges] == [by_name["BaseService"]]
+
+        call_targets = {
+            e.to_id for e in uow.edges.list_outgoing(by_name["run"], EdgeKind.CALLS)
+        }
+        assert {by_name["step"], by_name["compute"], by_name["helper"]}.issubset(call_targets)
+
+        # Removing core.py preserves surviving AST edges and SymbolLinker resets broken targets
+        core_file = uow.files.get_by_path(scan_report.repo.id, "pkg/core.py")
+        assert core_file is not None
+        uow.files.delete_file_graph(core_file.id, preserve_incoming_ast_edges=True)
+        surviving_nodes = uow.nodes.list_for_repo(scan_report.repo.id)
+        surviving_edges = uow.edges.list_for_repo(
+            scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
+        )
+        reset_report = linker.resolve(
+            scan_report.repo.id, scan_report.repo.name, surviving_nodes, surviving_edges
+        )
+        assert reset_report.edges_reset >= 2
 
 
-def test_edge_json_is_single_encoded_in_sqlite(
-    initialized_conn: Connection,
-) -> None:
+def test_edge_json_is_single_encoded_in_sqlite(uow_factory: SqlUnitOfWorkFactory) -> None:
     """Persisted edge JSON columns parse once directly to dicts (never double-encoded strings)."""
-    _persist_single_file(initialized_conn, FIXTURES_DIR / "simple_package", "services.py")
-    rows = (
-        initialized_conn.exec_driver_sql(
-            "SELECT payload_json, evidence_range_json FROM edges "
-            "WHERE evidence_range_json IS NOT NULL"
-        )
-        .mappings()
-        .all()
+    _persist_single_file(uow_factory, FIXTURES_DIR / "simple_package", "services.py")
+    res = uow_factory.execute_readonly_sql(
+        "SELECT payload_json, evidence_range_json FROM edges WHERE evidence_range_json IS NOT NULL"
     )
-    assert len(rows) > 0
-    for row in rows:
+    assert res.row_count > 0
+    for row in res.rows:
         payload = json.loads(row["payload_json"])
         ev_range = json.loads(row["evidence_range_json"])
         assert isinstance(payload, dict)
@@ -345,14 +326,11 @@ def test_edge_json_is_single_encoded_in_sqlite(
 
 def test_duplicate_names_and_generator_scope_boundary(tmp_path: Path) -> None:
     """Duplicate same-scope defs disambiguate; outer func isn't generator for inner yield."""
-    local_root = FIXTURES_DIR / "nested_scope_case"
-    repo_id = derive_repo_id(local_root)
-    dup_rec = build_file_record(repo_id, local_root, local_root / "duplicate_names.py")
-    nodes, _, _ = extract_file_graph(repo_id, dup_rec, local_root)
-    inner_nodes = [n for n in nodes if n["name"] == "inner"]
+    dup_ext = _extract_single_file(FIXTURES_DIR / "nested_scope_case", "duplicate_names.py")
+    inner_nodes = [n for n in dup_ext.nodes if n.name == "inner"]
     assert len(inner_nodes) == 2
-    assert inner_nodes[0]["id"].endswith("duplicate_names.outer_with_duplicates.inner")
-    assert inner_nodes[1]["id"].endswith(":dup1")
+    assert inner_nodes[0].id.endswith("duplicate_names.outer_with_duplicates.inner")
+    assert inner_nodes[1].id.endswith(":dup1")
 
     repo = tmp_path / "gen_repo"
     repo.mkdir()
@@ -363,28 +341,26 @@ def test_duplicate_names_and_generator_scope_boundary(tmp_path: Path) -> None:
         "    return inner_gen\n",
         encoding="utf-8",
     )
-    gen_repo_id = derive_repo_id(repo)
-    gen_rec = build_file_record(gen_repo_id, repo, repo / "gen.py")
-    gen_nodes, _, _ = extract_file_graph(gen_repo_id, gen_rec, repo)
-    outer = next(n for n in gen_nodes if n["name"] == "outer")
-    inner_gen = next(n for n in gen_nodes if n["name"] == "inner_gen")
-    assert json.loads(outer["payload_json"])["is_generator"] is False
-    assert json.loads(inner_gen["payload_json"])["is_generator"] is True
+    gen_ext = _extract_single_file(repo, "gen.py")
+    outer = next(n for n in gen_ext.nodes if n.name == "outer")
+    inner_gen = next(n for n in gen_ext.nodes if n.name == "inner_gen")
+    assert outer.payload["is_generator"] is False
+    assert inner_gen.payload["is_generator"] is True
 
 
 def test_ast_loader_and_range_utilities(tmp_path: Path) -> None:
-    """parse_file wraps syntax errors in ParseError and make_declaration_lines tracks decorators."""
+    """parse_python_ast wraps syntax errors in ParseError and ranges return typed spans."""
     bad = tmp_path / "bad.py"
     bad.write_text("def broken(:\n    pass\n", encoding="utf-8")
-    text = load_file_text(bad)
+    text = load_python_source(bad)
 
     with pytest.raises(ParseError):
-        parse_file(text, filename=bad)
+        parse_python_ast(text, filename=bad)
 
     tree = ast.parse("@dec\ndef g():\n    pass\n")
     fn = tree.body[0]
-    assert make_declaration_lines(fn) == (1, 3)
+    assert make_declaration_lines(fn) == LineSpan(start_line=1, end_line=3)
     rng = make_range(fn)
     sel = make_name_selection_range(fn, "def g():")
     assert rng is not None and sel is not None
-    assert sel["start"]["line"] == 1
+    assert sel.start.line == 1

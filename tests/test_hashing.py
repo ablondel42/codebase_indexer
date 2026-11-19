@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from repo_context.exceptions import ParseError
-from repo_context.parsing.hashing import compute_symbol_content_hash, sha256_file, sha256_text
+from core.models.exceptions import ParseError
+from core.utils.hashing import compute_symbol_content_hash, sha256_file, sha256_text
 
 
 def test_sha256_text_properties() -> None:

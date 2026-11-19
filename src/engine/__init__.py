@@ -1,0 +1,51 @@
+"""Headless and UI-ready application layer exposing ``IndexerEngine`` and typed DTOs."""
+
+from engine.models import (
+    ContextQuery,
+    DirectoryFileCount,
+    FileListPage,
+    IndexRunListReport,
+    ListFilesQuery,
+    ListSymbolsQuery,
+    OutlineQuery,
+    RepoOverview,
+    RepoSummaryListReport,
+    SearchSymbolsQuery,
+    SourceQuery,
+    SubgraphQuery,
+    SymbolListPage,
+    SymbolMembersQuery,
+    SymbolReferencesQuery,
+    SymbolSearchPage,
+    SymbolSnippetsQuery,
+)
+from engine.services import (
+    CommandEngine,
+    IndexerEngine,
+    QueryEngine,
+    SymbolTargetResolver,
+)
+
+__all__ = [
+    "CommandEngine",
+    "ContextQuery",
+    "DirectoryFileCount",
+    "FileListPage",
+    "IndexRunListReport",
+    "IndexerEngine",
+    "ListFilesQuery",
+    "ListSymbolsQuery",
+    "OutlineQuery",
+    "QueryEngine",
+    "RepoOverview",
+    "RepoSummaryListReport",
+    "SearchSymbolsQuery",
+    "SourceQuery",
+    "SubgraphQuery",
+    "SymbolListPage",
+    "SymbolMembersQuery",
+    "SymbolReferencesQuery",
+    "SymbolSearchPage",
+    "SymbolSnippetsQuery",
+    "SymbolTargetResolver",
+]

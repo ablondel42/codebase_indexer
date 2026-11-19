@@ -1,54 +1,103 @@
 # Repo Context MCP (`repo-context-mcp` v0.2.0)
 
-Local repository intelligence for safer, token-lean AI-assisted code planning. Indexes Python codebases into a local SQLite graph (WAL + FTS5) and exposes structural outlines, bounded source reading, AST/LSP references, and deterministic change-risk analysis over an 8-tool MCP server and the grouped `rc` CLI.
+Local repository intelligence for safer, token-lean AI-assisted code planning and UI code exploration. Indexes Python codebases into a local SQLite graph (WAL + FTS5) and exposes structural outlines, UI-ready raw/numbered symbol snippets, neighborhood subgraphs, AST/LSP references, and deterministic change-risk analysis over a headless Python `IndexerEngine`, an 8-tool MCP server, and the grouped `rc` CLI.
 
 ---
 
-## Architecture Overview
+## Hexagonal Service Architecture (`src/`)
+
+All 10 domain packages live directly under `src/` using a strict **Hexagonal (Ports & Adapters) + `<domain>/{services,models,utils}`** layout (`src/core/{ports,models,utils}`):
 
 ```text
-Local Repo
-  -> Scanner (path confinement, symlink rejection, SHA-256, line counts)
-  -> AST Extraction + Calls / Constants / Attributes / Type Aliases + Intra-Repo Linker
-  -> SQLite v2 (WAL mode, foreign keys, FTS5 symbol search, index_runs)
-  -> Context / Outline / Source / Pyright LSP / Risk Services
-  -> 8 Token-Lean MCP Tools & `rc` CLI
+Driving Adapters (Thin Consumers)
+  ├── src/cli/{services,models,utils} + main.py     Grouped `rc` CLI & interactive `rc>` REPL
+  └── src/mcp_server/{services,models,utils}        8 token-lean MCP tools over stdio
+
+Application Layer (Headless & UI-Ready)
+  └── src/engine/{services,models,utils}            IndexerEngine = QueryEngine + CommandEngine
+
+Domain Read & Write Layers (CQRS)
+  ├── src/context/{services,models,utils}           Outlines, SourceReader, SymbolContextBuilder
+  ├── src/graph/{services,models,utils}             GraphNavigator, SubgraphSlice, RiskAnalyzer
+  ├── src/indexing/{services,models,utils}          BatchIndexer, IncrementalIndexer, RepoWatcher
+  └── src/parsing/{services,models,utils}           RepoScanner, AstExtractionPipeline, SymbolLinker
+
+Driven Infrastructure Adapters
+  ├── src/storage/{services,models,utils}           100% of SQLAlchemy Core + SQLite v2 (WAL/FTS5)
+  └── src/lsp/{services,models,utils}               Pyright JSON-RPC transport, pool & enricher
+
+Innermost Core (Zero Sibling Dependencies)
+  └── src/core/{ports,models,utils}                 FrozenModel entities, IndexerError, UoW/Repo Protocols
 ```
 
-### Core Layers
+### Core Capabilities by Package
 
-1. **Scanner & Security (`repo_context.parsing`)**
-   - Walks the repository with `followlinks=False`, rejecting symlinks and path escapes via `ensure_safe_repo_file`.
-   - Respects `ignored_dirs` (including globs such as `*.egg-info`), `test_dir_names` (`--include-tests`), and `max_file_size_bytes` (2 MiB default).
-   - Computes SHA-256 hashes, byte sizes, line counts, module paths, and test flags.
+1. **Foundation & Ports (`src/core/`)**
+   - Immutable Pydantic v2 entities (`FrozenModel` / `MutableModel` with `extra="forbid"`), structured `Range` and `payload` fields on `SymbolNode` and `Edge`, `IndexerError` exception hierarchy, `"indexer"` stderr-only logging, and Hexagonal `UnitOfWorkProtocol` / repository / LSP ports.
 
-2. **AST Extraction & Intra-Repo Linker (`repo_context.parsing`)**
-   - Extracts `module`, `class`, `function`, `async_function`, `method`, `async_method`, `local_function`, `local_async_function`, `constant`, `attribute`, and `type_alias` nodes with compact signatures, 1-based line spans (`start_line`, `end_line`), and UTF-8-accurate ranges.
-   - Emits `contains`, `scope_parent`, `imports`, `inherits`, and `calls` edges.
-   - Resolves intra-repo links (`resolve_repo_edges`) across imports (including aliases, `src.` layouts, and `__init__.py` re-exports), class inheritance hierarchies, and `self`/`cls`/`super()`/module/local calls.
+2. **Persistence Adapter (`src/storage/`)**
+   - Isolates **100%** of SQLAlchemy 2.x Core and `sqlite3` operations (`SqlUnitOfWorkFactory`, `SqlUnitOfWork`, `ConnectionFactory`, `SchemaMigrator`) over SQLite schema `user_version = 2` (`repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and FTS5 `nodes_fts`).
+   - Enforces WAL mode, `foreign_keys = ON`, `busy_timeout = 5000`, read-only `query_only = ON` sessions, and SQLite's `SELECT`-only authorizer for `rc db sql`.
 
-3. **SQLite Storage v2 (`repo_context.storage`)**
-   - SQLAlchemy 2.x Core persistence (`MetaData` and `Table` definitions in `storage/schema.py`, `NullPool` connections) over SQLite schema `user_version = 2` with `repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and `nodes_fts` (FTS5 with `unicode61` tokenizer and automatic insert/update/delete triggers).
-   - Writable connections enable WAL mode, `foreign_keys = ON`, and `busy_timeout = 5000`.
-   - Read-only inspection and query commands use `read_only=True` (`mode=ro`, `query_only=ON`); `rc db sql` additionally enforces a SQLite authorizer allowing only `SELECT`, `READ`, `FUNCTION`, and `PRAGMA` actions.
+3. **Static Analysis & Intra-Repo Linker (`src/parsing/`)**
+   - `RepoScanner` walks repositories safely (`followlinks=False`, symlink/escape rejection, `ignored_dirs` globs, `--include-tests`, 2 MiB file cap).
+   - `AstExtractionPipeline` and `DeclarationWalker` extract modules, classes, functions/methods (sync & async, nested/local), constants, class attributes, and `TypeAlias`es, plus `contains`, `scope_parent`, `imports`, `inherits`, and `calls` edges.
+   - `SymbolLinker` resolves imports (`__init__.py` re-exports, `src.` layouts), base-class hierarchies, and calls in memory, resetting broken targets back to unresolved placeholders when files are deleted or refactored.
 
-4. **Context, Outlines, Source Reader & Watch Mode (`repo_context.context`, `repo_context.indexing`)**
-   - `build_file_outline` produces hierarchical symbol trees with deduplicated imports and live disk freshness checks.
-   - `read_symbol_source` returns bounded, line-numbered slices with pagination (`max_lines`, `offset`) and SHA-256 freshness verification.
-   - `build_symbol_context` assembles bounded structural/lexical hierarchy, balanced semantic relationships, and freshness/confidence summaries.
-   - `watch_repo` uses `watchdog` with debouncing to incrementally reindex changed files, clean up deleted files, re-link edges, and invalidate stale reference caches.
+4. **Graph, Risk, Outlines & Snippets (`src/graph/`, `src/context/`)**
+   - `GraphNavigator` and `RiskAnalyzer` compute bounded neighborhood `SubgraphSlice`s, paginated `SymbolReferencesReport`s with 1-line source previews, and deterministic `0-100` `RiskAssessment`s (`safe_enough`, `review_required`, `high_risk`).
+   - `OutlineBuilder`, `SourceReader`, and `SymbolContextBuilder` produce hierarchical `FileOutline`s, single-pass batched `SymbolSnippet`s (carrying both clean `raw_source` for syntax highlighters and `numbered_source` for CLI/MCP), and bounded `SymbolContext`s.
 
-5. **LSP Reference Enrichment & Risk Engine (`repo_context.lsp`, `repo_context.graph`)**
-   - `PyrightLspClient` and `LspSessionPool` run `pyright-langserver --stdio` with bounded JSON-RPC framing, UTF-16 <-> codepoint offset mapping, and clean subprocess cleanup.
-   - `analyze_symbol_risk` / `analyze_target_set_risk` evaluate reference fanout (using LSP `references` when refreshed, with transparent AST `calls`/`imports`/`inherits` fallback), cross-file/cross-module impact, public-surface exposure, inheritance involvement, disk staleness, and low-confidence edges to compute a `0-100` risk score and decision (`safe_enough`, `review_required`, `high_risk`).
+5. **Batch, Incremental & Watch Orchestration (`src/indexing/`, `src/lsp/`)**
+   - `BatchIndexer` executes hash-diffed repository indexing runs with optional `ReferenceEnricher` + `LspSessionPool` (`pyright-langserver --stdio`) enrichment.
+   - `IncrementalIndexer` and `RepoWatcher` isolate per-file updates in SQLite savepoints, link once per debounced batch, preserve surviving callers' AST edges across file deletions for automatic re-linking, and emit typed lifecycle events via callbacks.
 
-6. **Token-Lean MCP Server & `rc` CLI (`repo_context.mcp`, `repo_context.cli`)**
-   - Exposes 8 compact MCP tools over `stdio` without polluting `stdout` (all logs are directed strictly to `stderr`).
-   - Provides the grouped `rc` CLI outputting indented JSON objects by default (`--db-path` supported on root or subcommands).
+6. **Headless `IndexerEngine`, MCP Server & `rc` CLI (`src/engine/`, `src/mcp_server/`, `src/cli/`)**
+   - `IndexerEngine` exposes `engine.queries` and `engine.commands`, with `engine.for_db(db_path)` sharing warm Pyright LSP sessions across databases with zero global mutable state.
+   - `McpServerRunner` / `McpToolRegistry` expose 8 compact MCP tools over `stdio`, and `CliApplication` (`python -m cli.main` / `./rc`) emits indented JSON to `stdout`.
 
 ---
 
-## Quickstart
+## Headless Python Usage (`IndexerEngine`)
+
+```python
+from core import AppConfig
+from engine import (
+    IndexerEngine,
+    OutlineQuery,
+    SubgraphQuery,
+    SymbolMembersQuery,
+    SymbolSnippetsQuery,
+)
+from indexing import BatchIndexOptions
+
+config = AppConfig(db_path="repo_context.db", include_tests=True)
+
+with IndexerEngine(config) as engine:
+    # 1. Index a repository
+    run = engine.commands.index_repository(".", BatchIndexOptions(include_tests=True))
+
+    # 2. Resolve symbols, class/module members, and file outlines
+    sym = engine.queries.get_symbol("IndexerEngine")
+    members = engine.queries.get_symbol_members(
+        SymbolMembersQuery(symbol=sym.id, include_private=False)
+    )
+    outline = engine.queries.get_file_outline(
+        OutlineQuery(file_path="src/engine/services/facade.py")
+    )
+
+    # 3. Fetch UI-ready snippets (clean raw_source + CLI numbered_source) & BFS subgraphs
+    snippets = engine.queries.get_symbol_snippets(
+        SymbolSnippetsQuery(symbols=[sym.id], padding_lines=2)
+    )
+    subgraph = engine.queries.get_symbol_subgraph(
+        SubgraphQuery(symbols=[sym.id], depth=1, max_nodes=40)
+    )
+```
+
+---
+
+## Quickstart (`./rc`)
 
 Use the root `./rc` bootstrap script (automatically sets up `venv/` on first run, falling back cleanly to Python 3.11+ with `PYTHONPATH=src` when offline):
 
@@ -63,6 +112,9 @@ Use the root `./rc` bootstrap script (automatically sets up `venv/` on first run
 # Demo: index this repository (including tests) and start the interactive `rc>` shell
 ./rc demo --cli
 
+# Dev rebuild: recreate repo_context.db from scratch with tests + Pyright LSP enrichment
+./rc dev
+
 # Run the full test suite (ruff check + pytest)
 ./rc tests
 ```
@@ -73,48 +125,48 @@ Or install manually in editable mode (requires Python 3.11+):
 pip install -e ".[dev]"
 ```
 
-Run standalone CLI commands directly (`./rc <subcommand>` or `rc <subcommand>`), or follow the copy-paste verification checklist in [MANUAL_TESTING.md](file:///Users/arnaud/dev/codebase_indexer/MANUAL_TESTING.md):
+Run standalone CLI commands directly (`./rc <subcommand>`, `rc <subcommand>`, or `PYTHONPATH=src python -m cli.main <subcommand>`), or follow the copy-paste verification checklist in [MANUAL_TESTING.md](file:///Users/arnaud/dev/codebase_indexer/MANUAL_TESTING.md):
 
 ```bash
-rc index .
-rc shell
+./rc index .
+./rc shell
 ```
 
 Inspect database health, schema version, table counts, and latest run:
 
 ```bash
-rc db status
+./rc db status
 ```
 
 Inspect a file outline (with symbol IDs, line ranges, kinds, and signatures):
 
 ```bash
-rc outline src/repo_context/cli/main.py
+./rc outline src/engine/services/facade.py
 ```
 
 Search symbols via FTS5:
 
 ```bash
-rc symbols search build_symbol_context
+./rc symbols search IndexerEngine
 ```
 
-Read bounded, line-numbered source for a symbol (by `sym:...` ID, qualified name, or unique name):
+Read bounded, line-numbered source for a symbol (by `sym:...` ID, qualified name, `file.py:symbol`, or unique name):
 
 ```bash
-rc source build_symbol_context --max-lines 80
+./rc source IndexerEngine --max-lines 80
 ```
 
 Run a guarded read-only SQL query against the index:
 
 ```bash
-rc db sql "SELECT kind, COUNT(*) AS count FROM nodes GROUP BY kind ORDER BY count DESC"
+./rc db sql "SELECT kind, COUNT(*) AS count FROM nodes GROUP BY kind ORDER BY count DESC"
 ```
 
 Invoke any of the 8 MCP tools locally and inspect payload byte/token metrics:
 
 ```bash
-rc mcp-call get_repo_overview
-rc mcp-call search_symbols '{"query": "resolve_repo_edges", "limit": 5}'
+./rc mcp-call get_repo_overview
+./rc mcp-call search_symbols '{"query": "SymbolLinker", "limit": 5}'
 ```
 
 ---
@@ -141,7 +193,7 @@ All CLI commands emit indented JSON objects to `stdout` (and structured JSON err
 | `rc risk <id_or_names...> [--repo]` | Compute risk score, decision, targets, facts, and issue codes |
 | `rc shell [--repo]` | Start interactive `rc>` REPL bound to the database and active repository |
 | `rc watch [repo_path] [--debounce-ms 500] [--include-tests] [--verbose]` | Watch repository for changes and incrementally update SQLite |
-| `rc serve [--debug]` | Start the FastMCP server on `stdio` |
+| `rc serve [--debug]` | Start the MCP server on `stdio` |
 | `rc mcp-call <tool_name> [json_args]` | Execute one of the 8 MCP tools locally and print payload size + `~bytes/4` token estimate |
 
 ---

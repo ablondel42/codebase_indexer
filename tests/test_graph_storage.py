@@ -1,214 +1,240 @@
-"""Graph storage tests for v0.2.0 SQLite persistence, batch pruning, and transactions."""
+"""Graph storage tests for SQLite UnitOfWork repositories, FTS5, batch pruning, and savepoints."""
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy.engine import Connection
 
-from repo_context.constants import EDGE_KIND_CALLS, EDGE_KIND_SCOPE_PARENT
-from repo_context.exceptions import DatabaseError, ValidationError
-from repo_context.graph import get_repo_graph_stats
-from repo_context.models.file import FileRecord
-from repo_context.models.repo import RepoRecord
-from repo_context.storage import (
-    close_connection,
-    delete_edges_for_file,
-    delete_nodes_for_file,
-    get_connection,
-    get_edge_by_id,
-    get_file_by_path,
-    get_node_by_id,
-    get_node_by_qualified_name,
-    initialize_database,
-    list_child_nodes,
-    list_edges_for_file,
-    list_edges_for_repo,
-    list_edges_for_target_and_kinds,
-    list_files_for_repo,
-    list_incoming_edges,
-    list_index_runs,
-    list_lexical_children,
-    list_nodes_for_file,
-    list_nodes_for_repo,
-    list_outgoing_edges,
-    list_repos,
-    prune_stale_files,
-    record_index_run_finish,
-    record_index_run_start,
-    replace_file_graph,
-    resolve_repo_id,
-    upsert_edge,
-    upsert_edges,
-    upsert_files,
-    upsert_node,
-    upsert_nodes,
-    upsert_repo,
+from core.models import (
+    DatabaseError,
+    DirectedEdgeQuery,
+    Edge,
+    EdgeKind,
+    EdgeTargetUpdate,
+    FilePageQuery,
+    FileRecord,
+    IndexRunMetrics,
+    Position,
+    Range,
+    ReferenceRefreshState,
+    RefreshStatus,
+    RepoRecord,
+    SymbolKind,
+    SymbolNode,
+    SymbolPageQuery,
+    SymbolScope,
+    SymbolSearchQuery,
 )
+from storage import SqlUnitOfWorkFactory
 
 
 @pytest.fixture
-def initialized_db(tmp_path: Path) -> Iterator[Connection]:
-    """Yield an initialized v2 SQLite DB with a default repo and file row."""
-    conn = get_connection(tmp_path / "storage.db")
-    try:
-        initialize_database(conn)
-        repo = RepoRecord(
-            id="repo:test:12345678",
-            root_path=str(tmp_path),
-            name="test",
-            created_at="2026-01-01T00:00:00Z",
-            last_indexed_at="2026-01-01T00:00:00Z",
-        )
-        file_rec = FileRecord(
-            id="file:repo:test:12345678:test.py",
-            repo_id=repo.id,
-            file_path="test.py",
-            uri="file:///tmp/test.py",
-            module_path="test",
-            content_hash="sha256:file",
-            size_bytes=100,
-            line_count=10,
-            is_test=False,
-            last_modified_at="2026-01-01T00:00:00Z",
-            last_indexed_at="2026-01-01T00:00:00Z",
-        )
-        upsert_repo(conn, repo)
-        upsert_files(conn, [file_rec])
-        conn.commit()
-        yield conn
-    finally:
-        close_connection(conn)
+def uow_factory(tmp_path: Path) -> SqlUnitOfWorkFactory:
+    """Create and seed an initialized v2 SQLite DB with a default repo and file row."""
+    factory = SqlUnitOfWorkFactory(tmp_path / "storage.db")
+    repo = RepoRecord(
+        id="repo:test:12345678",
+        root_path=str(tmp_path),
+        name="test",
+        created_at="2026-01-01T00:00:00Z",
+        last_indexed_at="2026-01-01T00:00:00Z",
+    )
+    file_rec = FileRecord(
+        id="file:repo:test:12345678:test.py",
+        repo_id=repo.id,
+        file_path="test.py",
+        uri="file:///tmp/test.py",
+        module_path="test",
+        content_hash="sha256:file",
+        size_bytes=100,
+        line_count=10,
+        is_test=False,
+        last_modified_at="2026-01-01T00:00:00Z",
+        last_indexed_at="2026-01-01T00:00:00Z",
+    )
+    with factory.open(initialize=True) as uow:
+        uow.repos.upsert(repo)
+        uow.files.upsert_many([file_rec])
+    return factory
 
 
 def _node(
     node_id: str,
-    kind: str,
+    kind: SymbolKind,
     qualified_name: str,
     *,
     file_id: str = "file:repo:test:12345678:test.py",
     parent_id: str | None = None,
     lexical_parent_id: str | None = None,
-    scope: str = "module",
+    scope: SymbolScope = SymbolScope.MODULE,
     start_line: int | None = 1,
     end_line: int | None = 5,
     signature: str | None = None,
-) -> dict:
-    return {
-        "id": node_id,
-        "repo_id": "repo:test:12345678",
-        "file_id": file_id,
-        "language": "python",
-        "kind": kind,
-        "name": qualified_name.split(".")[-1],
-        "qualified_name": qualified_name,
-        "uri": "file:///tmp/test.py",
-        "range_json": {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 0}},
-        "selection_range_json": {
-            "start": {"line": 0, "character": 0},
-            "end": {"line": 0, "character": 4},
-        },
-        "start_line": start_line,
-        "end_line": end_line,
-        "signature": signature,
-        "parent_id": parent_id,
-        "visibility_hint": "public",
-        "doc_summary": "Doc summary",
-        "content_hash": "sha256:abc123",
-        "semantic_hash": "sha256:def456",
-        "source": "python-ast",
-        "confidence": 1.0,
-        "payload_json": {"test": "data"},
-        "scope": scope,
-        "lexical_parent_id": lexical_parent_id,
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
+    visibility_hint: str = "public",
+    doc_summary: str = "Doc summary",
+) -> SymbolNode:
+    """Construct a valid test SymbolNode with structured Range and payload."""
+    return SymbolNode(
+        id=node_id,
+        repo_id="repo:test:12345678",
+        file_id=file_id,
+        kind=kind,
+        name=qualified_name.split(".")[-1],
+        qualified_name=qualified_name,
+        uri="file:///tmp/test.py",
+        decl_range=Range(start=Position(line=0, character=0), end=Position(line=4, character=0)),
+        selection_range=Range(
+            start=Position(line=0, character=0),
+            end=Position(line=0, character=4),
+        ),
+        start_line=start_line,
+        end_line=end_line,
+        signature=signature,
+        parent_id=parent_id,
+        visibility_hint=visibility_hint,
+        doc_summary=doc_summary,
+        content_hash="sha256:abc123",
+        semantic_hash="sha256:def456",
+        source="python-ast",
+        confidence=1.0,
+        payload={"test": "data"},
+        scope=scope,
+        lexical_parent_id=lexical_parent_id,
+        last_indexed_at="2026-01-01T00:00:00Z",
+    )
 
 
 def _edge(
     edge_id: str,
-    kind: str,
+    kind: EdgeKind,
     from_id: str,
     to_id: str,
     *,
     file_id: str = "file:repo:test:12345678:test.py",
-) -> dict:
-    return {
-        "id": edge_id,
-        "repo_id": "repo:test:12345678",
-        "kind": kind,
-        "from_id": from_id,
-        "to_id": to_id,
-        "source": "python-ast",
-        "confidence": 1.0,
-        "evidence_file_id": file_id,
-        "evidence_uri": "file:///tmp/test.py",
-        "evidence_range_json": {
-            "start": {"line": 0, "character": 0},
-            "end": {"line": 1, "character": 0},
-        },
-        "payload_json": {"test": "edge_data"},
-        "last_indexed_at": "2026-01-01T00:00:00Z",
-    }
+    confidence: float = 1.0,
+) -> Edge:
+    """Construct a valid test Edge with structured evidence_range and payload."""
+    return Edge(
+        id=edge_id,
+        repo_id="repo:test:12345678",
+        kind=kind,
+        from_id=from_id,
+        to_id=to_id,
+        source="python-ast",
+        confidence=confidence,
+        evidence_file_id=file_id,
+        evidence_uri="file:///tmp/test.py",
+        evidence_range=Range(
+            start=Position(line=0, character=0),
+            end=Position(line=1, character=0),
+        ),
+        payload={"test": "edge_data"},
+        last_indexed_at="2026-01-01T00:00:00Z",
+    )
 
 
-def test_node_upsert_read_and_delete(initialized_db: Connection) -> None:
-    """Node CRUD, structural/lexical children, and file node deletion work with v2 fields."""
-    conn = initialized_db
-    mod = _node("sym:mod", "module", "test", start_line=1, end_line=20)
+def test_node_upsert_read_summaries_fts_and_delete(uow_factory: SqlUnitOfWorkFactory) -> None:
+    """Node CRUD, summaries, FTS5 + LIKE fallback search, and file deletion work end-to-end."""
+    mod = _node("sym:mod", SymbolKind.MODULE, "test", start_line=1, end_line=20)
     cls = _node(
         "sym:cls",
-        "class",
-        "test.Svc",
+        SymbolKind.CLASS,
+        "test.OrderService",
         parent_id="sym:mod",
         start_line=2,
         end_line=10,
-        signature="class Svc",
+        signature="class OrderService",
+        doc_summary="Processes customer checkout orders.",
     )
     fn = _node(
         "sym:fn",
-        "function",
-        "test.outer",
+        SymbolKind.FUNCTION,
+        "test._internal_helper",
         parent_id="sym:mod",
         start_line=12,
         end_line=20,
-        signature="def outer()",
+        signature="def _internal_helper()",
+        visibility_hint="private_like",
     )
     local = _node(
         "sym:local",
-        "local_function",
-        "test.outer.inner",
+        SymbolKind.LOCAL_FUNCTION,
+        "test._internal_helper.inner",
         parent_id="sym:fn",
         lexical_parent_id="sym:fn",
-        scope="function",
+        scope=SymbolScope.FUNCTION,
         start_line=14,
         end_line=16,
     )
-    upsert_node(conn, mod)
-    upsert_nodes(conn, [cls, fn, local])
 
-    fetched = get_node_by_id(conn, "sym:cls")
-    assert fetched is not None
-    assert fetched["signature"] == "class Svc"
-    assert fetched["start_line"] == 2
-    assert fetched["end_line"] == 10
-    assert get_node_by_qualified_name(conn, "repo:test:12345678", "test.Svc") is not None
+    with uow_factory.open() as uow:
+        uow.nodes.upsert(mod)
+        uow.nodes.upsert_many([cls, fn, local])
 
-    assert [n["id"] for n in list_child_nodes(conn, "sym:mod")] == ["sym:cls", "sym:fn"]
-    assert [n["id"] for n in list_lexical_children(conn, "sym:fn")] == ["sym:local"]
-    assert len(list_nodes_for_file(conn, "file:repo:test:12345678:test.py")) == 4
-    assert len(list_nodes_for_repo(conn, "repo:test:12345678")) == 4
+        fetched = uow.nodes.get_by_id("sym:cls")
+        assert fetched is not None
+        assert fetched.signature == "class OrderService"
+        assert fetched.start_line == 2
+        assert fetched.end_line == 10
+        assert fetched.payload == {"test": "data"}
+        assert (
+            uow.nodes.get_by_qualified_name("repo:test:12345678", "test.OrderService") is not None
+        )
 
-    delete_nodes_for_file(conn, "file:repo:test:12345678:test.py")
-    assert list_nodes_for_file(conn, "file:repo:test:12345678:test.py") == []
+        summaries = uow.nodes.get_summaries_by_ids(["sym:cls", "sym:fn"])
+        assert summaries["sym:cls"].file_path == "test.py"
+        assert summaries["sym:cls"].module_path == "test"
+
+        assert [n.id for n in uow.nodes.list_children("sym:mod")] == ["sym:cls", "sym:fn"]
+        assert [n.id for n in uow.nodes.list_lexical_children("sym:fn")] == ["sym:local"]
+        public_members = uow.nodes.list_member_summaries("sym:mod", include_private=False)
+        assert [m.id for m in public_members] == ["sym:cls"]
+        assert len(uow.nodes.list_for_file("file:repo:test:12345678:test.py")) == 4
+        assert len(uow.nodes.list_for_repo("repo:test:12345678")) == 4
+
+        page = uow.nodes.list_paginated_summaries(
+            SymbolPageQuery(repo_id="repo:test:12345678", limit=2, offset=0)
+        )
+        assert page.total_count == 4
+        assert len(page.items) == 2
+
+        # FTS5 exact/prefix + doc_summary token search + LIKE substring fallback
+        fts_hits = uow.nodes.search_fts(
+            SymbolSearchQuery(repo_id="repo:test:12345678", query="checkout")
+        )
+        assert [h.id for h in fts_hits] == ["sym:cls"]
+
+        like_hits = uow.nodes.search_fts(
+            SymbolSearchQuery(repo_id="repo:test:12345678", query="rderServ")
+        )
+        assert [h.id for h in like_hits] == ["sym:cls"]
+
+        # Update triggers nodes_fts_au
+        updated_cls = cls.model_copy(update={"doc_summary": "Handles billing invoices."})
+        uow.nodes.upsert(updated_cls)
+        assert (
+            uow.nodes.search_fts(SymbolSearchQuery(repo_id="repo:test:12345678", query="checkout"))
+            == []
+        )
+        assert [
+            h.id
+            for h in uow.nodes.search_fts(
+                SymbolSearchQuery(repo_id="repo:test:12345678", query="invoices")
+            )
+        ] == ["sym:cls"]
+
+        uow.files.delete_file_graph("file:repo:test:12345678:test.py")
+        assert uow.nodes.list_for_file("file:repo:test:12345678:test.py") == []
+        assert (
+            uow.nodes.search_fts(SymbolSearchQuery(repo_id="repo:test:12345678", query="invoices"))
+            == []
+        )
 
 
-def test_edge_upsert_single_json_encoding_and_full_file_delete(
-    initialized_db: Connection,
+def test_edge_upsert_single_json_encoding_updates_and_file_delete(
+    uow_factory: SqlUnitOfWorkFactory,
 ) -> None:
-    """Edges store single-encoded JSON and delete_edges_for_file clears from/to/evidence matches."""
-    conn = initialized_db
+    """Edges store single-encoded JSON, support target updates, and clean up on delete."""
     other_file = FileRecord(
         id="file:repo:test:12345678:other.py",
         repo_id="repo:test:12345678",
@@ -220,55 +246,69 @@ def test_edge_upsert_single_json_encoding_and_full_file_delete(
         line_count=2,
         last_modified_at="2026-01-01T00:00:00Z",
     )
-    upsert_files(conn, [other_file])
-    upsert_nodes(
-        conn,
-        [
-            _node("sym:a", "function", "test.a", file_id="file:repo:test:12345678:test.py"),
-            _node("sym:b", "function", "other.b", file_id=other_file.id),
-        ],
-    )
-
-    e1 = _edge(
-        "edge:1", EDGE_KIND_CALLS, "sym:a", "sym:b", file_id="file:repo:test:12345678:test.py"
-    )
-    e2 = _edge("edge:2", EDGE_KIND_SCOPE_PARENT, "sym:b", "sym:a", file_id=other_file.id)
-    upsert_edge(conn, e1)
-    upsert_edges(conn, [e2])
-
-    raw_row = (
-        conn.exec_driver_sql(
-            "SELECT payload_json, evidence_range_json FROM edges WHERE id = 'edge:1'"
+    with uow_factory.open() as uow:
+        uow.files.upsert_many([other_file])
+        uow.nodes.upsert_many(
+            [
+                _node("sym:a", SymbolKind.FUNCTION, "test.a"),
+                _node("sym:b", SymbolKind.FUNCTION, "other.b", file_id=other_file.id),
+            ]
         )
-        .mappings()
-        .one()
+
+        e1 = _edge("edge:1", EdgeKind.CALLS, "sym:a", "unresolved:other.b")
+        e2 = _edge("edge:2", EdgeKind.SCOPE_PARENT, "sym:b", "sym:a", file_id=other_file.id)
+        uow.edges.upsert(e1)
+        uow.edges.upsert_many([e2])
+
+        updated = uow.edges.update_resolved_targets(
+            [EdgeTargetUpdate(edge_id="edge:1", to_id="sym:b", confidence=0.95)]
+        )
+        assert updated == 1
+        resolved_e1 = uow.edges.get_by_id("edge:1")
+        assert resolved_e1 is not None
+        assert resolved_e1.to_id == "sym:b"
+        assert resolved_e1.confidence == 0.95
+
+        assert len(uow.edges.list_for_repo("repo:test:12345678")) == 2
+        assert len(uow.edges.list_outgoing("sym:a", EdgeKind.CALLS)) == 1
+        assert len(uow.edges.list_incoming("sym:b", EdgeKind.CALLS)) == 1
+        assert len(uow.edges.list_for_target_and_kinds("sym:a", [EdgeKind.SCOPE_PARENT])) == 1
+        assert len(uow.edges.list_for_file("file:repo:test:12345678:test.py")) == 1
+        assert (
+            uow.edges.count_directed(
+                DirectedEdgeQuery(symbol_id="sym:a", direction="outgoing", kinds=(EdgeKind.CALLS,))
+            )
+            == 1
+        )
+        assert len(uow.edges.list_neighborhood_edges(["sym:a"])) == 2
+
+    raw_res = uow_factory.execute_readonly_sql(
+        "SELECT payload_json, evidence_range_json FROM edges WHERE id = 'edge:1'"
     )
+    raw_row = raw_res.rows[0]
     assert isinstance(json.loads(raw_row["payload_json"]), dict)
     assert isinstance(json.loads(raw_row["evidence_range_json"]), dict)
 
-    assert get_edge_by_id(conn, "edge:1") is not None
-    assert len(list_edges_for_repo(conn, "repo:test:12345678")) == 2
-    assert len(list_outgoing_edges(conn, "sym:a", EDGE_KIND_CALLS)) == 1
-    assert len(list_incoming_edges(conn, "sym:b", EDGE_KIND_CALLS)) == 1
-    assert len(list_edges_for_target_and_kinds(conn, "sym:a", [EDGE_KIND_SCOPE_PARENT])) == 1
-    assert len(list_edges_for_file(conn, "file:repo:test:12345678:test.py")) == 1
-
-    # Deleting edges for test.py removes e1 (evidence/from_id) AND e2 (to_id == sym:a in test.py)
-    delete_edges_for_file(conn, "file:repo:test:12345678:test.py")
-    assert list_edges_for_repo(conn, "repo:test:12345678") == []
+    with uow_factory.open() as uow:
+        # Deleting all edges for test.py removes e1 (evidence/from_id) AND e2 (to_id == sym:a)
+        uow.edges.delete_all_for_file("file:repo:test:12345678:test.py")
+        assert uow.edges.list_for_repo("repo:test:12345678") == []
 
 
 def test_replace_file_graph_is_savepoint_safe_without_commit(
-    initialized_db: Connection,
+    uow_factory: SqlUnitOfWorkFactory,
 ) -> None:
-    """replace_file_graph does not auto-commit and preserves outer transaction state on failure."""
-    conn = initialized_db
+    """replace_file_graph isolates failures in a SAVEPOINT and preserves outer transaction work."""
     file_id = "file:repo:test:12345678:test.py"
-    initial = [_node("sym:initial", "module", "test", file_id=file_id)]
-    replace_file_graph(conn, file_id, initial, [])
-    conn.commit()
+    with uow_factory.open() as uow:
+        file_rec = uow.files.get_by_id(file_id)
+        assert file_rec is not None
+        uow.replace_file_graph(
+            file_rec,
+            [_node("sym:initial", SymbolKind.MODULE, "test", file_id=file_id)],
+            [],
+        )
 
-    # Start outer transaction with a second file insert + savepoint-guarded replace failure
     other_file = FileRecord(
         id="file:repo:test:12345678:keep.py",
         repo_id="repo:test:12345678",
@@ -280,20 +320,26 @@ def test_replace_file_graph_is_savepoint_safe_without_commit(
         line_count=1,
         last_modified_at="2026-01-01T00:00:00Z",
     )
-    upsert_files(conn, [other_file])
+    with uow_factory.open() as uow:
+        uow.files.upsert_many([other_file])
+        file_rec = uow.files.get_by_id(file_id)
+        assert file_rec is not None
+        bad_fk_node = _node(
+            "sym:broken",
+            SymbolKind.FUNCTION,
+            "test.broken",
+            file_id="file:repo:test:12345678:missing_fk.py",
+        )
+        with pytest.raises(DatabaseError):
+            uow.replace_file_graph(file_rec, [bad_fk_node], [])
 
-    with pytest.raises(ValidationError):
-        replace_file_graph(conn, file_id, [{"id": "invalid_node"}], [])
-
-    # Outer transaction work (keep.py) and prior file graph (sym:initial) must both survive
-    assert get_file_by_path(conn, "repo:test:12345678", "keep.py") is not None
-    assert len(list_nodes_for_file(conn, file_id)) == 1
-    conn.commit()
+        # Outer transaction work (keep.py) and prior file graph (sym:initial) must both survive
+        assert uow.files.get_by_path("repo:test:12345678", "keep.py") is not None
+        assert [n.id for n in uow.nodes.list_for_file(file_id)] == ["sym:initial"]
 
 
-def test_prune_stale_files_batched_over_500_files(initialized_db: Connection) -> None:
-    """prune_stale_files deletes >500 stale files cleanly in batches."""
-    conn = initialized_db
+def test_prune_stale_files_batched_over_500_files(uow_factory: SqlUnitOfWorkFactory) -> None:
+    """prune_not_in_ids deletes >500 stale files cleanly in bounded chunks."""
     repo_id = "repo:test:12345678"
     records = [
         FileRecord(
@@ -310,69 +356,89 @@ def test_prune_stale_files_batched_over_500_files(initialized_db: Connection) ->
         )
         for i in range(650)
     ]
-    upsert_files(conn, records)
-    conn.commit()
+    with uow_factory.open() as uow:
+        uow.files.upsert_many(records)
+        assert len(uow.files.list_for_repo(repo_id, include_tests=False)) == 326
+        assert len(uow.files.list_for_repo(repo_id, include_tests=True)) == 651
 
-    # 1 initial + 325 odd
-    assert len(list_files_for_repo(conn, repo_id, include_tests=False)) == 326
-    assert len(list_files_for_repo(conn, repo_id, include_tests=True)) == 651
+        page = uow.files.list_page(FilePageQuery(repo_id=repo_id, include_tests=True, limit=10))
+        assert page.total_count == 651
+        assert len(page.items) == 10
 
-    keep = {"file:repo:test:12345678:test.py", f"file:{repo_id}:mod_0.py"}
-    pruned = prune_stale_files(conn, repo_id, keep)
-    conn.commit()
-
-    assert pruned == 649
-    remaining = list_files_for_repo(conn, repo_id, include_tests=True)
-    assert {r.id for r in remaining} == keep
+        keep = {"file:repo:test:12345678:test.py", f"file:{repo_id}:mod_0.py"}
+        pruned = uow.files.prune_not_in_ids(repo_id, keep)
+        assert pruned == 649
+        remaining = uow.files.list_for_repo(repo_id, include_tests=True)
+        assert {r.id for r in remaining} == keep
 
 
-def test_repos_runs_and_graph_stats(initialized_db: Connection, tmp_path: Path) -> None:
-    """list_repos, resolve_repo_id, index_runs, and get_repo_graph_stats work end-to-end."""
-    conn = initialized_db
+def test_repos_runs_refresh_and_diagnostics(
+    uow_factory: SqlUnitOfWorkFactory,
+    tmp_path: Path,
+) -> None:
+    """repos, runs, refresh, and diagnostics repositories work end-to-end."""
     repo_id = "repo:test:12345678"
+    with uow_factory.open() as uow:
+        assert len(uow.repos.list_all()) == 1
+        assert uow.repos.resolve_id() == repo_id
+        assert uow.repos.resolve_id("test") == repo_id
+        assert uow.repos.resolve_id(str(tmp_path)) == repo_id
 
-    assert len(list_repos(conn)) == 1
-    assert resolve_repo_id(conn) == repo_id
-    assert resolve_repo_id(conn, "test") == repo_id
-    assert resolve_repo_id(conn, str(tmp_path)) == repo_id
+        repo2 = RepoRecord(
+            id="repo:test:87654321",
+            root_path=str(tmp_path / "other"),
+            name="test",
+            created_at="2026-01-02T00:00:00Z",
+        )
+        uow.repos.upsert(repo2)
+        with pytest.raises(DatabaseError) as exc_info:
+            uow.repos.resolve_id("test")
+        assert exc_info.value.error_code == "ambiguous_repo"
 
-    # Adding a second repo with same name makes bare name ambiguous
-    repo2 = RepoRecord(
-        id="repo:test:87654321",
-        root_path=str(tmp_path / "other"),
-        name="test",
-        created_at="2026-01-02T00:00:00Z",
-    )
-    upsert_repo(conn, repo2)
-    with pytest.raises(DatabaseError) as exc_info:
-        resolve_repo_id(conn, "test")
-    assert exc_info.value.error_code == "ambiguous_repo"
+        with pytest.raises(DatabaseError) as missing_exc:
+            uow.repos.resolve_id("nonexistent")
+        assert missing_exc.value.error_code == "repo_not_found"
 
-    with pytest.raises(DatabaseError) as missing_exc:
-        resolve_repo_id(conn, "nonexistent")
-    assert missing_exc.value.error_code == "repo_not_found"
+        run_id = uow.runs.start_run(repo_id, run_type="incremental")
+        uow.runs.finish_run(
+            run_id,
+            "completed",
+            IndexRunMetrics(files_scanned=1, nodes_extracted=4, edges_extracted=1),
+        )
+        runs = uow.runs.list_recent(repo_id, limit=5)
+        assert len(runs) == 1
+        assert runs[0].status == "completed"
+        assert runs[0].nodes_extracted == 4
 
-    run_id = record_index_run_start(conn, repo_id, run_type="incremental")
-    record_index_run_finish(
-        conn, run_id, "completed", files_scanned=1, nodes_extracted=2, edges_extracted=1
-    )
-    runs = list_index_runs(conn, repo_id, limit=5)
-    assert len(runs) == 1
-    assert runs[0]["status"] == "completed"
-    assert runs[0]["nodes_extracted"] == 2
+        uow.nodes.upsert_many(
+            [
+                _node("sym:m", SymbolKind.MODULE, "test"),
+                _node("sym:c", SymbolKind.CLASS, "test.C"),
+                _node("sym:f", SymbolKind.FUNCTION, "test.f"),
+                _node("sym:lf", SymbolKind.LOCAL_FUNCTION, "test.f.g", scope=SymbolScope.FUNCTION),
+            ]
+        )
+        uow.refresh.upsert(
+            ReferenceRefreshState(
+                target_symbol_id="sym:f",
+                available=True,
+                last_refreshed_at="2026-01-01T00:00:00Z",
+                refresh_status=RefreshStatus.OK,
+            )
+        )
+        assert uow.refresh.get("sym:f").available is True
+        assert uow.refresh.mark_symbols_stale(["sym:f"]) == ["sym:f"]
+        assert uow.refresh.get("sym:f").available is False
 
-    upsert_nodes(
-        conn,
-        [
-            _node("sym:m", "module", "test"),
-            _node("sym:c", "class", "test.C"),
-            _node("sym:f", "function", "test.f"),
-            _node("sym:lf", "local_function", "test.f.g", scope="function"),
-        ],
-    )
-    stats = get_repo_graph_stats(conn, repo_id)
-    assert stats["file_count"] == 1
-    assert stats["total_lines"] == 10
-    assert stats["node_count"] == 4
-    assert stats["callable_count"] == 2
-    assert stats["local_callable_count"] == 1
+        stats = uow.diagnostics.get_repo_graph_stats(repo_id)
+        assert stats.file_count == 1
+        assert stats.total_lines == 10
+        assert stats.node_count == 4
+        assert stats.callable_count == 2
+        assert stats.local_callable_count == 1
+
+        status_report = uow.diagnostics.get_status_report(uow_factory.db_path, repo_id)
+        assert status_report.schema_ok is True
+        assert status_report.repo_count == 2
+        assert len(uow.diagnostics.list_repo_summaries()) == 2
+        assert uow.diagnostics.get_table_list_report(uow_factory.db_path).user_version == 2

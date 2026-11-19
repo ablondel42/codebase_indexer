@@ -1,19 +1,25 @@
-"""Tests for the 8 token-lean MCP tools, schemas, adapters, errors, and budgets."""
+"""Tests for the 8 token-lean MCP tools, schemas, compact adapters, errors, and budgets."""
 
 import asyncio
 import json
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import select
 
-from repo_context.config import AppConfig
-from repo_context.context import build_symbol_context
-from repo_context.exceptions import (
+from context.models.outline import FileOutline, OutlineNode
+from context.models.symbol_context import (
+    CompactSymbol,
+    FocusSymbol,
+    StructuralSummary,
+    SymbolContext,
+)
+from core.models.config import AppConfig
+from core.models.enums import SymbolKind, SymbolScope
+from core.models.exceptions import (
     DatabaseNotFoundError,
     LspError,
     ParseError,
@@ -21,27 +27,16 @@ from repo_context.exceptions import (
     SymbolNotFoundError,
     ValidationError,
 )
-from repo_context.mcp.adapters import (
-    adapt_context,
-    adapt_edge,
-    adapt_node,
-    adapt_outline,
-    adapt_risk_result,
-)
-from repo_context.mcp.errors import (
-    ERROR_AMBIGUOUS_SYMBOL,
-    ERROR_DATABASE_NOT_FOUND,
-    ERROR_INTERNAL_ERROR,
-    ERROR_INVALID_INPUT,
-    ERROR_LSP_FAILURE,
-    ERROR_PARSE_ERROR,
-    ERROR_PATH_SECURITY,
-    ERROR_SYMBOL_NOT_FOUND,
-    error_result,
-    map_exception_to_error_result,
-    success_result,
-)
-from repo_context.mcp.schemas import (
+from core.models.node import SymbolSummary
+from core.models.range import Position
+from core.ports.lsp import LspClientProtocol, LspPoolProtocol
+from engine.models.queries import ContextQuery
+from engine.services.facade import IndexerEngine
+from graph.models.references import ReferenceDirection
+from graph.models.risk import RiskAssessment, RiskDecision, RiskFacts
+from indexing.models.results import BatchIndexOptions
+from mcp_server.models.errors import McpErrorCode, McpErrorDetail
+from mcp_server.models.inputs import (
     AnalyzeRiskInput,
     GetFileOutlineInput,
     GetRepoOverviewInput,
@@ -51,37 +46,131 @@ from repo_context.mcp.schemas import (
     ListFilesInput,
     SearchSymbolsInput,
 )
-from repo_context.mcp.server import create_server
-from repo_context.mcp.tools import (
-    analyze_risk,
-    get_file_outline,
-    get_repo_overview,
-    get_symbol_context,
-    get_symbol_references,
-    get_symbol_source,
-    list_files,
-    register_tools,
-    search_symbols,
+from mcp_server.services.registry import McpToolRegistry
+from mcp_server.services.repo_handlers import RepoMcpHandlers
+from mcp_server.services.server import McpServerRunner
+from mcp_server.services.symbol_handlers import SymbolMcpHandlers
+from mcp_server.utils.compact import (
+    adapt_outline,
+    adapt_risk_assessment,
+    adapt_symbol_context,
+    adapt_symbol_summary,
+    omit_none,
 )
-from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.scanner import scan_repository
-from repo_context.storage import (
-    close_connection,
-    get_connection,
-    initialize_database,
-    nodes_table,
-    record_index_run_finish,
-    record_index_run_start,
-    replace_file_graph,
-    upsert_files,
-    upsert_repo,
+from mcp_server.utils.errors import (
+    error_result,
+    map_exception_to_error_result,
+    success_result,
 )
+
+
+class _FakeMcpServer:
+    """Lightweight ``.tool()`` stub capturing registered MCP tool functions."""
+
+    def __init__(self) -> None:
+        """Initialize an empty tool map."""
+        self.tools: dict[str, Callable[..., Any]] = {}
+
+    def tool(
+        self,
+        name: str | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register ``fn`` under ``name`` or ``fn.__name__``."""
+
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            self.tools[name or fn.__name__] = fn
+            return fn
+
+        return decorator
+
+
+class _FakeLspClient(LspClientProtocol):
+    """In-memory ``LspClientProtocol`` double returning a deterministic reference location."""
+
+    def __init__(self, target_uri: str) -> None:
+        """Bind the fake reference target URI."""
+        self._target_uri = target_uri
+
+    @property
+    def is_running(self) -> bool:
+        """Report the fake client as active."""
+        return True
+
+    def start(self, repo_root: Path | str) -> None:
+        """No-op startup hook."""
+        _ = repo_root
+
+    def did_open_or_change(
+        self,
+        uri: str,
+        text: str,
+        language_id: str = "python",
+    ) -> None:
+        """No-op document sync hook."""
+        _ = (uri, text, language_id)
+
+    def find_references(
+        self,
+        uri: str,
+        position: Position,
+        *,
+        include_declaration: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return one synthetic LSP reference inside ``pkg/core.py``."""
+        _ = (uri, position, include_declaration)
+        return [
+            {
+                "uri": self._target_uri,
+                "range": {
+                    "start": {"line": 10, "character": 15},
+                    "end": {"line": 10, "character": 21},
+                },
+            }
+        ]
+
+    def close(self) -> None:
+        """No-op shutdown hook."""
+
+
+class _FakeLspPool(LspPoolProtocol):
+    """In-memory ``LspPoolProtocol`` returning ``_FakeLspClient``."""
+
+    def __init__(self, target_uri: str) -> None:
+        """Bind ``target_uri`` for returned fake clients."""
+        self._client = _FakeLspClient(target_uri)
+
+    def acquire(self, repo_root: Path) -> LspClientProtocol:
+        """Return the pre-configured ``_FakeLspClient``."""
+        _ = repo_root
+        return self._client
+
+    def evict(self, repo_root: Path) -> None:
+        """No-op eviction hook."""
+        _ = repo_root
+
+    def close_all(self) -> None:
+        """No-op pool shutdown hook."""
+
+
+class _FailingLspPool(LspPoolProtocol):
+    """In-memory ``LspPoolProtocol`` raising ``LspError`` on ``acquire``."""
+
+    def acquire(self, repo_root: Path) -> LspClientProtocol:
+        """Raise ``LspError`` simulating unavailable ``pyright-langserver``."""
+        _ = repo_root
+        raise LspError("pyright unavailable")
+
+    def evict(self, repo_root: Path) -> None:
+        """No-op eviction hook."""
+        _ = repo_root
+
+    def close_all(self) -> None:
+        """No-op pool shutdown hook."""
 
 
 @pytest.fixture
-def indexed_mcp_repo(tmp_path: Path) -> Iterator[tuple[Path, Path, str]]:
-    """Index a multi-file repository into a temp DB and yield ``(db_path, repo_root, repo_id)``."""
+def indexed_mcp_repo(tmp_path: Path) -> Iterator[tuple[Path, Path, str, IndexerEngine]]:
+    """Index a multi-file repo via ``IndexerEngine`` and yield ``(db_path, root, id, eng)``."""
     repo_root = tmp_path / "mcp_repo"
     (repo_root / "pkg").mkdir(parents=True)
     (repo_root / "tests").mkdir()
@@ -117,59 +206,26 @@ def indexed_mcp_repo(tmp_path: Path) -> Iterator[tuple[Path, Path, str]]:
         encoding="utf-8",
     )
     (repo_root / "tests" / "test_core.py").write_text(
-        "def test_ok():\n    assert True\n", encoding="utf-8"
+        "def test_ok() -> None:\n    assert True\n",
+        encoding="utf-8",
     )
 
     db_path = tmp_path / "mcp.db"
-    conn = get_connection(db_path)
+    engine = IndexerEngine(AppConfig(db_path=db_path, include_tests=True))
     try:
-        initialize_database(conn)
-        cfg = AppConfig(include_tests=True)
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        run_id = record_index_run_start(conn, repo.id, run_type="full")
-        upsert_files(conn, files)
-        total_nodes = 0
-        total_edges = 0
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-            total_nodes += len(nodes)
-            total_edges += len(edges)
-        resolve_repo_edges(conn, repo.id)
-        record_index_run_finish(
-            conn,
-            run_id,
-            "completed",
-            files_scanned=len(files),
-            nodes_extracted=total_nodes,
-            edges_extracted=total_edges,
+        res = engine.commands.index_repository(
+            repo_root,
+            BatchIndexOptions(include_tests=True),
         )
-        conn.commit()
+        yield db_path, repo_root, res.repo.id, engine
     finally:
-        close_connection(conn)
-
-    yield db_path, repo_root, repo.id
-
-
-class _FakeFastMCP:
-    """Lightweight duck-typed FastMCP stub for testing ``register_tools`` without ``mcp``."""
-
-    def __init__(self) -> None:
-        self.tools: dict[str, Callable[..., Any]] = {}
-
-    def tool(
-        self, name: str | None = None
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.tools[name or fn.__name__] = fn
-            return fn
-
-        return decorator
+        engine.close()
 
 
 def test_error_envelopes_and_exception_mapping(capsys: pytest.CaptureFixture[str]) -> None:
-    """Error mapping produces safe structured payloads and logs internal errors to stderr only."""
+    """Error mapping produces safe structured envelopes and logs internal errors to stderr only."""
+    detail = McpErrorDetail(code="code", message="msg")
+    assert detail.details is None
     assert error_result("code", "msg") == {
         "ok": False,
         "error": {"code": "code", "message": "msg", "details": None},
@@ -177,32 +233,35 @@ def test_error_envelopes_and_exception_mapping(capsys: pytest.CaptureFixture[str
     }
     assert success_result({"x": 1}) == {"ok": True, "data": {"x": 1}, "error": None}
 
-    db_err = map_exception_to_error_result(DatabaseNotFoundError("x"), operation="op")
-    assert db_err["error"]["code"] == ERROR_DATABASE_NOT_FOUND
-    sym_err = map_exception_to_error_result(SymbolNotFoundError("x"), operation="op")
-    assert sym_err["error"]["code"] == ERROR_SYMBOL_NOT_FOUND
+    cases: list[tuple[Exception, McpErrorCode]] = [
+        (DatabaseNotFoundError("x"), McpErrorCode.DATABASE_NOT_FOUND),
+        (SymbolNotFoundError("x"), McpErrorCode.SYMBOL_NOT_FOUND),
+        (LspError("x"), McpErrorCode.LSP_FAILURE),
+        (ParseError("x"), McpErrorCode.PARSE_ERROR),
+        (ValidationError("x"), McpErrorCode.INVALID_INPUT),
+    ]
+    for exc, expected_code in cases:
+        mapped = map_exception_to_error_result(exc, operation="op")
+        assert mapped["error"]["code"] == expected_code
+
     sec = map_exception_to_error_result(PathSecurityError("/secret/abs/path"), operation="op")
-    assert sec["error"]["code"] == ERROR_PATH_SECURITY
+    assert sec["error"]["code"] == McpErrorCode.PATH_SECURITY
     assert "/secret/abs/path" not in sec["error"]["message"]
-    lsp_err = map_exception_to_error_result(LspError("x"), operation="op")
-    assert lsp_err["error"]["code"] == ERROR_LSP_FAILURE
-    parse_err = map_exception_to_error_result(ParseError("x"), operation="op")
-    assert parse_err["error"]["code"] == ERROR_PARSE_ERROR
-    val_err = map_exception_to_error_result(ValidationError("x"), operation="op")
-    assert val_err["error"]["code"] == ERROR_INVALID_INPUT
 
     internal = map_exception_to_error_result(
-        RuntimeError("/private/secret/traceback"), operation="op"
+        RuntimeError("/private/secret/traceback"),
+        operation="op",
     )
-    assert internal["error"]["code"] == ERROR_INTERNAL_ERROR
+    assert internal["error"]["code"] == McpErrorCode.INTERNAL_ERROR
     assert "/private/secret/traceback" not in internal["error"]["message"]
-    captured = capsys.readouterr()
-    assert captured.out == ""
+    assert capsys.readouterr().out == ""
 
 
-def test_schemas_validation_and_aliases() -> None:
-    """Pydantic input schemas enforce bounds and accept legacy aliases cleanly."""
-    assert GetRepoOverviewInput(repo_id=None).repo_id is None
+def test_schemas_validation_and_aliases(tmp_path: Path) -> None:
+    """Pydantic input models enforce bounds, Path coercion, enums, and legacy aliases."""
+    sample_db = tmp_path / "override.db"
+    assert GetRepoOverviewInput(repo_id=None, db_path=str(sample_db)).db_path == str(sample_db)
+    assert GetRepoOverviewInput.model_validate({"db_path": sample_db}).db_path == str(sample_db)
     with pytest.raises(PydanticValidationError):
         GetRepoOverviewInput(repo_id="   ")
 
@@ -211,17 +270,15 @@ def test_schemas_validation_and_aliases() -> None:
         ListFilesInput(limit=201)
 
     assert GetFileOutlineInput(file_path="a.py").max_depth == 3
-    assert SearchSymbolsInput(query="Worker", kind="class").kind == "class"
+    assert SearchSymbolsInput(query="Worker", kind=SymbolKind.CLASS).kind == SymbolKind.CLASS
 
     src_in = GetSymbolSourceInput.model_validate({"symbol": "Worker", "max_lines": 100})
     assert src_in.symbol_id_or_name == "Worker"
     assert GetSymbolSourceInput(symbol_id_or_name="Worker").symbol_id_or_name == "Worker"
 
     assert GetSymbolContextInput.model_validate({"symbol": "Worker"}).edge_limit == 20
-    assert (
-        GetSymbolReferencesInput.model_validate({"symbol": "Worker", "direction": "both"}).direction
-        == "both"
-    )
+    refs_in = GetSymbolReferencesInput.model_validate({"symbol": "Worker", "direction": "both"})
+    assert refs_in.direction == ReferenceDirection.BOTH
 
     risk_in = AnalyzeRiskInput.model_validate({"symbol_ids": ["a", "b"]})
     assert risk_in.symbols == ["a", "b"]
@@ -232,298 +289,306 @@ def test_schemas_validation_and_aliases() -> None:
 
 
 def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
-    """Adapters strip None noise and drop child docstrings when >10 children are present."""
-    adapted = adapt_node(
-        {
-            "id": "sym:1",
-            "kind": "function",
-            "name": "f",
-            "qualified_name": "m.f",
-            "doc_summary": None,
-        }
+    """Compact adapters strip ``None`` fields and omit child docstrings when >10 children exist."""
+    assert omit_none({"a": 1, "b": None}) == {"a": 1}
+
+    adapted_sym = adapt_symbol_summary(
+        SymbolSummary(
+            id="sym:1",
+            repo_id="repo:1",
+            file_id="file:1",
+            kind=SymbolKind.FUNCTION,
+            name="f",
+            qualified_name="m.f",
+            uri="file:///m.py",
+            doc_summary=None,
+        )
     )
-    assert "doc_summary" not in adapted
+    assert "doc_summary" not in adapted_sym
 
-    edge_adapted = adapt_edge({"kind": "calls", "from_id": "a", "to_id": "b", "confidence": 0.9})
-    assert "preview" not in edge_adapted
-
-    class DummyCtx:
-        focus_symbol = {
-            "id": "sym:c",
-            "kind": "class",
-            "name": "C",
-            "qualified_name": "m.C",
-            "start_line": 1,
-            "end_line": 50,
-        }
-        structural_parent = None
-        structural_children = [
-            {
-                "id": f"sym:m{i}",
-                "kind": "method",
-                "name": f"m{i}",
-                "lines": f"{i}-{i}",
-                "doc_summary": f"doc {i}",
-            }
+    wide_ctx = SymbolContext(
+        focus_symbol=FocusSymbol(
+            id="sym:c",
+            kind=SymbolKind.CLASS,
+            name="C",
+            qualified_name="m.C",
+            start_line=1,
+            end_line=50,
+        ),
+        structural_children=[
+            CompactSymbol(
+                id=f"sym:m{i}",
+                kind=SymbolKind.METHOD,
+                name=f"m{i}",
+                lines=f"{i}-{i}",
+                doc_summary=f"doc {i}",
+            )
             for i in range(12)
-        ]
-        lexical_parent = None
-        lexical_children = []
-        incoming_edges = []
-        outgoing_edges = []
-        structural_summary = {"scope": "module", "structural_child_count": 12}
-        reference_summary = {}
-        freshness = {"is_fresh": True}
-        confidence = {"focus_symbol_confidence": 1.0}
-
-    compact_ctx = adapt_context(DummyCtx())
+        ],
+        structural_summary=StructuralSummary(
+            scope=SymbolScope.MODULE,
+            structural_child_count=12,
+        ),
+    )
+    compact_ctx = adapt_symbol_context(wide_ctx)
     assert len(compact_ctx["structural_children"]) == 12
     assert all("doc_summary" not in c for c in compact_ctx["structural_children"])
     assert "structural_parent" not in compact_ctx
 
     out = adapt_outline(
-        {
-            "file_path": "a.py",
-            "module_path": "a",
-            "symbols": [{"id": "s", "kind": "function", "name": "f", "children": []}],
-        }
+        FileOutline(
+            file_path="a.py",
+            module_path="a",
+            line_count=10,
+            is_fresh=True,
+            symbols=[OutlineNode(id="sym:s", kind=SymbolKind.FUNCTION, name="f", children=[])],
+        )
     )
     assert "children" not in out["symbols"][0]
 
-    class DummyFacts:
-        target_count = 0
-        symbol_ids = []
-        symbol_kinds = set()
-        reference_counts = {}
-        reference_availability = {}
-        referencing_file_counts = {}
-        referencing_module_counts = {}
-        touches_public_surface = False
-        touches_local_scope_only = False
-        target_spans_multiple_files = False
-        target_spans_multiple_modules = False
-        cross_file_impact = False
-        cross_module_impact = False
-        inheritance_involved = False
-        stale_symbols = []
-        low_confidence_symbols = []
-        low_confidence_edges = []
-        extra = {}
-
-    class DummyRisk:
-        risk_score = 10
-        decision = "safe_enough"
-        issues = []
-        targets = []
-        facts = DummyFacts()
-
-    assert adapt_risk_result(DummyRisk())["decision"] == "safe_enough"
-
-
-def test_all_8_mcp_tools_end_to_end(indexed_mcp_repo: tuple[Path, Path, str]) -> None:
-    """All 8 MCP tools return valid token-lean JSON envelopes against a temp DB."""
-    db_path, repo_root, repo_id = indexed_mcp_repo
-
-    # 1. get_repo_overview
-    ov = json.loads(asyncio.run(get_repo_overview(db_path=db_path)))
-    assert ov["ok"] is True
-    assert ov["data"]["repo"]["id"] == repo_id
-    assert ov["data"]["stats"]["file_count"] == 4
-    assert ov["data"]["stats"]["test_file_count"] == 1
-
-    # 2. list_files
-    lf_no_tests = json.loads(
-        asyncio.run(list_files(path_prefix="pkg", include_tests=False, db_path=db_path))
+    risk = RiskAssessment(
+        risk_score=10,
+        decision=RiskDecision.SAFE_ENOUGH,
+        facts=RiskFacts(symbol_kinds=["function"]),
     )
-    assert lf_no_tests["ok"] is True
-    assert lf_no_tests["data"]["total_count"] == 3
-    lf_tests = json.loads(
-        asyncio.run(list_files(include_tests=True, limit=2, offset=1, db_path=db_path))
-    )
-    assert lf_tests["data"]["total_count"] == 4
-    assert lf_tests["data"]["returned_count"] == 2
-    assert lf_tests["data"]["has_more"] is True
+    assert adapt_risk_assessment(risk)["decision"] == "safe_enough"
 
-    # 3. get_file_outline
-    outline = json.loads(asyncio.run(get_file_outline("pkg/core.py", db_path=db_path)))
-    assert outline["ok"] is True
-    assert outline["data"]["module_path"] == "pkg.core"
-    assert [s["name"] for s in outline["data"]["symbols"]] == ["Base", "Worker", "helper"]
 
-    # 4. search_symbols
-    search = json.loads(asyncio.run(search_symbols("Worker", kind="class", db_path=db_path)))
-    assert search["ok"] is True
-    assert search["data"]["count"] == 1
-    assert search["data"]["symbols"][0]["qualified_name"] == "pkg.core.Worker"
+def test_all_8_mcp_tools_end_to_end_and_db_override(
+    indexed_mcp_repo: tuple[Path, Path, str, IndexerEngine],
+    tmp_path: Path,
+) -> None:
+    """All 8 MCP tools and per-call ``db_path`` override work via ``McpToolRegistry``."""
+    db_path, repo_root, repo_id, _ = indexed_mcp_repo
 
-    # 5. get_symbol_source
-    src = json.loads(
-        asyncio.run(
-            get_symbol_source("pkg.core.Worker.run", max_lines=2, offset=0, db_path=db_path)
+    # Engine initialized on an empty default path overrides to db_path via engine.for_db(db_path)
+    default_db = tmp_path / "unused_default.db"
+    with IndexerEngine(AppConfig(db_path=default_db)) as engine:
+        repo_handlers = RepoMcpHandlers(engine)
+        symbol_handlers = SymbolMcpHandlers(engine)
+        registry = McpToolRegistry(
+            engine,
+            repo_handlers=repo_handlers,
+            symbol_handlers=symbol_handlers,
         )
-    )
-    assert src["ok"] is True
-    assert src["data"]["truncated"] is True
-    assert "def run(" in src["data"]["source"]
 
-    # 6. get_symbol_context + ambiguity handling
-    ctx = json.loads(
-        asyncio.run(get_symbol_context("pkg.core.Worker", include_source=True, db_path=db_path))
-    )
-    assert ctx["ok"] is True
-    assert ctx["data"]["context"]["focus_symbol"]["qualified_name"] == "pkg.core.Worker"
-    assert "bases" in ctx["data"]["context"]
+        with pytest.raises(ValidationError):
+            asyncio.run(registry.call_tool("nonexistent_tool", {}))
 
-    ambig = json.loads(asyncio.run(get_symbol_context("run", db_path=db_path)))
-    assert ambig["ok"] is False
-    assert ambig["error"]["code"] == ERROR_AMBIGUOUS_SYMBOL
-    assert len(ambig["error"]["details"]["candidates"]) == 2
+        ov = json.loads(
+            asyncio.run(registry.call_tool("get_repo_overview", {"db_path": str(db_path)}))
+        )
+        assert ov["ok"] is True
+        assert ov["data"]["repo"]["id"] == repo_id
+        assert ov["data"]["stats"]["file_count"] == 4
+        assert ov["data"]["stats"]["test_file_count"] == 1
+        assert not default_db.exists()
 
-    # 7. get_symbol_references (AST fallback & 1-line preview)
-    refs = json.loads(
-        asyncio.run(get_symbol_references("pkg.core.helper", direction="incoming", db_path=db_path))
-    )
-    assert refs["ok"] is True
-    assert refs["data"]["reference_summary"]["reference_source"] == "ast"
-    assert refs["data"]["total_count"] >= 1
-    assert any("helper(x)" in (item.get("preview") or "") for item in refs["data"]["references"])
+        lf_no_tests = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "list_files",
+                    {"path_prefix": "pkg", "include_tests": False, "db_path": str(db_path)},
+                )
+            )
+        )
+        assert lf_no_tests["data"]["total_count"] == 3
 
-    # 8. analyze_risk
-    risk = json.loads(
-        asyncio.run(analyze_risk(["pkg.core.Base", "pkg.client.run"], db_path=db_path))
-    )
-    assert risk["ok"] is True
-    assert risk["data"]["risk"]["facts"]["inheritance_involved"] is True
-    assert risk["data"]["risk"]["facts"]["target_spans_multiple_modules"] is True
+        lf_tests = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "list_files",
+                    {"include_tests": True, "limit": 2, "offset": 1, "db_path": str(db_path)},
+                )
+            )
+        )
+        assert lf_tests["data"]["total_count"] == 4
+        assert lf_tests["data"]["returned_count"] == 2
+        assert lf_tests["data"]["has_more"] is True
 
-    # Missing file symlink security error via get_symbol_source after replacing file with symlink
-    outside = repo_root.parent / "secret.py"
-    outside.write_text("SECRET = 1\n", encoding="utf-8")
-    target_file = repo_root / "pkg" / "client.py"
-    target_file.unlink()
-    target_file.symlink_to(outside)
-    sec_res = json.loads(asyncio.run(get_symbol_source("pkg.client.run", db_path=db_path)))
-    assert sec_res["ok"] is False
-    assert sec_res["error"]["code"] == ERROR_PATH_SECURITY
+        outline = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_file_outline",
+                    {"file_path": "pkg/core.py", "db_path": str(db_path)},
+                )
+            )
+        )
+        assert outline["data"]["module_path"] == "pkg.core"
+        assert [s["name"] for s in outline["data"]["symbols"]] == ["Base", "Worker", "helper"]
+
+        search = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "search_symbols",
+                    {"query": "Worker", "kind": "class", "db_path": str(db_path)},
+                )
+            )
+        )
+        assert search["data"]["count"] == 1
+        assert search["data"]["symbols"][0]["qualified_name"] == "pkg.core.Worker"
+
+        src = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_symbol_source",
+                    {
+                        "symbol": "pkg.core.Worker.run",
+                        "max_lines": 2,
+                        "offset": 0,
+                        "db_path": str(db_path),
+                    },
+                )
+            )
+        )
+        assert src["data"]["truncated"] is True
+        assert "def run(" in src["data"]["source"]
+
+        ctx = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_symbol_context",
+                    {"symbol": "pkg.core.Worker", "include_source": True, "db_path": str(db_path)},
+                )
+            )
+        )
+        assert ctx["data"]["context"]["focus_symbol"]["qualified_name"] == "pkg.core.Worker"
+        assert "bases" in ctx["data"]["context"]
+
+        ambig = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_symbol_context",
+                    {"symbol": "run", "db_path": str(db_path)},
+                )
+            )
+        )
+        assert ambig["ok"] is False
+        assert ambig["error"]["code"] == McpErrorCode.AMBIGUOUS_SYMBOL
+        assert len(ambig["error"]["details"]["candidates"]) == 2
+
+        refs = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_symbol_references",
+                    {
+                        "symbol": "pkg.core.helper",
+                        "direction": "incoming",
+                        "db_path": str(db_path),
+                    },
+                )
+            )
+        )
+        assert refs["data"]["reference_summary"]["reference_source"] == "ast"
+        assert refs["data"]["total_count"] >= 1
+        assert any(
+            "helper(x)" in (item.get("preview") or "") for item in refs["data"]["references"]
+        )
+
+        risk = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "analyze_risk",
+                    {"symbols": ["pkg.core.Base", "pkg.client.run"], "db_path": str(db_path)},
+                )
+            )
+        )
+        assert risk["data"]["risk"]["facts"]["inheritance_involved"] is True
+        assert risk["data"]["risk"]["facts"]["target_spans_multiple_modules"] is True
+
+        outside = repo_root.parent / "secret.py"
+        outside.write_text("SECRET = 1\n", encoding="utf-8")
+        target_file = repo_root / "pkg" / "client.py"
+        target_file.unlink()
+        target_file.symlink_to(outside)
+        sec_res = json.loads(
+            asyncio.run(
+                registry.call_tool(
+                    "get_symbol_source",
+                    {"symbol": "pkg.client.run", "db_path": str(db_path)},
+                )
+            )
+        )
+        assert sec_res["ok"] is False
+        assert sec_res["error"]["code"] == McpErrorCode.PATH_SECURITY
 
 
 def test_get_symbol_references_refresh_lsp_and_error_handling(
-    indexed_mcp_repo: tuple[Path, Path, str],
+    indexed_mcp_repo: tuple[Path, Path, str, IndexerEngine],
 ) -> None:
-    """get_symbol_references supports refresh_lsp=True with mocked pool and catches LspError."""
-    db_path, repo_root, _ = indexed_mcp_repo
+    """``get_symbol_references`` supports ``refresh_lsp=True`` and translates ``LspError``."""
+    db_path, repo_root, _, _ = indexed_mcp_repo
+    core_uri = (repo_root / "pkg" / "core.py").resolve().as_uri()
 
-    class _FakeClient:
-        is_running = True
-
-        def start(self, root: str) -> None:
-            pass
-
-        def did_open_or_change(self, uri: str, text: str) -> None:
-            pass
-
-        def find_references(
-            self,
-            uri: str,
-            line: int,
-            character: int,
-            include_declaration: bool = False,
-        ) -> list[dict[str, Any]]:
-            return [
-                {
-                    "uri": (repo_root / "pkg" / "core.py").resolve().as_uri(),
-                    "range": {
-                        "start": {"line": 13, "character": 15},
-                        "end": {"line": 13, "character": 21},
-                    },
-                }
-            ]
-
-    class _FakePool:
-        def get_or_start(self, root: str) -> _FakeClient:
-            return _FakeClient()
-
-        def close_repo(self, root: str) -> None:
-            pass
-
-    res = json.loads(
-        asyncio.run(
-            get_symbol_references(
-                "pkg.core.helper",
-                refresh_lsp=True,
-                db_path=db_path,
-                lsp_pool=cast(Any, _FakePool()),
+    with IndexerEngine(AppConfig(db_path=db_path), lsp_pool=_FakeLspPool(core_uri)) as ok_engine:
+        ok_reg = McpToolRegistry(ok_engine)
+        res = json.loads(
+            asyncio.run(
+                ok_reg.call_tool(
+                    "get_symbol_references",
+                    {"symbol": "pkg.core.helper", "refresh_lsp": True},
+                )
             )
         )
-    )
-    assert res["ok"] is True
-    assert res["data"]["reference_summary"]["available"] is True
-    assert res["data"]["reference_summary"]["reference_source"] == "lsp"
+        assert res["ok"] is True
+        assert res["data"]["reference_summary"]["available"] is True
+        assert res["data"]["reference_summary"]["reference_source"] == "lsp"
 
-    class _FailingPool:
-        def get_or_start(self, root: str) -> _FakeClient:
-            raise LspError("pyright unavailable")
-
-        def close_repo(self, root: str) -> None:
-            pass
-
-    err = json.loads(
-        asyncio.run(
-            get_symbol_references(
-                "pkg.core.helper",
-                refresh_lsp=True,
-                db_path=db_path,
-                lsp_pool=cast(Any, _FailingPool()),
+    with IndexerEngine(AppConfig(db_path=db_path), lsp_pool=_FailingLspPool()) as bad_engine:
+        bad_reg = McpToolRegistry(bad_engine)
+        err = json.loads(
+            asyncio.run(
+                bad_reg.call_tool(
+                    "get_symbol_references",
+                    {"symbol": "pkg.core.helper", "refresh_lsp": True},
+                )
             )
         )
-    )
-    assert err["ok"] is False
-    assert err["error"]["code"] == ERROR_LSP_FAILURE
+        assert err["ok"] is False
+        assert err["error"]["code"] == McpErrorCode.LSP_FAILURE
 
 
 def test_read_only_db_safety_and_missing_db_creates_zero_files(
-    indexed_mcp_repo: tuple[Path, Path, str],
+    indexed_mcp_repo: tuple[Path, Path, str, IndexerEngine],
     tmp_path: Path,
 ) -> None:
-    """Non-refresh MCP tools work on read-only DBs and never create missing DB files."""
+    """Read-only MCP tools work on ``0o444`` DBs and never create missing DB files."""
     missing_db = tmp_path / "never_created.db"
-    res = json.loads(asyncio.run(get_repo_overview(db_path=missing_db)))
-    assert res["ok"] is False
-    assert res["error"]["code"] == ERROR_DATABASE_NOT_FOUND
-    assert not missing_db.exists()
+    with IndexerEngine(AppConfig(db_path=missing_db)) as missing_engine:
+        missing_reg = McpToolRegistry(missing_engine)
+        res = json.loads(asyncio.run(missing_reg.call_tool("get_repo_overview", {})))
+        assert res["ok"] is False
+        assert res["error"]["code"] == McpErrorCode.DATABASE_NOT_FOUND
+        assert not missing_db.exists()
 
-    db_path, _, _ = indexed_mcp_repo
+    db_path, _, _, engine = indexed_mcp_repo
+    reg = McpToolRegistry(engine)
     os.chmod(db_path, 0o444)
     try:
-        ov = json.loads(asyncio.run(get_repo_overview(db_path=db_path)))
+        ov = json.loads(asyncio.run(reg.call_tool("get_repo_overview", {})))
         assert ov["ok"] is True
-        ctx = json.loads(asyncio.run(get_symbol_context("pkg.core.Worker", db_path=db_path)))
+        ctx = json.loads(
+            asyncio.run(reg.call_tool("get_symbol_context", {"symbol": "pkg.core.Worker"}))
+        )
         assert ctx["ok"] is True
     finally:
         os.chmod(db_path, 0o644)
 
 
-def test_register_tools_and_create_server(indexed_mcp_repo: tuple[Path, Path, str]) -> None:
-    """register_tools registers all 8 tools cleanly with a FastMCP stub or real FastMCP."""
-    db_path, _, _ = indexed_mcp_repo
-    fake_mcp = _FakeFastMCP()
-    register_tools(fake_mcp, db_path=db_path)
+def test_register_tools_and_create_server(
+    indexed_mcp_repo: tuple[Path, Path, str, IndexerEngine],
+) -> None:
+    """``McpToolRegistry.bind`` and ``McpServerRunner.create_server`` register all 8 tools."""
+    db_path, _, _, engine = indexed_mcp_repo
+    fake_mcp = _FakeMcpServer()
+    McpToolRegistry(engine).bind(fake_mcp, db_path=db_path)
 
-    expected = {
-        "get_repo_overview",
-        "list_files",
-        "get_file_outline",
-        "search_symbols",
-        "get_symbol_source",
-        "get_symbol_context",
-        "get_symbol_references",
-        "analyze_risk",
-    }
-    assert set(fake_mcp.tools.keys()) == expected
+    assert set(fake_mcp.tools.keys()) == set(McpToolRegistry.TOOL_NAMES)
     ov_res = json.loads(asyncio.run(fake_mcp.tools["get_repo_overview"]()))
     assert ov_res["ok"] is True
 
-    server = create_server(db_path=db_path)
+    runner = McpServerRunner(engine.config, engine=engine)
+    server = runner.create_server(db_path=db_path, debug=True)
     assert server is not None
 
 
@@ -544,110 +609,99 @@ def test_40_method_class_token_budget(tmp_path: Path) -> None:
     (repo_root / "big.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     db_path = tmp_path / "budget.db"
-    conn = get_connection(db_path)
-    try:
-        initialize_database(conn)
-        cfg = AppConfig()
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        upsert_files(conn, files)
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-        conn.commit()
-    finally:
-        close_connection(conn)
+    with IndexerEngine(AppConfig(db_path=db_path)) as engine:
+        engine.commands.index_repository(repo_root)
+        reg = McpToolRegistry(engine)
 
-    ctx_raw = asyncio.run(get_symbol_context("BigService", db_path=db_path))
-    ctx_data = json.loads(ctx_raw)
-    assert ctx_data["ok"] is True
-    assert len(ctx_raw) < 6000
-    assert (len(ctx_raw) / 4) < 1500
+        ctx_raw = asyncio.run(reg.call_tool("get_symbol_context", {"symbol": "BigService"}))
+        assert json.loads(ctx_raw)["ok"] is True
+        assert len(ctx_raw) < 6000
+        assert (len(ctx_raw) / 4) < 1500
 
-    outline_raw = asyncio.run(get_file_outline("big.py", db_path=db_path))
-    outline_data = json.loads(outline_raw)
-    assert outline_data["ok"] is True
-    assert len(outline_raw) < 4000
-    assert (len(outline_raw) / 4) < 1000
+        outline_raw = asyncio.run(reg.call_tool("get_file_outline", {"file_path": "big.py"}))
+        assert json.loads(outline_raw)["ok"] is True
+        assert len(outline_raw) < 4000
+        assert (len(outline_raw) / 4) < 1000
 
 
 def test_list_files_preserves_dot_prefix_directory(tmp_path: Path) -> None:
-    """list_files normalizes ./ without stripping leading dots from .github paths."""
+    """``list_files`` normalizes ``./`` without stripping leading dots from ``.github`` paths."""
     repo_root = tmp_path / "dot_repo"
     (repo_root / ".github").mkdir(parents=True)
     (repo_root / "github").mkdir()
     (repo_root / ".github" / "ci.py").write_text(
-        "def check_ci() -> int:\n    return 1\n", encoding="utf-8"
+        "def check_ci() -> int:\n    return 1\n",
+        encoding="utf-8",
     )
     (repo_root / "github" / "ci.py").write_text(
-        "def check_non_dot() -> int:\n    return 2\n", encoding="utf-8"
+        "def check_non_dot() -> int:\n    return 2\n",
+        encoding="utf-8",
     )
 
     db_path = tmp_path / "dot.db"
-    conn = get_connection(db_path)
-    try:
-        initialize_database(conn)
-        cfg = AppConfig()
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        upsert_files(conn, files)
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-        conn.commit()
-    finally:
-        close_connection(conn)
-
-    for prefix in (".github", "./.github/", "./.github/ci.py"):
-        res = json.loads(asyncio.run(list_files(path_prefix=prefix, db_path=db_path)))
-        assert res["ok"] is True
-        assert [f["file_path"] for f in res["data"]["files"]] == [".github/ci.py"]
+    with IndexerEngine(AppConfig(db_path=db_path)) as engine:
+        engine.commands.index_repository(repo_root)
+        reg = McpToolRegistry(engine)
+        for prefix in (".github", "./.github/", "./.github/ci.py"):
+            res = json.loads(asyncio.run(reg.call_tool("list_files", {"path_prefix": prefix})))
+            assert res["ok"] is True
+            assert [f["file_path"] for f in res["data"]["files"]] == [".github/ci.py"]
 
 
 def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_error(
     tmp_path: Path,
 ) -> None:
-    """adapt_context drops duplicate lexical_children/parent and source_error hides OS paths."""
-
-    class SameChildrenCtx:
-        focus_symbol = {
-            "id": "sym:outer",
-            "kind": "function",
-            "name": "outer",
-            "qualified_name": "mod.outer",
-            "start_line": 1,
-            "end_line": 6,
-        }
-        structural_parent = {"id": "sym:mod", "kind": "module", "name": "mod"}
-        structural_children = [
-            {"id": "sym:inner", "kind": "local_function", "name": "inner", "lines": "2-4"}
-        ]
-        lexical_parent = {"id": "sym:mod", "kind": "module", "name": "mod"}
-        lexical_children = [
-            {"id": "sym:inner", "kind": "local_function", "name": "inner", "lines": "2-4"}
-        ]
-        incoming_edges = []
-        outgoing_edges = []
-        structural_summary = {"scope": "module", "structural_child_count": 1}
-        reference_summary = {}
-        freshness = {"is_fresh": True}
-        confidence = {"focus_symbol_confidence": 1.0}
-
-    deduped = adapt_context(SameChildrenCtx())
+    """``adapt_symbol_context`` deduplicates lexical fields and hides OS paths on symlink error."""
+    mod_parent = FocusSymbol(
+        id="sym:mod",
+        kind=SymbolKind.MODULE,
+        name="mod",
+        qualified_name="mod",
+    )
+    inner_child = CompactSymbol(
+        id="sym:inner",
+        kind=SymbolKind.LOCAL_FUNCTION,
+        name="inner",
+        lines="2-4",
+    )
+    same_ctx = SymbolContext(
+        focus_symbol=FocusSymbol(
+            id="sym:outer",
+            kind=SymbolKind.FUNCTION,
+            name="outer",
+            qualified_name="mod.outer",
+            start_line=1,
+            end_line=6,
+        ),
+        structural_parent=mod_parent,
+        structural_children=[inner_child],
+        lexical_parent=mod_parent,
+        lexical_children=[inner_child],
+        structural_summary=StructuralSummary(
+            scope=SymbolScope.MODULE,
+            structural_child_count=1,
+        ),
+    )
+    deduped = adapt_symbol_context(same_ctx)
     assert len(deduped["structural_children"]) == 1
     assert "lexical_children" not in deduped
     assert "lexical_parent" not in deduped
 
-    class DistinctChildrenCtx(SameChildrenCtx):
-        lexical_children = [
-            {"id": "sym:local_only", "kind": "local_function", "name": "loc", "lines": "3-4"}
-        ]
-
-    distinct = adapt_context(DistinctChildrenCtx())
-    assert "lexical_children" in distinct
+    distinct_ctx = same_ctx.model_copy(
+        update={
+            "lexical_children": [
+                CompactSymbol(
+                    id="sym:local_only",
+                    kind=SymbolKind.LOCAL_FUNCTION,
+                    name="loc",
+                    lines="3-4",
+                )
+            ]
+        }
+    )
+    distinct = adapt_symbol_context(distinct_ctx)
     assert [c["id"] for c in distinct["lexical_children"]] == ["sym:local_only"]
 
-    # End-to-end check on indexed local function + symlinked file source_error sanitization
     repo_root = tmp_path / "ctx_sec_repo"
     repo_root.mkdir()
     mod_file = repo_root / "mod.py"
@@ -662,66 +716,42 @@ def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_erro
     )
 
     db_path = tmp_path / "ctx_sec.db"
-    conn = get_connection(db_path)
-    try:
-        initialize_database(conn)
-        cfg = AppConfig()
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        upsert_files(conn, files)
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-        conn.commit()
-        outer_id = str(
-            conn.execute(
-                select(nodes_table.c.id).where(
-                    nodes_table.c.name == "outer",
-                    nodes_table.c.kind == "function",
-                )
-            ).scalar_one()
+    with IndexerEngine(AppConfig(db_path=db_path)) as engine:
+        engine.commands.index_repository(repo_root)
+        reg = McpToolRegistry(engine)
+        outer_id = engine.queries.get_symbol("outer").id
+        victim_id = engine.queries.get_symbol("victim").id
+
+        outer_res = json.loads(
+            asyncio.run(reg.call_tool("get_symbol_context", {"symbol": outer_id}))
         )
-        victim_id = str(
-            conn.execute(
-                select(nodes_table.c.id).where(
-                    nodes_table.c.name == "victim",
-                    nodes_table.c.kind == "function",
-                )
-            ).scalar_one()
+        outer_ctx = outer_res["data"]["context"]
+        assert [c["name"] for c in outer_ctx["structural_children"]] == ["inner"]
+        assert "lexical_children" not in outer_ctx
+
+        outside_secret = tmp_path / "outside_secret_target.py"
+        outside_secret.write_text("SECRET_TOKEN = 'xyz'\n", encoding="utf-8")
+        mod_file.unlink()
+        mod_file.symlink_to(outside_secret)
+
+        direct_ctx = engine.queries.get_symbol_context(
+            ContextQuery(symbol=victim_id, include_source=True)
         )
-    finally:
-        close_connection(conn)
-
-    outer_res = json.loads(asyncio.run(get_symbol_context(outer_id, db_path=db_path)))
-    assert outer_res["ok"] is True
-    outer_ctx = outer_res["data"]["context"]
-    assert [c["name"] for c in outer_ctx["structural_children"]] == ["inner"]
-    assert "lexical_children" not in outer_ctx
-
-    outside_secret = tmp_path / "outside_secret_target.py"
-    outside_secret.write_text("SECRET_TOKEN = 'xyz'\n", encoding="utf-8")
-    mod_file.unlink()
-    mod_file.symlink_to(outside_secret)
-
-    verify_conn = get_connection(db_path, read_only=True)
-    try:
-        direct_ctx = build_symbol_context(verify_conn, victim_id, include_source=True)
-        assert direct_ctx is not None
-        assert "source" not in direct_ctx.focus_symbol
-        direct_err = direct_ctx.focus_symbol.get("source_error", "")
+        assert direct_ctx.focus_symbol.source is None
+        direct_err = direct_ctx.focus_symbol.source_error or ""
         assert "Access denied" in direct_err
         assert str(outside_secret) not in direct_err
         assert "outside_secret_target.py" not in direct_err
-        assert str(repo_root) not in direct_err
-    finally:
-        close_connection(verify_conn)
 
-    mcp_res = json.loads(
-        asyncio.run(get_symbol_context(victim_id, include_source=True, db_path=db_path))
-    )
-    assert mcp_res["ok"] is True
-    mcp_focus = mcp_res["data"]["context"]["focus_symbol"]
-    assert "source" not in mcp_focus
-    assert "Access denied" in mcp_focus["source_error"]
-    assert str(outside_secret) not in mcp_focus["source_error"]
-    assert "outside_secret_target.py" not in mcp_focus["source_error"]
+        mcp_res = json.loads(
+            asyncio.run(
+                reg.call_tool(
+                    "get_symbol_context",
+                    {"symbol": victim_id, "include_source": True},
+                )
+            )
+        )
+        mcp_focus = mcp_res["data"]["context"]["focus_symbol"]
+        assert "source" not in mcp_focus
+        assert "Access denied" in mcp_focus["source_error"]
+        assert str(outside_secret) not in mcp_focus["source_error"]

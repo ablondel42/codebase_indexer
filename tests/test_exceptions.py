@@ -1,14 +1,14 @@
-"""Tests for the canonical ``repo_context.exceptions`` hierarchy."""
+"""Tests for the canonical ``core.models.exceptions`` hierarchy."""
 
 import pytest
 
-from repo_context.exceptions import (
+from core.models.exceptions import (
     DatabaseError,
     DatabaseNotFoundError,
+    IndexerError,
     LspError,
     ParseError,
     PathSecurityError,
-    RepoContextError,
     SymbolNotFoundError,
     ValidationError,
 )
@@ -17,7 +17,7 @@ from repo_context.exceptions import (
 @pytest.mark.parametrize(
     ("exc_cls", "expected_code"),
     [
-        (RepoContextError, "repo_context_error"),
+        (IndexerError, "indexer_error"),
         (ValidationError, "validation_error"),
         (DatabaseError, "database_error"),
         (DatabaseNotFoundError, "database_not_found"),
@@ -28,12 +28,12 @@ from repo_context.exceptions import (
     ],
 )
 def test_exception_defaults_and_inheritance(
-    exc_cls: type[RepoContextError],
+    exc_cls: type[IndexerError],
     expected_code: str,
 ) -> None:
-    """Every domain exception inherits from RepoContextError and defines error_code."""
+    """Every domain exception inherits from IndexerError and defines error_code."""
     err = exc_cls("something failed", {"key": "value"})
-    assert isinstance(err, RepoContextError)
+    assert isinstance(err, IndexerError)
     assert isinstance(err, Exception)
     assert err.message == "something failed"
     assert str(err) == "something failed"
@@ -43,15 +43,15 @@ def test_exception_defaults_and_inheritance(
 
 
 def test_database_not_found_is_database_error() -> None:
-    """DatabaseNotFoundError subclasses DatabaseError."""
+    """DatabaseNotFoundError subclasses DatabaseError and IndexerError."""
     err = DatabaseNotFoundError("missing db")
     assert isinstance(err, DatabaseError)
-    assert isinstance(err, RepoContextError)
+    assert isinstance(err, IndexerError)
 
 
 def test_custom_error_code_override() -> None:
     """Explicit error_code keyword overrides the class default."""
-    err = RepoContextError(
+    err = IndexerError(
         "ambiguous",
         {"candidates": ["a", "b"]},
         error_code="ambiguous_symbol",

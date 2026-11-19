@@ -1,1 +1,1 @@
-"""Tests for repo_context package."""
+"""Automated test suite for the Hexagonal codebase indexer packages."""

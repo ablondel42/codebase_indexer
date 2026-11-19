@@ -1,58 +1,48 @@
-"""Hermetic MCP server registration and CLI ``rc mcp-call`` integration tests."""
+"""Hermetic MCP server registration, ``stdio`` handshake, and ``rc mcp-call`` tests."""
 
 import asyncio
-import importlib.util
 import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp.types import CallToolResult, TextContent
 
-from repo_context.config import AppConfig
-from repo_context.mcp.errors import (
-    ERROR_AMBIGUOUS_SYMBOL,
-    ERROR_DATABASE_NOT_FOUND,
-    ERROR_SYMBOL_NOT_FOUND,
-)
-from repo_context.mcp.server import create_server
-from repo_context.mcp.tools import register_tools
-from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.scanner import scan_repository
-from repo_context.storage import (
-    close_connection,
-    get_connection,
-    initialize_database,
-    replace_file_graph,
-    upsert_files,
-    upsert_repo,
-)
+from core.models.config import AppConfig
+from engine.services.facade import IndexerEngine
+from mcp_server.models.errors import McpErrorCode
+from mcp_server.services.registry import McpToolRegistry
+from mcp_server.services.server import McpServerRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
 
 def _subprocess_env() -> dict[str, str]:
+    """Build subprocess environment with ``src/`` prioritized on ``PYTHONPATH``."""
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{existing}" if existing else str(SRC_DIR)
     return env
 
 
-class _FakeFastMCP:
-    """Lightweight FastMCP stub capturing tool registrations for integration tests."""
+class _FakeMcpServer:
+    """Lightweight ``.tool()`` stub capturing registered MCP tool functions."""
 
     def __init__(self) -> None:
+        """Initialize an empty tool registry map."""
         self.tools: dict[str, Callable[..., Any]] = {}
 
     def tool(
-        self, name: str | None = None
+        self,
+        name: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Bind ``fn`` into ``self.tools``."""
+
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self.tools[name or fn.__name__] = fn
             return fn
@@ -61,8 +51,8 @@ class _FakeFastMCP:
 
 
 @pytest.fixture
-def indexed_integration_db(tmp_path: Path) -> tuple[Path, Path, str]:
-    """Create and index a sample repository in ``tmp_path``."""
+def indexed_integration_db(tmp_path: Path) -> Iterator[tuple[Path, Path, str, IndexerEngine]]:
+    """Create and index a two-module sample repository inside ``tmp_path``."""
     repo_root = tmp_path / "integration_repo"
     repo_root.mkdir()
     (repo_root / "alpha.py").write_text(
@@ -87,50 +77,39 @@ def indexed_integration_db(tmp_path: Path) -> tuple[Path, Path, str]:
     )
 
     db_path = tmp_path / "integration.db"
-    conn = get_connection(db_path)
+    engine = IndexerEngine(AppConfig(db_path=db_path))
     try:
-        initialize_database(conn)
-        cfg = AppConfig()
-        repo, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo)
-        upsert_files(conn, files)
-        for rec in files:
-            nodes, edges, _ = extract_file_graph(repo.id, rec, repo_root, config=cfg)
-            replace_file_graph(conn, rec.id, nodes, edges)
-        resolve_repo_edges(conn, repo.id)
-        conn.commit()
+        res = engine.commands.index_repository(repo_root)
+        yield db_path, repo_root, res.repo.id, engine
     finally:
-        close_connection(conn)
-
-    return db_path, repo_root, repo.id
+        engine.close()
 
 
-def test_registered_tools_integration_flow(indexed_integration_db: tuple[Path, Path, str]) -> None:
-    """Registered MCP tools work end-to-end via real MCP server (if installed) and stub."""
-    db_path, _, repo_id = indexed_integration_db
-    if importlib.util.find_spec("mcp") is not None:
-        mcp_obj = create_server(db_path=db_path)
-        if hasattr(mcp_obj, "list_tools"):
-            listed = asyncio.run(mcp_obj.list_tools())
-            assert {t.name for t in listed} == {
-                "get_repo_overview",
-                "list_files",
-                "get_file_outline",
-                "search_symbols",
-                "get_symbol_source",
-                "get_symbol_context",
-                "get_symbol_references",
-                "analyze_risk",
-            }
-        if hasattr(mcp_obj, "call_tool"):
-            call_res = asyncio.run(mcp_obj.call_tool("get_repo_overview", {}))
-            assert isinstance(call_res, CallToolResult)
-            first_block = call_res.content[0]
-            assert isinstance(first_block, TextContent)
-            assert json.loads(first_block.text)["data"]["repo"]["id"] == repo_id
+def test_real_mcp_server_list_and_call_tool(
+    indexed_integration_db: tuple[Path, Path, str, IndexerEngine],
+) -> None:
+    """``McpServerRunner.create_server`` exposes all 8 tools on a real ``MCPServer``."""
+    db_path, _, repo_id, engine = indexed_integration_db
+    runner = McpServerRunner(engine.config, engine=engine)
+    mcp_obj = runner.create_server(db_path=db_path)
 
-    fake = _FakeFastMCP()
-    register_tools(fake, db_path=db_path)
+    listed = asyncio.run(mcp_obj.list_tools())
+    assert {tool.name for tool in listed} == set(McpToolRegistry.TOOL_NAMES)
+
+    call_res = asyncio.run(mcp_obj.call_tool("get_repo_overview", {}))
+    assert isinstance(call_res, CallToolResult)
+    first_block = call_res.content[0]
+    assert isinstance(first_block, TextContent)
+    assert json.loads(first_block.text)["data"]["repo"]["id"] == repo_id
+
+
+def test_bound_tools_stub_flow(
+    indexed_integration_db: tuple[Path, Path, str, IndexerEngine],
+) -> None:
+    """``McpToolRegistry.bind`` wires all 8 tools and structured error envelopes cleanly."""
+    db_path, _, repo_id, engine = indexed_integration_db
+    fake = _FakeMcpServer()
+    McpToolRegistry(engine).bind(fake, db_path=db_path)
     tools = fake.tools
 
     ov = json.loads(asyncio.run(tools["get_repo_overview"]()))
@@ -159,18 +138,53 @@ def test_registered_tools_integration_flow(indexed_integration_db: tuple[Path, P
     assert risk_res["data"]["risk"]["facts"]["cross_module_impact"] is True
 
     ambig = json.loads(asyncio.run(tools["get_symbol_context"]("shared")))
-    assert ambig["error"]["code"] == ERROR_AMBIGUOUS_SYMBOL
+    assert ambig["error"]["code"] == McpErrorCode.AMBIGUOUS_SYMBOL
 
     missing = json.loads(asyncio.run(tools["get_symbol_source"]("does_not_exist")))
-    assert missing["error"]["code"] == ERROR_SYMBOL_NOT_FOUND
+    assert missing["error"]["code"] == McpErrorCode.SYMBOL_NOT_FOUND
+
+
+def test_cli_serve_stdio_initialize_handshake(tmp_path: Path) -> None:
+    """``python -m cli.main serve`` completes an MCP ``initialize`` handshake cleanly on stdio."""
+    unindexed_db = tmp_path / "serve_check.db"
+    init_request = (
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "integration-test", "version": "0.2.0"},
+                },
+            }
+        )
+        + "\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "cli.main", "serve", "--db-path", str(unindexed_db), "--debug"],
+        input=init_request,
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=_subprocess_env(),
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    response = json.loads(proc.stdout.strip())
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["result"]["serverInfo"]["name"] == "repo-context-mcp"
+    assert not unindexed_db.exists()
 
 
 def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
-    indexed_integration_db: tuple[Path, Path, str],
+    indexed_integration_db: tuple[Path, Path, str, IndexerEngine],
     tmp_path: Path,
 ) -> None:
-    """`rc mcp-call` executes all 8 MCP tools and missing --db-path creates zero files."""
-    db_path, _, _ = indexed_integration_db
+    """``python -m cli.main mcp-call`` runs all 8 tools and creates zero files on missing DB."""
+    db_path, _, _, _ = indexed_integration_db
     env = _subprocess_env()
 
     calls = [
@@ -188,7 +202,7 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
             [
                 sys.executable,
                 "-m",
-                "repo_context.cli.main",
+                "cli.main",
                 "mcp-call",
                 tool_name,
                 json_args,
@@ -212,7 +226,7 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
         [
             sys.executable,
             "-m",
-            "repo_context.cli.main",
+            "cli.main",
             "mcp-call",
             "get_repo_overview",
             "--db-path",
@@ -225,16 +239,16 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
     )
     assert err_proc.returncode == 1
     err_payload = json.loads(err_proc.stdout)
-    assert err_payload["result"]["error"]["code"] == ERROR_DATABASE_NOT_FOUND
+    assert err_payload["result"]["error"]["code"] == McpErrorCode.DATABASE_NOT_FOUND
     assert not missing_db.exists()
 
 
 def test_cli_mcp_call_shorthand_and_key_value_args(
-    indexed_integration_db: tuple[Path, Path, str],
+    indexed_integration_db: tuple[Path, Path, str, IndexerEngine],
     tmp_path: Path,
 ) -> None:
-    """`rc mcp-call` accepts shorthand args, key=value pairs, and unquoted JSON."""
-    db_path, _, _ = indexed_integration_db
+    """``python -m cli.main mcp-call`` accepts shorthand args, ``key=value``, and unquoted JSON."""
+    db_path, _, _, _ = indexed_integration_db
     env = _subprocess_env()
 
     shorthand_cases = [
@@ -252,7 +266,7 @@ def test_cli_mcp_call_shorthand_and_key_value_args(
             [
                 sys.executable,
                 "-m",
-                "repo_context.cli.main",
+                "cli.main",
                 "mcp-call",
                 *extra_args,
                 "--db-path",
@@ -272,7 +286,7 @@ def test_cli_mcp_call_shorthand_and_key_value_args(
         [
             sys.executable,
             "-m",
-            "repo_context.cli.main",
+            "cli.main",
             "mcp-call",
             "get_symbol_context",
             "{bad_json",

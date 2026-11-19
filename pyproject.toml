@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-rc = "repo_context.cli.main:main"
+rc = "cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

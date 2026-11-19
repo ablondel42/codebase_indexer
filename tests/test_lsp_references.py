@@ -1,66 +1,68 @@
-"""Tests for LSP client, session pool, UTF-16 mapping, and reference enrichment (v0.2.0)."""
+"""Tests for LSP client, session pool, UTF-16 mapping, framing, and reference enrichment."""
 
 import json
 import os
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.engine import Connection
 
-import repo_context.lsp.client as lsp_client_mod
-from repo_context.config import AppConfig
-from repo_context.constants import EDGE_KIND_REFERENCES
-from repo_context.exceptions import LspError, PathSecurityError
-from repo_context.graph.references import build_reference_stats, list_symbol_reference_edges
-from repo_context.lsp import LspSessionPool, PyrightLspClient
-from repo_context.lsp.mapper import (
-    codepoint_offset_to_utf16,
+from core.models import (
+    AST_DEPENDENCY_EDGE_KINDS,
+    AppConfig,
+    DirectedEdgeQuery,
+    EdgeKind,
+    FileRecord,
+    LspError,
+    PathSecurityError,
+    Position,
+    Range,
+    ReferenceRefreshState,
+    RefreshStatus,
+    RepoRecord,
+    SymbolKind,
+    SymbolNode,
+)
+from core.utils.hashing import sha256_file
+from graph import ReferenceAnalyzer
+from lsp import (
+    LspClientOptions,
+    LspSessionPool,
+    PyrightLspClient,
+    ReferenceEnricher,
+)
+from lsp.utils.framing import (
+    encode_jsonrpc_message,
+    parse_content_length_header,
+    parse_header_line,
+)
+from lsp.utils.locations import (
+    build_reference_edge,
+    extract_uri_candidates,
     find_module_node_for_file,
+    get_reference_query_position,
     normalize_location,
     pick_smallest_containing_symbol,
+    range_contains,
+)
+from lsp.utils.utf16 import (
+    codepoint_offset_to_utf16,
     position_codepoint_to_utf16,
     position_utf16_to_codepoint,
-    range_contains,
     range_utf16_to_codepoint,
     utf16_offset_to_codepoint,
 )
-from repo_context.lsp.references import (
-    build_reference_edge,
-    enrich_references_for_symbol,
-    replace_reference_edges_for_target,
-)
-from repo_context.lsp.resolver import get_reference_query_position, resolve_file_by_uri
-from repo_context.models.file import FileRecord
-from repo_context.models.repo import RepoRecord
-from repo_context.parsing.hashing import sha256_file
-from repo_context.parsing.linker import resolve_repo_edges
-from repo_context.parsing.pipeline import extract_file_graph
-from repo_context.parsing.scanner import scan_repository
-from repo_context.storage import (
-    close_connection,
-    files_table,
-    get_connection,
-    initialize_database,
-    nodes_table,
-    replace_file_graph,
-    upsert_files,
-    upsert_nodes,
-    upsert_repo,
-)
+from parsing import AstExtractionPipeline, RepoScanner, SymbolLinker
+from storage import SqlUnitOfWorkFactory
 
 
 @pytest.fixture
-def lsp_db(tmp_path: Path) -> Iterator[tuple[Connection, Path]]:
-    """Yield an initialized v2 SQLite connection and temp directory."""
-    conn = get_connection(tmp_path / "lsp.db")
-    try:
-        initialize_database(conn)
-        yield conn, tmp_path
-    finally:
-        close_connection(conn)
+def uow_factory(tmp_path: Path) -> SqlUnitOfWorkFactory:
+    """Create and initialize a SQLite UnitOfWorkFactory for LSP tests."""
+    factory = SqlUnitOfWorkFactory(tmp_path / "lsp.db")
+    with factory.open(initialize=True):
+        pass
+    return factory
 
 
 def _write_fake_lsp_server(path: Path, body: str) -> Path:
@@ -89,10 +91,11 @@ def _write_fake_lsp_server(path: Path, body: str) -> Path:
     return path
 
 
-class TestMapperAndUtf16Conversions:
-    """Tests for UTF-16 <-> Python codepoint mapping and range containment."""
+class TestMapperUtf16AndFraming:
+    """Tests for UTF-16 <-> Python codepoint mapping, containment, and wire framing."""
 
     def test_utf16_codepoint_roundtrip_with_supplementary_emoji(self) -> None:
+        """Emoji supplementary plane characters convert cleanly between UTF-16 and codepoints."""
         line = "msg = '😀'; target()"
         cp_target = line.index("target")
         utf16_target = codepoint_offset_to_utf16(line, cp_target)
@@ -102,37 +105,61 @@ class TestMapperAndUtf16Conversions:
         assert utf16_target == 12
         assert utf16_offset_to_codepoint(line, utf16_target) == cp_target
 
-        pos = position_codepoint_to_utf16([line], {"line": 0, "character": cp_target})
-        assert pos == {"line": 0, "character": 12}
-        assert position_utf16_to_codepoint([line], pos) == {"line": 0, "character": cp_target}
+        pos = position_codepoint_to_utf16([line], Position(line=0, character=cp_target))
+        assert pos == Position(line=0, character=12)
+        assert position_utf16_to_codepoint([line], pos) == Position(line=0, character=cp_target)
 
         rng = range_utf16_to_codepoint(
             [line],
-            {"start": {"line": 0, "character": 12}, "end": {"line": 0, "character": 18}},
+            Range(
+                start=Position(line=0, character=12),
+                end=Position(line=0, character=18),
+            ),
         )
-        assert line[rng["start"]["character"] : rng["end"]["character"]] == "target"
+        assert line[rng.start.character : rng.end.character] == "target"
 
     def test_range_contains_and_pick_smallest_prefers_non_module_on_tie(self) -> None:
-        outer = {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}}
-        inner = {"start": {"line": 5, "character": 0}, "end": {"line": 6, "character": 0}}
+        """pick_smallest_containing_symbol prefers non-module symbols on exact span ties."""
+        outer = Range(start=Position(line=0, character=0), end=Position(line=10, character=0))
+        inner = Range(start=Position(line=5, character=0), end=Position(line=6, character=0))
         assert range_contains(outer, inner) is True
         assert range_contains(inner, outer) is False
 
-        symbols = [
-            {"id": "sym:mod", "kind": "module", "range_json": outer},
-            {"id": "sym:fn", "kind": "function", "range_json": outer},
-        ]
-        picked = pick_smallest_containing_symbol(symbols, outer)
-        assert picked is not None and picked["id"] == "sym:fn"
-        mod_node = find_module_node_for_file(symbols)
-        assert mod_node is not None and mod_node["id"] == "sym:mod"
+        mod_sym = SymbolNode(
+            id="sym:mod",
+            repo_id="repo:r",
+            file_id="file:r:a.py",
+            kind=SymbolKind.MODULE,
+            name="a",
+            qualified_name="a",
+            uri="file:///a.py",
+            decl_range=outer,
+        )
+        fn_sym = SymbolNode(
+            id="sym:fn",
+            repo_id="repo:r",
+            file_id="file:r:a.py",
+            kind=SymbolKind.FUNCTION,
+            name="fn",
+            qualified_name="a.fn",
+            uri="file:///a.py",
+            decl_range=outer,
+        )
+        picked = pick_smallest_containing_symbol([mod_sym, fn_sym], outer)
+        assert picked is not None and picked.id == "sym:fn"
+        mod_node = find_module_node_for_file([mod_sym, fn_sym])
+        assert mod_node is not None and mod_node.id == "sym:mod"
 
-    def test_normalize_location_location_and_location_link(self) -> None:
+    def test_normalize_location_and_framing_helpers(self) -> None:
+        """normalize_location handles Location/LocationLink and framing enforces bounds."""
         loc = {
             "uri": "file:///a.py",
             "range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 5}},
         }
-        assert normalize_location(loc) == loc
+        norm_loc = normalize_location(loc)
+        assert norm_loc is not None
+        assert norm_loc.uri == "file:///a.py"
+        assert norm_loc.range.start == Position(line=1, character=2)
 
         link = {
             "targetUri": "file:///b.py",
@@ -141,37 +168,58 @@ class TestMapperAndUtf16Conversions:
                 "end": {"line": 3, "character": 9},
             },
         }
-        assert normalize_location(link)["uri"] == "file:///b.py"
-        assert normalize_location(link)["range"]["start"] == {"line": 3, "character": 4}
+        norm_link = normalize_location(link)
+        assert norm_link is not None
+        assert norm_link.uri == "file:///b.py"
+        assert norm_link.range.start == Position(line=3, character=4)
+        assert normalize_location({"uri": ""}) is None
+
+        framed = encode_jsonrpc_message({"jsonrpc": "2.0", "id": 1}, max_payload_bytes=256)
+        hdr_line, rest = framed.split(b"\r\n", 1)
+        key, val = parse_header_line(hdr_line)
+        assert key == "content-length"
+        assert parse_content_length_header({key: val}, max_payload_bytes=256) == len(
+            rest.removeprefix(b"\r\n")
+        )
+        with pytest.raises(LspError):
+            encode_jsonrpc_message({"big": "x" * 100}, max_payload_bytes=16)
 
 
 class TestResolverAndPosition:
-    """Tests for ``get_reference_query_position`` and ``resolve_file_by_uri``."""
+    """Tests for ``get_reference_query_position`` and URI candidate resolution."""
 
     def test_query_position_preference_and_missing(self) -> None:
-        sym = {
-            "id": "sym:1",
-            "selection_range_json": {
-                "start": {"line": 2, "character": 4},
-                "end": {"line": 2, "character": 8},
-            },
-            "range_json": {
-                "start": {"line": 1, "character": 0},
-                "end": {"line": 5, "character": 0},
-            },
-        }
-        assert get_reference_query_position(sym) == {"line": 2, "character": 4}
-        sym["selection_range_json"] = None
-        assert get_reference_query_position(sym) == {"line": 1, "character": 0}
-        sym["range_json"] = None
-        with pytest.raises(ValueError, match="no stored range"):
-            get_reference_query_position(sym)
+        """Prefers selection_range.start, falls back to decl_range, raises LspError if missing."""
+        sym = SymbolNode(
+            id="sym:1",
+            repo_id="repo:r",
+            file_id="file:r:a.py",
+            kind=SymbolKind.FUNCTION,
+            name="f",
+            qualified_name="a.f",
+            uri="file:///a.py",
+            selection_range=Range(
+                start=Position(line=2, character=4),
+                end=Position(line=2, character=8),
+            ),
+            decl_range=Range(
+                start=Position(line=1, character=0),
+                end=Position(line=5, character=0),
+            ),
+        )
+        assert get_reference_query_position(sym) == Position(line=2, character=4)
+        no_sel = sym.model_copy(update={"selection_range": None})
+        assert get_reference_query_position(no_sel) == Position(line=1, character=0)
+        no_rng = no_sel.model_copy(update={"decl_range": None})
+        with pytest.raises(LspError, match="no stored range"):
+            get_reference_query_position(no_rng)
 
     def test_resolve_file_by_uri_percent_decoding_and_symlinked_root(
         self,
-        lsp_db: tuple[Connection, Path],
+        uow_factory: SqlUnitOfWorkFactory,
+        tmp_path: Path,
     ) -> None:
-        conn, tmp_path = lsp_db
+        """Percent-encoded spaces and symlinked root URIs resolve to the tracked FileRecord."""
         real_root = tmp_path / "real_repo"
         real_root.mkdir()
         target = real_root / "my file.py"
@@ -180,57 +228,51 @@ class TestResolverAndPosition:
         symlink_root.symlink_to(real_root)
 
         repo_id = "repo:real_repo:12345678"
-        upsert_repo(
-            conn,
-            RepoRecord(
-                id=repo_id,
-                root_path=str(real_root),
-                name="real_repo",
-                created_at="2026-01-01T00:00:00Z",
-            ),
-        )
-        upsert_files(
-            conn,
-            [
-                FileRecord(
-                    id=f"file:{repo_id}:my file.py",
-                    repo_id=repo_id,
-                    file_path="my file.py",
-                    uri=target.resolve().as_uri(),
-                    module_path="my file",
-                    content_hash=sha256_file(target),
-                    size_bytes=target.stat().st_size,
-                    last_modified_at="2026-01-01T00:00:00Z",
+        with uow_factory.open() as uow:
+            uow.repos.upsert(
+                RepoRecord(
+                    id=repo_id,
+                    root_path=str(real_root),
+                    name="real_repo",
+                    created_at="2026-01-01T00:00:00Z",
                 )
-            ],
-        )
-        conn.commit()
+            )
+            uow.files.upsert_many(
+                [
+                    FileRecord(
+                        id=f"file:{repo_id}:my file.py",
+                        repo_id=repo_id,
+                        file_path="my file.py",
+                        uri=target.resolve().as_uri(),
+                        module_path="my file",
+                        content_hash=sha256_file(target),
+                        size_bytes=target.stat().st_size,
+                        last_modified_at="2026-01-01T00:00:00Z",
+                    )
+                ]
+            )
 
-        # Percent-encoded space and symlinked root URI both resolve to the file row
         via_symlink_uri = (symlink_root / "my file.py").as_uri()
-        resolved = resolve_file_by_uri(conn, via_symlink_uri, repo_id=repo_id)
-        assert resolved is not None
-        assert resolved["id"] == f"file:{repo_id}:my file.py"
+        candidates, resolved_path = extract_uri_candidates(via_symlink_uri)
+        assert resolved_path == target.resolve()
+        assert len(candidates) >= 2
+
+        with uow_factory.open(read_only=True) as ro_uow:
+            resolved = ro_uow.files.resolve_by_uri(via_symlink_uri, repo_id=repo_id)
+            assert resolved is not None
+            assert resolved.id == f"file:{repo_id}:my file.py"
 
 
 class TestReferenceEdgePersistenceAndStats:
-    """Tests for transactional edge replacement, single JSON encoding, and AST fallback."""
+    """Tests for transactional LSP edge replacement, single JSON encoding, and AST fallback."""
 
     def test_replace_reference_edges_single_json_and_savepoint_safety(
         self,
-        lsp_db: tuple[Connection, Path],
+        uow_factory: SqlUnitOfWorkFactory,
+        tmp_path: Path,
     ) -> None:
-        conn, tmp_path = lsp_db
+        """replace_lsp_references_for_target stores single JSON and switches stats to LSP."""
         repo_id = "repo:test:12345678"
-        upsert_repo(
-            conn,
-            RepoRecord(
-                id=repo_id,
-                root_path=str(tmp_path),
-                name="test",
-                created_at="2026-01-01T00:00:00Z",
-            ),
-        )
         file_rec = FileRecord(
             id=f"file:{repo_id}:a.py",
             repo_id=repo_id,
@@ -241,88 +283,90 @@ class TestReferenceEdgePersistenceAndStats:
             size_bytes=10,
             last_modified_at="2026-01-01T00:00:00Z",
         )
-        upsert_files(conn, [file_rec])
         target_id = f"sym:{repo_id}:function:a.target"
         caller_id = f"sym:{repo_id}:function:a.caller"
-        upsert_nodes(
-            conn,
-            [
-                {
-                    "id": target_id,
-                    "repo_id": repo_id,
-                    "file_id": file_rec.id,
-                    "kind": "function",
-                    "name": "target",
-                    "qualified_name": "a.target",
-                    "uri": file_rec.uri,
-                },
-                {
-                    "id": caller_id,
-                    "repo_id": repo_id,
-                    "file_id": file_rec.id,
-                    "kind": "function",
-                    "name": "caller",
-                    "qualified_name": "a.caller",
-                    "uri": file_rec.uri,
-                },
-            ],
-        )
-        conn.commit()
-
-        # Prior to LSP refresh, build_reference_stats uses AST fallback
-        pre_stats = build_reference_stats(conn, target_id)
-        assert pre_stats["available"] is False
-        assert pre_stats["reference_source"] == "ast"
-
-        edge = build_reference_edge(
+        target_node = SymbolNode(
+            id=target_id,
             repo_id=repo_id,
-            from_id=caller_id,
-            to_id=target_id,
-            confidence=0.9,
-            evidence_file_id=file_rec.id,
-            evidence_uri=file_rec.uri,
-            evidence_range_json={
-                "start": {"line": 2, "character": 4},
-                "end": {"line": 2, "character": 10},
-            },
-            payload_json={"mapping_mode": "exact_symbol"},
+            file_id=file_rec.id,
+            kind=SymbolKind.FUNCTION,
+            name="target",
+            qualified_name="a.target",
+            uri=file_rec.uri,
         )
-        refresh_meta = {
-            "target_symbol_id": target_id,
-            "available": True,
-            "last_refreshed_at": "2026-01-02T00:00:00Z",
-            "refresh_status": "ok",
-            "error_code": None,
-        }
+        caller_node = SymbolNode(
+            id=caller_id,
+            repo_id=repo_id,
+            file_id=file_rec.id,
+            kind=SymbolKind.FUNCTION,
+            name="caller",
+            qualified_name="a.caller",
+            uri=file_rec.uri,
+        )
+        analyzer = ReferenceAnalyzer()
 
-        # Run inside an active transaction to exercise SAVEPOINT path
-        conn.execute(select(1))
-        replace_reference_edges_for_target(conn, target_id, [edge], refresh_meta)
-        conn.commit()
-
-        raw_row = (
-            conn.exec_driver_sql(
-                "SELECT payload_json, evidence_range_json FROM edges WHERE id = ?",
-                (edge["id"],),
+        with uow_factory.open() as uow:
+            uow.repos.upsert(
+                RepoRecord(
+                    id=repo_id,
+                    root_path=str(tmp_path),
+                    name="test",
+                    created_at="2026-01-01T00:00:00Z",
+                )
             )
-            .mappings()
-            .one()
+            uow.files.upsert_many([file_rec])
+            uow.nodes.upsert_many([target_node, caller_node])
+
+            pre_stats = analyzer.build_stats(uow, target_id)
+            assert pre_stats.available is False
+            assert pre_stats.reference_source == "ast"
+
+            edge = build_reference_edge(
+                repo_id=repo_id,
+                target=target_node,
+                source=caller_node,
+                file_id=file_rec.id,
+                evidence_uri=file_rec.uri,
+                usage_range=Range(
+                    start=Position(line=2, character=4),
+                    end=Position(line=2, character=10),
+                ),
+            )
+            uow.edges.replace_lsp_references_for_target(repo_id, target_id, [edge])
+            uow.refresh.upsert(
+                ReferenceRefreshState(
+                    target_symbol_id=target_id,
+                    available=True,
+                    last_refreshed_at="2026-01-02T00:00:00Z",
+                    refresh_status=RefreshStatus.OK,
+                )
+            )
+
+            post_stats = analyzer.build_stats(uow, target_id)
+            assert post_stats.available is True
+            assert post_stats.reference_source == "lsp"
+            assert post_stats.reference_count == 1
+            directed = uow.edges.list_directed(
+                DirectedEdgeQuery(symbol_id=target_id, direction="incoming")
+            )
+            assert len(directed) == 1
+
+        raw_res = uow_factory.execute_readonly_sql(
+            f"SELECT payload_json, evidence_range_json FROM edges WHERE id = '{edge.id}'"
         )
+        raw_row = raw_res.rows[0]
         assert isinstance(json.loads(raw_row["payload_json"]), dict)
         assert isinstance(json.loads(raw_row["evidence_range_json"]), dict)
-
-        post_stats = build_reference_stats(conn, target_id)
-        assert post_stats["available"] is True
-        assert post_stats["reference_source"] == "lsp"
-        assert post_stats["reference_count"] == 1
-        assert len(list_symbol_reference_edges(conn, target_id, direction="incoming")) == 1
 
 
 class TestPyrightLspClientSubprocessProtocol:
     """Mocked subprocess protocol tests for ``PyrightLspClient`` and ``LspSessionPool``."""
 
     def test_missing_executable_raises_lsp_error(self, tmp_path: Path) -> None:
-        client = PyrightLspClient(["definitely_missing_lsp_binary_xyz"])
+        """Unresolvable server_cmd executable raises LspError."""
+        client = PyrightLspClient(
+            LspClientOptions(server_cmd=("definitely_missing_lsp_binary_xyz",))
+        )
         with pytest.raises(LspError, match="not found"):
             client.start(tmp_path)
 
@@ -363,12 +407,19 @@ while True:
 """,
         )
 
-        with PyrightLspClient([sys.executable, "-u", str(server_script)], timeout=5.0) as client:
+        opts = LspClientOptions(
+            server_cmd=(sys.executable, "-u", str(server_script)),
+            request_timeout_seconds=5.0,
+        )
+        with PyrightLspClient(opts) as client:
             client.start(tmp_path)
             assert client.is_running is True
             assert len(client.stderr_lines) == 200
             assert "stderr flood line 349" in client.stderr_lines[-1]
-            refs = client.find_references((tmp_path / "a.py").as_uri(), 0, 0)
+            refs = client.find_references(
+                (tmp_path / "a.py").as_uri(),
+                Position(line=0, character=0),
+            )
             assert refs == []
 
         replies = json.loads(log_file.read_text(encoding="utf-8"))
@@ -393,24 +444,21 @@ while True:
 """,
         )
 
-        with PyrightLspClient(
-            [sys.executable, "-u", str(server_script)],
-            timeout=5.0,
+        opts = LspClientOptions(
+            server_cmd=(sys.executable, "-u", str(server_script)),
+            request_timeout_seconds=5.0,
             max_payload_bytes=512,
-        ) as client:
+        )
+        with PyrightLspClient(opts) as client:
             client.start(tmp_path)
             with pytest.raises(LspError, match="max_lsp_payload_bytes"):
-                client.find_references((tmp_path / "a.py").as_uri(), 0, 0)
+                client.find_references(
+                    (tmp_path / "a.py").as_uri(),
+                    Position(line=0, character=0),
+                )
 
-    def test_timeout_and_zombie_free_kill_close(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    def test_timeout_and_zombie_free_kill_close(self, tmp_path: Path) -> None:
         """Hung request times out with LspError and close() kills/reaps SIGTERM-ignoring server."""
-        monkeypatch.setattr(lsp_client_mod, "SHUTDOWN_TIMEOUT_SECONDS", 0.2)
-        monkeypatch.setattr(lsp_client_mod, "TERMINATE_WAIT_SECONDS", 0.2)
-
         server_script = _write_fake_lsp_server(
             tmp_path / "hung_lsp.py",
             """
@@ -429,15 +477,24 @@ while True:
 """,
         )
 
-        client = PyrightLspClient([sys.executable, "-u", str(server_script)], timeout=0.3)
+        opts = LspClientOptions(
+            server_cmd=(sys.executable, "-u", str(server_script)),
+            request_timeout_seconds=0.3,
+            shutdown_timeout_seconds=0.2,
+            terminate_wait_seconds=0.2,
+        )
+        client = PyrightLspClient(opts)
         client.start(tmp_path)
-        assert client.proc is not None
-        pid = client.proc.pid
+        assert client.pid is not None
+        pid = client.pid
         with pytest.raises(LspError, match="timed out"):
-            client.find_references((tmp_path / "a.py").as_uri(), 0, 0)
+            client.find_references(
+                (tmp_path / "a.py").as_uri(),
+                Position(line=0, character=0),
+            )
 
         client.close()
-        assert client.proc is None
+        assert client.pid is None
         assert client.is_running is False
         # Process was reaped by wait(); waitpid must raise ChildProcessError
         with pytest.raises(ChildProcessError):
@@ -445,10 +502,10 @@ while True:
 
     def test_lsp_session_pool_caches_by_resolved_root_and_enriches_utf16_references(
         self,
-        lsp_db: tuple[Connection, Path],
+        uow_factory: SqlUnitOfWorkFactory,
+        tmp_path: Path,
     ) -> None:
         """LspSessionPool caches sessions, tracks didOpen/didChange, and enriches UTF-16 refs."""
-        conn, tmp_path = lsp_db
         repo_root = tmp_path / "real_project"
         repo_root.mkdir()
         target_py = repo_root / "defs.py"
@@ -459,29 +516,32 @@ while True:
             encoding="utf-8",
         )
 
-        # Index repo into DB
         cfg = AppConfig()
-        repo_rec, files = scan_repository(repo_root, cfg)
-        upsert_repo(conn, repo_rec)
-        upsert_files(conn, files)
-        for f in files:
-            nodes, edges, _ = extract_file_graph(repo_rec.id, f, repo_root, config=cfg)
-            replace_file_graph(conn, f.id, nodes, edges)
-        resolve_repo_edges(conn, repo_rec.id)
-        conn.commit()
+        scan_report = RepoScanner(cfg).scan_repository(repo_root)
+        pipeline = AstExtractionPipeline(cfg)
+        linker = SymbolLinker()
 
-        target_row = (
-            conn.execute(
-                select(nodes_table, files_table.c.file_path)
-                .select_from(
-                    nodes_table.join(files_table, files_table.c.id == nodes_table.c.file_id)
-                )
-                .where(nodes_table.c.name == "target", nodes_table.c.kind == "function")
+        with uow_factory.open() as uow:
+            uow.repos.upsert(scan_report.repo)
+            for f in scan_report.files:
+                ext = pipeline.extract_file(repo_root, f)
+                uow.replace_file_graph(f, ext.nodes, ext.edges)
+            nodes = uow.nodes.list_for_repo(scan_report.repo.id)
+            cand_edges = uow.edges.list_for_repo(
+                scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
             )
-            .mappings()
-            .one()
-        )
-        target_sym = dict(target_row)
+            link_res = linker.resolve(
+                scan_report.repo.id, scan_report.repo.name, nodes, cand_edges
+            )
+            uow.edges.update_resolved_targets(link_res.updates)
+
+        with uow_factory.open(read_only=True) as ro_uow:
+            target_node = ro_uow.nodes.get_by_qualified_name(
+                scan_report.repo.id, "defs.target", kind=SymbolKind.FUNCTION
+            )
+            assert target_node is not None
+            target_sym = ro_uow.nodes.get_summary_by_id(target_node.id)
+            assert target_sym is not None
 
         caller_line = caller_py.read_text(encoding="utf-8").splitlines()[3]
         cp_start = caller_line.index("target")
@@ -516,31 +576,39 @@ while True:
 
         symlink_root = tmp_path / "symlink_project"
         symlink_root.symlink_to(repo_root)
+        enricher = ReferenceEnricher(cfg)
+        opts = LspClientOptions(server_cmd=(sys.executable, "-u", str(server_script)))
 
-        with LspSessionPool([sys.executable, "-u", str(server_script)]) as pool:
-            c1 = pool.get_or_start(repo_root)
-            c2 = pool.get_or_start(symlink_root)
+        with LspSessionPool(opts, config=cfg) as pool:
+            c1 = pool.acquire(repo_root)
+            c2 = pool.acquire(symlink_root)
             assert c1 is c2
             assert len(starts_file.read_text(encoding="utf-8").splitlines()) == 1
 
-            stats = enrich_references_for_symbol(conn, c1, target_sym)
-            assert stats["available"] is True
-            assert stats["reference_count"] == 1
+            with uow_factory.open() as uow:
+                result = enricher.enrich_symbol(uow, c1, target_sym)
+                assert result.available is True
+                assert result.reference_count == 1
+                assert result.refresh_status == RefreshStatus.OK
 
-            # Check UTF-16 -> codepoint conversion stored exact codepoint column
-            stored_edges = list_symbol_reference_edges(
-                conn, target_sym["id"], direction="incoming", kinds=[EDGE_KIND_REFERENCES]
-            )
-            assert len(stored_edges) == 1
-            assert stored_edges[0]["evidence_range_json"]["start"]["character"] == cp_start
+                stored_edges = uow.edges.list_directed(
+                    DirectedEdgeQuery(
+                        symbol_id=target_sym.id,
+                        direction="incoming",
+                        kinds=(EdgeKind.REFERENCES,),
+                    )
+                )
+                assert len(stored_edges) == 1
+                assert stored_edges[0].evidence_range is not None
+                assert stored_edges[0].evidence_range.start.character == cp_start
 
-            # enrich_references_for_symbol opened target_py at version 1; caller_py is unseen
-            assert c1._document_versions[target_py.resolve().as_uri()] == 1
+            assert isinstance(c1, PyrightLspClient)
+            assert c1.document_version(target_py.resolve().as_uri()) == 1
             caller_uri = caller_py.resolve().as_uri()
             pool.notify_did_open_or_change(repo_root, caller_uri, "x = 1\n")
-            assert c1._document_versions[caller_uri] == 1
+            assert c1.document_version(caller_uri) == 1
             pool.notify_did_open_or_change(repo_root, caller_uri, "x = 2\n")
-            assert c1._document_versions[caller_uri] == 2
+            assert c1.document_version(caller_uri) == 2
 
             outside = tmp_path / "outside.py"
             outside.write_text("SECRET = 1\n", encoding="utf-8")
@@ -548,6 +616,6 @@ while True:
             with pytest.raises(PathSecurityError):
                 pool.notify_did_open_or_change(repo_root, (repo_root / "escape.py").as_uri())
 
-            bad_sym = {**target_sym, "file_path": "escape.py"}
-            with pytest.raises(PathSecurityError):
-                enrich_references_for_symbol(conn, c1, bad_sym)
+            bad_sym = target_sym.model_copy(update={"file_path": "escape.py"})
+            with pytest.raises(PathSecurityError), uow_factory.open() as uow:
+                enricher.enrich_symbol(uow, c1, bad_sym)

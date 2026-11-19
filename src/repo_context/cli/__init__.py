@@ -1,1 +1,0 @@
-"""Grouped ``rc`` CLI package."""
