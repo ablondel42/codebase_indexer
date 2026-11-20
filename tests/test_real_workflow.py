@@ -65,9 +65,7 @@ def test_python_api_end_to_end_workflow(copied_workflow_repo: Path, tmp_path: Pa
         assert "def helper():" in src.raw_source
         assert src.is_fresh is True
 
-        ctx = engine.queries.get_symbol_context(
-            ContextQuery(symbol=helper_id, include_source=True)
-        )
+        ctx = engine.queries.get_symbol_context(ContextQuery(symbol=helper_id, include_source=True))
         assert ctx.structural_summary.relationship_counts.callers >= 1
         assert ctx.freshness.context_source == "ast_only"
 

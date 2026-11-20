@@ -1,6 +1,6 @@
 """Full and hash-diff repository batch indexing orchestrator service."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from core.models.config import AppConfig
@@ -13,7 +13,11 @@ from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 from core.utils.logging import get_logger
 from core.utils.pathing import normalize_repo_root
-from core.utils.text_files import read_text_document, walk_repo_text_stats
+from core.utils.text_files import (
+    build_text_document_from_source,
+    read_text_document,
+    walk_repo_text_stats,
+)
 from core.utils.timestamps import utc_now_iso
 from indexing.models.results import (
     BatchExtractionSummary,
@@ -25,8 +29,10 @@ from indexing.models.results import (
 )
 from indexing.services.linker_runner import RepoLinkCoordinator
 from indexing.services.lsp_runner import RepoLspCoordinator
+from indexing.utils.collapse import build_repo_upsert_record
 from parsing.models.extraction import FileGraphExtraction
 from parsing.models.linking import LinkResolutionReport
+from parsing.models.scan import ScanReport
 from parsing.services.pipeline import AstExtractionPipeline
 from parsing.services.scanner import RepoScanner
 
@@ -45,15 +51,7 @@ class BatchIndexer:
         link_coordinator: RepoLinkCoordinator | None = None,
         lsp_coordinator: RepoLspCoordinator | None = None,
     ) -> None:
-        """Initialize the batch indexer with optional injected collaborators.
-
-        Args:
-            config: Optional ``AppConfig`` supplying scan, parse, and LSP bounds.
-            scanner: Optional injected ``RepoScanner`` instance.
-            pipeline: Optional injected ``AstExtractionPipeline`` instance.
-            link_coordinator: Optional injected ``RepoLinkCoordinator`` instance.
-            lsp_coordinator: Optional injected ``RepoLspCoordinator`` instance.
-        """
+        """Initialize the batch indexer with optional injected collaborators."""
         resolved_config = config if config is not None else AppConfig()
         self._config = resolved_config
         self._scanner = scanner if scanner is not None else RepoScanner(config=resolved_config)
@@ -70,14 +68,7 @@ class BatchIndexer:
         )
 
     def _resolve_scanner(self, include_tests: bool | None) -> RepoScanner:
-        """Return a ``RepoScanner`` honoring an explicit ``include_tests`` override.
-
-        Args:
-            include_tests: Optional per-run ``include_tests`` override.
-
-        Returns:
-            Active ``RepoScanner`` instance for the current run.
-        """
+        """Return a ``RepoScanner`` honoring an explicit ``include_tests`` override."""
         if include_tests is None or include_tests == self._scanner.options.include_tests:
             return self._scanner
         override_cfg = self._config.model_copy(update={"include_tests": include_tests})
@@ -85,21 +76,9 @@ class BatchIndexer:
 
     @staticmethod
     def _prepare_repo_record(uow: UnitOfWorkProtocol, scanned_repo: RepoRecord) -> RepoRecord:
-        """Preserve ``created_at`` when ``scanned_repo`` already exists and commit it.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            scanned_repo: Newly constructed ``RepoRecord`` from ``RepoScanner``.
-
-        Returns:
-            Persisted ``RepoRecord`` preserving any prior ``created_at`` timestamp.
-        """
+        """Preserve ``created_at`` when ``scanned_repo`` already exists and commit it."""
         existing = uow.repos.get_by_id(scanned_repo.id)
-        repo = (
-            scanned_repo.model_copy(update={"created_at": existing.created_at})
-            if existing is not None
-            else scanned_repo
-        )
+        repo = build_repo_upsert_record(existing, scanned_repo)
         uow.repos.upsert(repo)
         uow.commit()
         return repo
@@ -112,22 +91,11 @@ class BatchIndexer:
         *,
         force: bool,
     ) -> list[FileRecord]:
-        """Select all scanned files when ``force=True``, else only new or modified files.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_id: Target repository identifier.
-            scanned_files: Files discovered by ``RepoScanner``.
-            force: Whether to bypass ``content_hash`` diffing.
-
-        Returns:
-            Ordered list of ``FileRecord`` items requiring AST extraction.
-        """
+        """Select all scanned files when ``force=True``, else only new or modified files."""
         if force:
             return list(scanned_files)
         existing_files = {
-            rec.id: rec
-            for rec in uow.files.list_for_repo(repo_id, include_tests=True)
+            rec.id: rec for rec in uow.files.list_for_repo(repo_id, include_tests=True)
         }
         return [
             rec
@@ -140,16 +108,9 @@ class BatchIndexer:
         self,
         repo_root: Path,
         to_extract: Sequence[FileRecord],
+        source_by_file_id: Mapping[str, str],
     ) -> BatchExtractionSummary:
-        """Run ``AstExtractionPipeline`` over ``to_extract``, isolating per-file parse failures.
-
-        Args:
-            repo_root: Normalized repository root directory.
-            to_extract: Candidate ``FileRecord`` items to parse and extract.
-
-        Returns:
-            ``BatchExtractionSummary`` containing extractions, failures, and counters.
-        """
+        """Run ``AstExtractionPipeline`` over ``to_extract``, isolating per-file parse failures."""
         extractions: list[FileGraphExtraction] = []
         failures: list[ExtractionFailureEntry] = []
         nodes_extracted = 0
@@ -157,7 +118,11 @@ class BatchIndexer:
 
         for file_rec in to_extract:
             try:
-                extraction = self._pipeline.extract_file(repo_root, file_rec)
+                extraction = self._pipeline.extract_file(
+                    repo_root,
+                    file_rec,
+                    source_text=source_by_file_id.get(file_rec.id),
+                )
                 extractions.append(extraction)
                 nodes_extracted += len(extraction.nodes)
                 edges_extracted += len(extraction.edges)
@@ -185,17 +150,7 @@ class BatchIndexer:
         scanned_files: Sequence[FileRecord],
         extractions: Sequence[FileGraphExtraction],
     ) -> tuple[int, LinkResolutionReport]:
-        """Persist extracted file graphs, prune stale files, link edges, and commit.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo: Active ``RepoRecord``.
-            scanned_files: Full list of scanned repository files.
-            extractions: Successfully extracted file graphs.
-
-        Returns:
-            Tuple ``(files_pruned, link_report)``.
-        """
+        """Persist extracted file graphs, prune stale files, link edges, and commit."""
         for extraction in extractions:
             uow.refresh.invalidate_for_file(extraction.file.id)
             uow.replace_file_graph(extraction.file, extraction.nodes, extraction.edges)
@@ -204,16 +159,42 @@ class BatchIndexer:
         keep_file_ids = {rec.id for rec in scanned_files}
         pruned_count = uow.files.prune_not_in_ids(repo.id, keep_file_ids)
         link_report = self._link_coordinator.link_repository(uow, repo.id)
-        uow.edges.delete_dangling_lsp_references(repo.id)
         uow.repos.upsert(repo)
         uow.commit()
         return pruned_count, link_report
+
+    def _build_or_read_text_doc(
+        self,
+        repo_id: str,
+        repo_root: Path,
+        rel_path: str,
+        mtime_ns: int,
+        preloaded: tuple[FileRecord, str] | None,
+    ) -> TextDocumentRecord | None:
+        """Build a ``TextDocumentRecord`` from preloaded scan data or read from disk."""
+        if preloaded is not None:
+            file_rec, text = preloaded
+            return build_text_document_from_source(
+                file_rec.id,
+                repo_id,
+                rel_path,
+                text,
+                meta=(file_rec.content_hash, file_rec.size_bytes, mtime_ns, file_rec.is_test),
+            )
+        return read_text_document(
+            repo_id,
+            repo_root,
+            rel_path,
+            max_file_size_bytes=self._config.max_file_size_bytes,
+            test_dir_names=self._config.test_dir_names,
+        )
 
     def _sync_text_corpus(
         self,
         uow: UnitOfWorkProtocol,
         repo_id: str,
         repo_root: Path,
+        scan_report: ScanReport,
         *,
         force: bool,
     ) -> None:
@@ -225,6 +206,11 @@ class BatchIndexer:
         )
         existing_by_path = {
             meta.file_path: meta for meta in uow.text_search.list_metadata_for_repo(repo_id)
+        }
+        preloaded_by_path: dict[str, tuple[FileRecord, str]] = {
+            rec.file_path: (rec, scan_report.source_by_file_id[rec.id])
+            for rec in scan_report.files
+            if rec.id in scan_report.source_by_file_id
         }
         keep_ids: set[str] = set()
         to_upsert: list[TextDocumentRecord] = []
@@ -241,12 +227,12 @@ class BatchIndexer:
                 keep_ids.add(prev.id)
                 continue
 
-            doc = read_text_document(
+            doc = self._build_or_read_text_doc(
                 repo_id,
                 repo_root,
                 st.file_path,
-                max_file_size_bytes=self._config.max_file_size_bytes,
-                test_dir_names=self._config.test_dir_names,
+                st.mtime_ns,
+                preloaded_by_path.get(st.file_path),
             )
             if doc is None:
                 continue
@@ -262,26 +248,12 @@ class BatchIndexer:
         uow: UnitOfWorkProtocol,
         repo: RepoRecord,
         repo_root: Path,
-        scanned_files: Sequence[FileRecord],
+        scan_report: ScanReport,
         *,
         force: bool,
     ) -> PersistedBatchOutcome:
-        """Execute an audited indexing run and record terminal ``completed`` or ``failed`` state.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo: Prepared ``RepoRecord``.
-            repo_root: Normalized repository root directory.
-            scanned_files: Scanned ``FileRecord`` items.
-            force: Whether all scanned files must be re-extracted.
-
-        Returns:
-            ``PersistedBatchOutcome`` containing audit run counters and ``LinkResolutionReport``.
-
-        Raises:
-            Exception: Re-raises any unexpected persistence or linking failure after recording
-                ``status="failed"`` in ``index_runs``.
-        """
+        """Execute an audited indexing run and record terminal ``completed`` or ``failed`` state."""
+        scanned_files = scan_report.files
         run_id = uow.runs.start_run(repo.id, run_type="full" if force else "incremental")
         uow.commit()
 
@@ -293,8 +265,12 @@ class BatchIndexer:
                 scanned_files,
                 force=force,
             )
-            batch = self._extract_changed_files(repo_root, to_extract)
-            self._sync_text_corpus(uow, repo.id, repo_root, force=force)
+            batch = self._extract_changed_files(
+                repo_root,
+                to_extract,
+                scan_report.source_by_file_id,
+            )
+            self._sync_text_corpus(uow, repo.id, repo_root, scan_report, force=force)
             pruned_count, link_report = self._persist_and_link_batch(
                 uow,
                 repo,
@@ -302,9 +278,7 @@ class BatchIndexer:
                 batch.extractions,
             )
             error_msg = (
-                f"{len(batch.failures)} file(s) failed AST extraction"
-                if batch.failures
-                else None
+                f"{len(batch.failures)} file(s) failed AST extraction" if batch.failures else None
             )
             uow.runs.finish_run(
                 run_id,
@@ -356,23 +330,7 @@ class BatchIndexer:
         *,
         lsp_pool: LspPoolProtocol | None = None,
     ) -> BatchIndexResult:
-        """Scan, extract, persist, link, and optionally LSP-enrich a repository.
-
-        Args:
-            uow_factory: ``UnitOfWorkFactoryProtocol`` managing database sessions.
-            repo_root: Path to the repository root directory on disk.
-            options: Optional ``BatchIndexOptions`` controlling ``force``, ``include_tests``,
-                and ``enrich_lsp``.
-            lsp_pool: Optional warm ``LspPoolProtocol`` reused when ``options.enrich_lsp=True``.
-
-        Returns:
-            Immutable ``BatchIndexResult`` with run counters, link report, and graph stats.
-
-        Raises:
-            FileNotFoundError: If ``repo_root`` does not exist.
-            NotADirectoryError: If ``repo_root`` is not a directory.
-            DatabaseError: If initializing or writing to the database fails.
-        """
+        """Scan, extract, persist, link, and optionally LSP-enrich a repository."""
         resolved_opts = options if options is not None else BatchIndexOptions()
         normalized_root = normalize_repo_root(repo_root)
         active_scanner = self._resolve_scanner(resolved_opts.include_tests)
@@ -391,7 +349,7 @@ class BatchIndexer:
                 uow,
                 repo,
                 normalized_root,
-                scan_report.files,
+                scan_report,
                 force=resolved_opts.force,
             )
             lsp_summary: LspBatchSummary | None = None

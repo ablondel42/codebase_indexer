@@ -285,9 +285,7 @@ def test_symbol_and_hierarchy_lookups(query_env: tuple[SqlUnitOfWorkFactory, Pat
         batched_syms = uow.nodes.get_by_ids(["node:cls1", "node:sub", "node:missing"])
         assert set(batched_syms.keys()) == {"node:cls1", "node:sub"}
 
-        batched_files = uow.files.get_by_ids(
-            [f"file:{repo_id}:mod1.py", f"file:{repo_id}:mod2.py"]
-        )
+        batched_files = uow.files.get_by_ids([f"file:{repo_id}:mod1.py", f"file:{repo_id}:mod2.py"])
         assert len(batched_files) == 2
 
 

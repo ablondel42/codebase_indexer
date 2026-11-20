@@ -419,28 +419,24 @@ def test_mcp_and_cli_search_code_surface(
 
     app = CliApplication(engine=engine)
     capsys.readouterr()
-    rc = app.run(
-        [
-            "--db-path",
-            str(db_path),
-            "search",
-            "TEST_ONLY_MARKER",
-            "--no-tests",
-        ]
-    )
+    rc = app.run([
+        "--db-path",
+        str(db_path),
+        "search",
+        "TEST_ONLY_MARKER",
+        "--no-tests",
+    ])
     assert rc == 0
     no_test_out = json.loads(capsys.readouterr().out)
     assert no_test_out["total_matches"] == 0
 
-    rc2 = app.run(
-        [
-            "--db-path",
-            str(db_path),
-            "mcp-call",
-            "search_code",
-            "CBI_SCRIPT_MARKER",
-        ]
-    )
+    rc2 = app.run([
+        "--db-path",
+        str(db_path),
+        "mcp-call",
+        "search_code",
+        "CBI_SCRIPT_MARKER",
+    ])
     assert rc2 == 0
     mcp_call_out = json.loads(capsys.readouterr().out)
     assert mcp_call_out["result"]["ok"] is True

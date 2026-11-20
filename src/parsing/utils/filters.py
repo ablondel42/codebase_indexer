@@ -1,40 +1,24 @@
 """Pure stateless path and extension filter helpers for repository scanning."""
 
-import fnmatch
 from pathlib import Path
+
+from core.utils.text_files import is_ignored_text_dir, is_test_rel_path
 
 DEFAULT_TEST_DIR_NAMES: tuple[str, ...] = ("tests", "test")
 DEFAULT_SUPPORTED_EXTENSIONS: tuple[str, ...] = (".py",)
 
 
 def should_ignore_dir(name: str, ignored_dirs: tuple[str, ...]) -> bool:
-    """Check whether a directory name matches any ignore name or glob pattern.
-
-    Args:
-        name: Directory basename to test.
-        ignored_dirs: Tuple of directory names or ``fnmatch`` patterns (e.g. ``*.egg-info``).
-
-    Returns:
-        ``True`` if ``name`` matches at least one pattern in ``ignored_dirs``.
-    """
-    return any(fnmatch.fnmatch(name, pattern) for pattern in ignored_dirs)
+    """Check whether a directory name matches any ignore name or glob pattern."""
+    return is_ignored_text_dir(name, ignored_dirs)
 
 
 def is_test_path(
     rel_path: str,
     test_dir_names: tuple[str, ...] = DEFAULT_TEST_DIR_NAMES,
 ) -> bool:
-    """Determine whether a repository-relative file path lives inside a test directory.
-
-    Args:
-        rel_path: Repository-relative POSIX or platform file path.
-        test_dir_names: Directory name or glob patterns marking test directories.
-
-    Returns:
-        ``True`` if any parent directory component matches ``test_dir_names``.
-    """
-    parts = Path(rel_path).parts
-    return any(should_ignore_dir(part, test_dir_names) for part in parts[:-1])
+    """Determine whether a repository-relative file path lives inside a test directory."""
+    return is_test_rel_path(rel_path, test_dir_names)
 
 
 def is_supported_source_file(

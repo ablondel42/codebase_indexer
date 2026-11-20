@@ -14,7 +14,11 @@ from context.models.symbol_context import (
     StructuralTotals,
     SymbolContext,
 )
-from context.utils.formatting import edges_have_placeholder_targets, is_lsp_enriched
+from context.utils.formatting import (
+    edges_have_placeholder_targets,
+    is_lsp_enriched,
+    is_nested_lexical_declaration,
+)
 from core.models.config import AppConfig
 from core.models.edge import Edge
 from core.models.enums import LOCAL_CALLABLE_KINDS, EdgeKind, SymbolKind, SymbolScope
@@ -61,22 +65,8 @@ class ContextEvaluator:
 
     @staticmethod
     def is_nested_declaration(focus: FocusSymbol) -> bool:
-        """Return ``True`` strictly for lexically nested non-method declarations.
-
-        Normal class methods are structural class members, never lexical nested declarations.
-
-        Args:
-            focus: ``FocusSymbol`` being evaluated.
-
-        Returns:
-            ``True`` when ``focus`` has a lexical parent and is not a standard class method.
-        """
-        if focus.lexical_parent_id is None:
-            return False
-        return not (
-            focus.kind in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
-            and focus.scope == SymbolScope.CLASS
-        )
+        """Return ``True`` strictly for lexically nested non-method declarations."""
+        return is_nested_lexical_declaration(focus)
 
     @staticmethod
     def count_relationships(
@@ -222,13 +212,6 @@ class ContextEvaluator:
         """
         if node_last_indexed_at is None:
             return False, "missing_last_indexed_at"
-        if inputs.file_record is not None and inputs.repo_root is not None:
-            check = check_file_disk_freshness(
-                inputs.repo_root,
-                inputs.file_record,
-                max_file_size_bytes=self._config.max_file_size_bytes,
-            )
-            return check.is_fresh, check.stale_reason
         if uow is not None and (inputs.focus_node is not None or inputs.file_record is not None):
             target_file_id = (
                 inputs.focus_node.file_id
@@ -242,6 +225,13 @@ class ContextEvaluator:
                 repo_root=inputs.repo_root,
             )
             return check.is_fresh, check.stale_reason
+        if inputs.file_record is not None and inputs.repo_root is not None:
+            check = check_file_disk_freshness(
+                inputs.repo_root,
+                inputs.file_record,
+                max_file_size_bytes=self._config.max_file_size_bytes,
+            )
+            return check.is_fresh, check.stale_reason
         return True, None
 
     def evaluate_freshness(
@@ -250,18 +240,9 @@ class ContextEvaluator:
         inputs: FreshnessEvalInputs | None = None,
         *,
         uow: UnitOfWorkProtocol | None = None,
+        lsp_enriched: bool | None = None,
     ) -> FreshnessSummary:
-        """Compute ``FreshnessSummary`` verifying timestamps, LSP enrichment, and disk hash.
-
-        Args:
-            context: Assembled ``SymbolContext`` model.
-            inputs: Optional ``FreshnessEvalInputs`` with ``focus_node``, ``raw_edges``,
-                ``file_record``, and ``repo_root``.
-            uow: Optional active read Unit of Work for repository/edge timestamp lookups.
-
-        Returns:
-            Populated ``FreshnessSummary`` model.
-        """
+        """Compute ``FreshnessSummary`` verifying timestamps, LSP enrichment, and disk hash."""
         resolved_inputs = inputs if inputs is not None else FreshnessEvalInputs()
         focus_node = resolved_inputs.focus_node
         focus_id = focus_node.id if focus_node is not None else context.focus_symbol.id
@@ -281,14 +262,14 @@ class ContextEvaluator:
             resolved_inputs,
             uow,
         )
-        context_source = "lsp+ast" if is_lsp_enriched(context, raw_edges) else "ast_only"
+        enriched = lsp_enriched if lsp_enriched is not None else is_lsp_enriched(context, raw_edges)
 
         return FreshnessSummary(
             node_last_indexed_at=node_last_indexed_at,
             edge_snapshot_last_indexed_at=edge_ts,
             has_incoming_edges=has_incoming,
             has_outgoing_edges=has_outgoing,
-            context_source=context_source,
+            context_source="lsp+ast" if enriched else "ast_only",
             is_fresh=is_fresh,
             stale_reason=stale_reason,
         )
@@ -298,30 +279,22 @@ class ContextEvaluator:
         context: SymbolContext,
         *,
         raw_edges: Sequence[Edge] | None = None,
+        lsp_enriched: bool | None = None,
     ) -> ConfidenceSummary:
-        """Compute ``ConfidenceSummary`` across ``context.focus_symbol`` and incident edges.
-
-        ``edge_confidence_min`` and ``edge_confidence_max`` are ``None`` when zero edges exist.
-
-        Args:
-            context: Assembled ``SymbolContext`` model.
-            raw_edges: Optional unbounded raw ``Edge`` sequence touching the focus symbol.
-
-        Returns:
-            Populated ``ConfidenceSummary`` model.
-        """
+        """Compute ``ConfidenceSummary`` across ``context.focus_symbol`` and incident edges."""
         all_edges: Sequence[Edge | ContextEdge] = (
             raw_edges
             if raw_edges is not None
             else [*context.incoming_edges, *context.outgoing_edges]
         )
         confidences = [float(edge.confidence) for edge in all_edges]
+        enriched = lsp_enriched if lsp_enriched is not None else is_lsp_enriched(context, raw_edges)
         return ConfidenceSummary(
             focus_symbol_confidence=context.focus_symbol.confidence,
             edge_confidence_min=min(confidences) if confidences else None,
             edge_confidence_max=max(confidences) if confidences else None,
             contains_placeholder_targets=edges_have_placeholder_targets(all_edges),
-            graph_only=not is_lsp_enriched(context, raw_edges),
+            graph_only=not enriched,
         )
 
 

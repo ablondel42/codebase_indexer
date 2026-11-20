@@ -1,7 +1,7 @@
 """Python AST ``inherits`` edge extractor service."""
 
 import ast
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from core.models.edge import Edge
 from core.models.enums import PREFIX_EDGE, EdgeKind, SymbolKind
@@ -27,17 +27,7 @@ class InheritanceExtractor:
         placeholder_id: str,
         dup_count: int = 0,
     ) -> str:
-        """Build a deterministic edge ID for an ``inherits`` edge.
-
-        Args:
-            repo_id: Owning repository identifier.
-            class_node_id: Subclass ``SymbolNode`` identifier.
-            placeholder_id: Unresolved base placeholder target identifier.
-            dup_count: Zero-based duplicate index for repeated identical base names.
-
-        Returns:
-            Deterministic ``edge:<repo_id>:inherits:...`` identifier.
-        """
+        """Build a deterministic edge ID for an ``inherits`` edge."""
         base = f"{PREFIX_EDGE}{repo_id}:{EdgeKind.INHERITS.value}:{class_node_id}->{placeholder_id}"
         if dup_count > 0:
             return f"{base}:dup{dup_count}"
@@ -109,25 +99,13 @@ class InheritanceExtractor:
             )
         return edges
 
-    def extract(
+    def _resolve_fallback_ast_map(
         self,
         file_record: FileRecord,
         class_nodes: Sequence[SymbolNode],
         tree: ast.Module,
-        *,
-        lines: Sequence[str] | None = None,
-    ) -> list[Edge]:
-        """Extract ``inherits`` edges for all extracted class nodes in ``tree``.
-
-        Args:
-            file_record: Tracked ``FileRecord`` of the source module.
-            class_nodes: Extracted ``SymbolKind.CLASS`` nodes for the file.
-            tree: Parsed ``ast.Module`` root node.
-            lines: Optional pre-split source lines for UTF-8 base ranges.
-
-        Returns:
-            Ordered list of ``inherits`` ``Edge`` instances.
-        """
+    ) -> dict[str, ast.ClassDef]:
+        """Build a fallback ``symbol_id -> ast.ClassDef`` map when AST-ID maps are omitted."""
         by_qname_line: dict[tuple[str, int], ast.ClassDef] = {}
         by_qname: dict[str, ast.ClassDef] = {}
         self._walk_class_defs(
@@ -136,8 +114,7 @@ class InheritanceExtractor:
             [],
             (by_qname_line, by_qname),
         )
-
-        edges: list[Edge] = []
+        resolved: dict[str, ast.ClassDef] = {}
         for class_node in class_nodes:
             if class_node.kind != SymbolKind.CLASS:
                 continue
@@ -147,11 +124,33 @@ class InheritanceExtractor:
                 if class_node.start_line is not None
                 else None
             ) or by_qname.get(qname)
+            if ast_node is not None:
+                resolved[class_node.id] = ast_node
+        return resolved
+
+    def extract(
+        self,
+        file_record: FileRecord,
+        class_nodes: Sequence[SymbolNode],
+        tree: ast.Module,
+        *,
+        lines: Sequence[str] | None = None,
+        class_ast_by_symbol_id: Mapping[str, ast.ClassDef] | None = None,
+    ) -> list[Edge]:
+        """Extract ``inherits`` edges for all extracted class nodes in ``tree``."""
+        ast_map = (
+            class_ast_by_symbol_id
+            if class_ast_by_symbol_id is not None
+            else self._resolve_fallback_ast_map(file_record, class_nodes, tree)
+        )
+        edges: list[Edge] = []
+        for class_node in class_nodes:
+            if class_node.kind != SymbolKind.CLASS:
+                continue
+            ast_node = ast_map.get(class_node.id)
             if ast_node is None:
                 continue
-            edges.extend(
-                self._build_class_base_edges(file_record, class_node.id, ast_node, lines)
-            )
+            edges.extend(self._build_class_base_edges(file_record, class_node.id, ast_node, lines))
         return edges
 
 

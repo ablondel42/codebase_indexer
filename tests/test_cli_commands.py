@@ -156,10 +156,7 @@ def test_cbi_files_and_outline_json(
     files_res = _run_cbi("files", "--db-path", str(db_path), cwd=repo_root)
     assert files_res.returncode == 0
     files_payload = json.loads(files_res.stdout)
-    fresh_paths = {
-        item["file_path"]: item["freshness"]
-        for item in files_payload["files"]
-    }
+    fresh_paths = {item["file_path"]: item["freshness"] for item in files_payload["files"]}
     assert fresh_paths.get("pkg/math_ops.py") == "fresh"
 
     math_file = repo_root / "pkg" / "math_ops.py"

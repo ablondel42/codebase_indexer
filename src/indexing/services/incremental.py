@@ -13,7 +13,7 @@ from core.utils.pathing import (
     ensure_safe_repo_file,
     to_relative_path,
 )
-from core.utils.text_files import read_text_document
+from core.utils.text_files import build_text_document_from_source, read_text_document
 from indexing.models.events import FileChangeEvent, FileEventType
 from indexing.models.results import (
     IncrementalBatchResult,
@@ -21,22 +21,21 @@ from indexing.models.results import (
     IncrementalStatus,
 )
 from indexing.services.linker_runner import RepoLinkCoordinator
-from indexing.utils.collapse import collapse_events
+from indexing.utils.collapse import build_repo_upsert_record, collapse_events
 from indexing.utils.watch_paths import is_ignored_watch_path
 from parsing.models.extraction import FileGraphExtraction
 from parsing.models.linking import LinkResolutionReport
+from parsing.models.scan import ScannedFile
 from parsing.services.pipeline import AstExtractionPipeline
 from parsing.services.scanner import RepoScanner
 from parsing.utils.filters import is_supported_source_file
 
 logger = get_logger("indexing.services.incremental")
 
-_MUTATED_STATUSES: frozenset[IncrementalStatus] = frozenset(
-    {
-        IncrementalStatus.REINDEXED,
-        IncrementalStatus.DELETED,
-    }
-)
+_MUTATED_STATUSES: frozenset[IncrementalStatus] = frozenset({
+    IncrementalStatus.REINDEXED,
+    IncrementalStatus.DELETED,
+})
 
 
 class IncrementalIndexer:
@@ -49,14 +48,7 @@ class IncrementalIndexer:
         pipeline: AstExtractionPipeline | None = None,
         link_coordinator: RepoLinkCoordinator | None = None,
     ) -> None:
-        """Initialize the incremental indexer and its static analysis collaborators.
-
-        Args:
-            config: Optional ``AppConfig`` supplying filter and file-size rules.
-            scanner: Optional injected ``RepoScanner`` instance.
-            pipeline: Optional injected ``AstExtractionPipeline`` instance.
-            link_coordinator: Optional injected ``RepoLinkCoordinator`` instance.
-        """
+        """Initialize the incremental indexer and its static analysis collaborators."""
         resolved_config = config if config is not None else AppConfig()
         self._config = resolved_config
         self._scanner = scanner if scanner is not None else RepoScanner(config=resolved_config)
@@ -73,16 +65,7 @@ class IncrementalIndexer:
         resolved_root: Path,
         file_path: Path | str,
     ) -> tuple[Path, str] | IncrementalFileResult:
-        """Validate path confinement and extension/ignore filters for a changed file.
-
-        Args:
-            raw_root: Unresolved repository root path supplied by caller.
-            resolved_root: Canonical resolved repository root path.
-            file_path: Candidate file path (absolute or relative to ``repo_root``).
-
-        Returns:
-            Tuple ``(safe_path, repo_relative)`` or early ``IncrementalFileResult``.
-        """
+        """Validate path confinement and extension/ignore filters for a changed file."""
         display_path = str(file_path)
         try:
             safe_path = ensure_safe_repo_file(raw_root, file_path)
@@ -100,7 +83,11 @@ class IncrementalIndexer:
                 error_message=str(exc),
             )
         except OSError as exc:
-            logger.warning("OS error resolving file path during reindex for %s: %s", file_path, exc)
+            logger.warning(
+                "OS error resolving file path during reindex for %s: %s",
+                file_path,
+                exc,
+            )
             return IncrementalFileResult(
                 file_path=display_path,
                 status=IncrementalStatus.ERROR,
@@ -127,22 +114,22 @@ class IncrementalIndexer:
         resolved_root: Path,
         safe_path: Path,
         repo_relative: str,
-    ) -> tuple[str, FileGraphExtraction] | IncrementalFileResult:
-        """Scan and parse ``safe_path`` into a ``FileGraphExtraction`` or early status result.
-
-        Args:
-            resolved_root: Resolved repository root directory.
-            safe_path: Verified regular file path inside ``resolved_root``.
-            repo_relative: Repository-relative POSIX path string.
-
-        Returns:
-            Tuple ``(repo_id, extraction)`` or early ``IncrementalFileResult``.
-        """
+    ) -> tuple[str, ScannedFile, FileGraphExtraction] | IncrementalFileResult:
+        """Scan and parse ``safe_path`` into a ``FileGraphExtraction`` in a single file read."""
         repo_id = derive_repo_id(resolved_root)
         try:
-            file_record = self._scanner.scan_file(repo_id, resolved_root, safe_path)
-            extraction = self._pipeline.extract_file(resolved_root, file_record)
-            return repo_id, extraction
+            scanned = self._scanner.scan_file_with_source(
+                repo_id,
+                resolved_root,
+                safe_path,
+                safe_path=safe_path,
+            )
+            extraction = self._pipeline.extract_file(
+                resolved_root,
+                scanned.record,
+                source_text=scanned.source_text,
+            )
+            return repo_id, scanned, extraction
         except (ParseError, SyntaxError) as exc:
             logger.warning(
                 "Parse failure reindexing %s; keeping previous graph: %s",
@@ -182,41 +169,60 @@ class IncrementalIndexer:
         resolved_root: Path,
         last_indexed_at: str | None,
     ) -> None:
-        """Ensure ``repo_id`` exists in ``uow.repos`` and update ``last_indexed_at``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_id: Repository identifier.
-            resolved_root: Resolved repository root directory.
-            last_indexed_at: ISO 8601 timestamp from the updated file record.
-        """
+        """Ensure ``repo_id`` exists in ``uow.repos`` and update ``last_indexed_at``."""
         existing = uow.repos.get_by_id(repo_id)
         if existing is None:
             uow.repos.upsert(self._scanner.build_repo_record(resolved_root))
         elif last_indexed_at is not None:
-            uow.repos.upsert(existing.model_copy(update={"last_indexed_at": last_indexed_at}))
+            uow.repos.upsert(
+                build_repo_upsert_record(existing, existing, last_indexed_at=last_indexed_at)
+            )
+
+    def _sync_preloaded_or_disk_text(
+        self,
+        uow: UnitOfWorkProtocol,
+        repo_id: str,
+        resolved_root: Path,
+        file_path: Path | str,
+        scanned: ScannedFile | None = None,
+    ) -> bool:
+        """Upsert one UTF-8 repository text document using ``scanned`` when preloaded."""
+        if scanned is not None and scanned.source_text is not None:
+            rec = scanned.record
+            doc = build_text_document_from_source(
+                rec.id,
+                repo_id,
+                rec.file_path,
+                scanned.source_text,
+                meta=(rec.content_hash, rec.size_bytes, scanned.mtime_ns, rec.is_test),
+            )
+            uow.text_search.upsert_many([doc])
+            return True
+
+        doc = read_text_document(
+            repo_id,
+            resolved_root,
+            file_path,
+            max_file_size_bytes=self._config.max_file_size_bytes,
+            test_dir_names=self._config.test_dir_names,
+        )
+        if doc is None:
+            return False
+        self._ensure_repo_record(uow, repo_id, resolved_root, None)
+        uow.text_search.upsert_many([doc])
+        return True
 
     def _persist_reindexed_file(
         self,
         uow: UnitOfWorkProtocol,
         repo_id: str,
         resolved_root: Path,
+        scanned: ScannedFile,
         extraction: FileGraphExtraction,
         *,
         run_linker: bool,
     ) -> IncrementalFileResult:
-        """Persist ``extraction`` inside a savepoint and optionally run repository linking.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_id: Owning repository identifier.
-            resolved_root: Resolved repository root directory.
-            extraction: Extracted file graph ready for replacement.
-            run_linker: Whether to invoke ``RepoLinkCoordinator`` and commit immediately.
-
-        Returns:
-            Completed or error ``IncrementalFileResult``.
-        """
+        """Persist ``extraction`` inside a savepoint and optionally run repository linking."""
         file_id = extraction.file.id
         repo_relative = extraction.file.file_path
         try:
@@ -229,11 +235,16 @@ class IncrementalIndexer:
                 )
                 invalidated_refs = uow.refresh.invalidate_for_file(file_id)
                 uow.replace_file_graph(extraction.file, extraction.nodes, extraction.edges)
-                self._sync_single_text_file(uow, repo_id, resolved_root, repo_relative)
+                self._sync_preloaded_or_disk_text(
+                    uow,
+                    repo_id,
+                    resolved_root,
+                    repo_relative,
+                    scanned,
+                )
                 invalidated_targets = uow.refresh.mark_file_symbols_stale(file_id)
                 if run_linker:
                     link_report = self._link_coordinator.link_repository(uow, repo_id)
-                    uow.edges.delete_dangling_lsp_references(repo_id)
                     resolved_count = link_report.total_resolved
                     reset_count = link_report.edges_reset
                 else:
@@ -261,27 +272,6 @@ class IncrementalIndexer:
             reset_edge_count=reset_count,
         )
 
-    def _sync_single_text_file(
-        self,
-        uow: UnitOfWorkProtocol,
-        repo_id: str,
-        resolved_root: Path,
-        file_path: Path | str,
-    ) -> bool:
-        """Upsert one UTF-8 repository text document into ``text_files`` when eligible."""
-        doc = read_text_document(
-            repo_id,
-            resolved_root,
-            file_path,
-            max_file_size_bytes=self._config.max_file_size_bytes,
-            test_dir_names=self._config.test_dir_names,
-        )
-        if doc is None:
-            return False
-        self._ensure_repo_record(uow, repo_id, resolved_root, None)
-        uow.text_search.upsert_many([doc])
-        return True
-
     def reindex_file(
         self,
         uow: UnitOfWorkProtocol,
@@ -290,25 +280,14 @@ class IncrementalIndexer:
         *,
         run_linker: bool = True,
     ) -> IncrementalFileResult:
-        """Reindex a created or modified source file inside ``repo_root``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_root: Repository root directory path.
-            file_path: Changed file path (absolute or relative to ``repo_root``).
-            run_linker: When ``True``, runs ``RepoLinkCoordinator``, prunes dangling LSP
-                references, and commits ``uow`` on completion.
-
-        Returns:
-            ``IncrementalFileResult`` describing the outcome and entity counts.
-        """
+        """Reindex a created or modified source file inside ``repo_root``."""
         raw_root = Path(repo_root)
         resolved_root = raw_root.resolve()
 
         target = self._resolve_reindex_target(raw_root, resolved_root, file_path)
         if isinstance(target, IncrementalFileResult):
             if target.status == IncrementalStatus.SKIPPED:
-                synced = self._sync_single_text_file(
+                synced = self._sync_preloaded_or_disk_text(
                     uow,
                     derive_repo_id(resolved_root),
                     resolved_root,
@@ -322,12 +301,13 @@ class IncrementalIndexer:
         extracted = self._extract_file_graph(resolved_root, safe_path, repo_relative)
         if isinstance(extracted, IncrementalFileResult):
             return extracted
-        repo_id, extraction = extracted
+        repo_id, scanned, extraction = extracted
 
         return self._persist_reindexed_file(
             uow,
             repo_id,
             resolved_root,
+            scanned,
             extraction,
             run_linker=run_linker,
         )
@@ -338,16 +318,7 @@ class IncrementalIndexer:
         file_id: str,
         declared_ids: set[str],
     ) -> list[str]:
-        """Collect external target symbol IDs referenced or called from ``file_id``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            file_id: File identifier being deleted.
-            declared_ids: Set of symbol IDs declared inside ``file_id``.
-
-        Returns:
-            Sorted deduplicated list of external target symbol IDs.
-        """
+        """Collect external target symbol IDs referenced or called from ``file_id``."""
         impacted_ids = set(uow.refresh.collect_impacted_symbol_ids(file_id))
         for edge in uow.edges.list_for_file(file_id):
             if edge.to_id:
@@ -363,18 +334,7 @@ class IncrementalIndexer:
         *,
         run_linker: bool,
     ) -> IncrementalFileResult:
-        """Delete ``file_id`` non-destructively so surviving callers' AST edges reset cleanly.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_id: Owning repository identifier.
-            file_id: Persisted ``file_id`` to remove.
-            repo_relative_path: Repository-relative POSIX file path.
-            run_linker: Whether to invoke ``RepoLinkCoordinator`` and commit immediately.
-
-        Returns:
-            Completed or error ``IncrementalFileResult``.
-        """
+        """Delete ``file_id`` non-destructively so surviving callers' AST edges reset cleanly."""
         try:
             with uow.savepoint():
                 declared_ids = {node.id for node in uow.nodes.list_for_file(file_id)}
@@ -386,7 +346,6 @@ class IncrementalIndexer:
 
                 if run_linker:
                     link_report = self._link_coordinator.link_repository(uow, repo_id)
-                    uow.edges.delete_dangling_lsp_references(repo_id)
                     resolved_count = link_report.total_resolved
                     reset_count = link_report.edges_reset
                 else:
@@ -427,22 +386,7 @@ class IncrementalIndexer:
         *,
         run_linker: bool = True,
     ) -> IncrementalFileResult:
-        """Delete a removed file's symbols, owned edges, and stale LSP references.
-
-        Preserves external callers' incoming AST ``calls``, ``imports``, and ``inherits``
-        edges so ``RepoLinkCoordinator`` resets them to ``unresolved_target`` placeholders
-        for automatic recovery when the file is moved or re-created.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_id: Owning repository identifier.
-            repo_relative_path: Repository-relative POSIX path of the deleted file.
-            run_linker: When ``True``, runs ``RepoLinkCoordinator``, prunes dangling LSP
-                references, and commits ``uow`` on completion.
-
-        Returns:
-            ``IncrementalFileResult`` summarizing deleted nodes/edges and reset links.
-        """
+        """Delete a removed file's symbols, owned edges, and stale LSP references."""
         deleted_text = uow.text_search.delete_by_paths(repo_id, [repo_relative_path])
         file_rec = uow.files.get_by_path(repo_id, repo_relative_path)
         if file_rec is None:
@@ -475,17 +419,7 @@ class IncrementalIndexer:
         default_repo_id: str,
         event: FileChangeEvent,
     ) -> IncrementalFileResult:
-        """Execute one collapsed ``FileChangeEvent`` isolated inside ``uow.savepoint()``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            resolved_root: Resolved repository root directory.
-            default_repo_id: Fallback ``repo_id`` derived from ``resolved_root``.
-            event: Collapsed ``FileChangeEvent`` to apply.
-
-        Returns:
-            ``IncrementalFileResult`` for ``event`` (never raises into sibling events).
-        """
+        """Execute one collapsed ``FileChangeEvent`` isolated inside ``uow.savepoint()``."""
         try:
             with uow.savepoint():
                 if event.event_type == FileEventType.DELETED:
@@ -518,20 +452,13 @@ class IncrementalIndexer:
         uow: UnitOfWorkProtocol,
         repo_root: Path | str,
         events: Sequence[FileChangeEvent],
+        *,
+        already_collapsed: bool = False,
     ) -> IncrementalBatchResult:
-        """Collapse ``events``, isolate per-file updates, link once, and commit ``uow``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_root: Watched repository root directory.
-            events: Raw or pre-normalized sequence of ``FileChangeEvent`` items.
-
-        Returns:
-            ``IncrementalBatchResult`` with per-file outcomes and batch link metrics.
-        """
+        """Collapse ``events``, isolate per-file updates, link once, and commit ``uow``."""
         resolved_root = Path(repo_root).resolve()
         repo_id = derive_repo_id(resolved_root)
-        collapsed = collapse_events(events)
+        collapsed = list(events) if already_collapsed else collapse_events(events)
 
         results: list[IncrementalFileResult] = [
             self._process_single_event_isolated(uow, resolved_root, repo_id, event)
@@ -545,7 +472,7 @@ class IncrementalIndexer:
         dangling_deleted = 0
         if mutated_indices:
             link_report = self._link_coordinator.link_repository(uow, repo_id)
-            dangling_deleted = uow.edges.delete_dangling_lsp_references(repo_id)
+            dangling_deleted = link_report.dangling_lsp_deleted
             last_idx = mutated_indices[-1]
             results[last_idx] = results[last_idx].model_copy(
                 update={

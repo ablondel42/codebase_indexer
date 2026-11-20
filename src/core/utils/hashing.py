@@ -12,6 +12,19 @@ from core.utils.logging import get_logger
 logger = get_logger("core.utils.hashing")
 
 
+def sha256_bytes(raw_bytes: bytes) -> str:
+    """Compute a ``sha256:``-prefixed digest of raw in-memory bytes.
+
+    Args:
+        raw_bytes: Input byte sequence to hash.
+
+    Returns:
+        Deterministic digest string prefixed with ``"sha256:"``.
+    """
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    return f"{PREFIX_SHA256}{digest}"
+
+
 def sha256_text(text: str) -> str:
     """Compute a ``sha256:``-prefixed digest of a UTF-8 text string.
 
@@ -21,8 +34,7 @@ def sha256_text(text: str) -> str:
     Returns:
         Deterministic digest string prefixed with ``"sha256:"``.
     """
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return f"{PREFIX_SHA256}{digest}"
+    return sha256_bytes(text.encode("utf-8"))
 
 
 def sha256_file(file_path: Path, max_file_size_bytes: int | None = None) -> str:

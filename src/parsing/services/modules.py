@@ -10,7 +10,6 @@ from core.models.range import Position, Range
 from core.utils.logging import get_logger
 from parsing.services.scope import FileExtractionSession
 from parsing.utils.ast_helpers import get_doc_summary
-from parsing.utils.naming import build_module_qualified_name
 
 logger = get_logger("parsing.services.modules")
 
@@ -66,7 +65,7 @@ class ModuleExtractor:
             if module_path
             else (Path(file_rec.file_path).stem or "__init__")
         )
-        qualified_name = build_module_qualified_name(module_path) or name
+        qualified_name = module_path or name
         package_path = ".".join(module_path.split(".")[:-1]) if "." in module_path else ""
         file_lines: Sequence[str] = (
             session.lines if session.lines is not None else file_text.splitlines()

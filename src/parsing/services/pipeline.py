@@ -51,9 +51,7 @@ class AstExtractionPipeline:
         imported_symbols: list[str],
     ) -> SymbolNode:
         """Return a copy of ``module_node`` with import and top-level child payload keys."""
-        top_level_symbol_ids = [
-            node.id for node in nodes if node.parent_id == module_node.id
-        ]
+        top_level_symbol_ids = [node.id for node in nodes if node.parent_id == module_node.id]
         updated_payload = {
             **module_node.payload,
             "imported_modules": imported_modules,
@@ -72,9 +70,7 @@ class AstExtractionPipeline:
     ) -> ExtractionMetrics:
         """Compute per-file ``ExtractionMetrics`` from extracted nodes and edges."""
         method_count = sum(
-            1
-            for node in nodes
-            if node.kind in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
+            1 for node in nodes if node.kind in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
         )
         callable_count = sum(1 for node in nodes if node.kind in CALLABLE_KINDS)
         return ExtractionMetrics(
@@ -88,9 +84,7 @@ class AstExtractionPipeline:
             method_count=method_count,
             constant_count=sum(1 for node in nodes if node.kind == SymbolKind.CONSTANT),
             attribute_count=sum(1 for node in nodes if node.kind == SymbolKind.ATTRIBUTE),
-            type_alias_count=sum(
-                1 for node in nodes if node.kind == SymbolKind.TYPE_ALIAS
-            ),
+            type_alias_count=sum(1 for node in nodes if node.kind == SymbolKind.TYPE_ALIAS),
             call_edge_count=call_edge_count,
         )
 
@@ -114,6 +108,7 @@ class AstExtractionPipeline:
             walk_result.class_nodes,
             tree,
             lines=session.lines,
+            class_ast_by_symbol_id=walk_result.class_ast_by_symbol_id,
         )
         call_edges = self._call_extractor.extract(
             file_rec,
@@ -121,6 +116,7 @@ class AstExtractionPipeline:
             walk_result.nodes,
             tree,
             lines=session.lines,
+            symbols_by_ast_id=walk_result.symbols_by_ast_id,
         )
         enriched_module = self._enrich_module_node(
             initial_module,
@@ -189,12 +185,15 @@ class AstExtractionPipeline:
         self,
         repo_root: Path | str,
         file_record: FileRecord,
+        *,
+        source_text: str | None = None,
     ) -> FileGraphExtraction:
         """Safely load ``file_record`` from ``repo_root`` and extract its AST graph.
 
         Args:
             repo_root: Repository root directory path.
             file_record: Tracked ``FileRecord`` to parse and extract.
+            source_text: Optional pre-loaded UTF-8 source text bypassing a second read.
 
         Returns:
             Immutable ``FileGraphExtraction`` containing nodes, edges, and metrics.
@@ -205,12 +204,17 @@ class AstExtractionPipeline:
             ParseError: If the file exceeds ``max_file_size_bytes``, is invalid UTF-8,
                 or fails AST parsing.
         """
-        safe_path = ensure_safe_repo_file(Path(repo_root), file_record.file_path)
-        source_text = load_python_source(
-            safe_path,
-            max_file_size_bytes=self._config.max_file_size_bytes,
-        )
-        extraction = self.extract_source(file_record, source_text, filename=safe_path)
+        if source_text is not None:
+            diag_path: Path | str = Path(repo_root) / file_record.file_path
+            loaded_text = source_text
+        else:
+            safe_path = ensure_safe_repo_file(Path(repo_root), file_record.file_path)
+            diag_path = safe_path
+            loaded_text = load_python_source(
+                safe_path,
+                max_file_size_bytes=self._config.max_file_size_bytes,
+            )
+        extraction = self.extract_source(file_record, loaded_text, filename=diag_path)
         logger.debug(
             "Extracted %d nodes and %d edges from %s",
             extraction.metrics.node_count,

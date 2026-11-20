@@ -2,7 +2,6 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 from core.models.config import AppConfig
 from core.models.exceptions import ValidationError
@@ -10,6 +9,7 @@ from core.ports.events import EventCallback
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol
 from core.utils.logging import get_logger
+from engine.models.collaborators import CommandCollaborators
 from engine.services.resolver import SymbolTargetResolver
 from indexing.models.events import FileChangeEvent
 from indexing.models.results import (
@@ -25,13 +25,6 @@ from lsp.models.enrichment import SymbolEnrichmentResult
 
 logger = get_logger("engine.services.command")
 
-_ALLOWED_COLLABORATOR_KEYS: frozenset[str] = frozenset({
-    "batch_indexer",
-    "incremental_indexer",
-    "lsp_coordinator",
-    "watcher",
-})
-
 
 class CommandEngine:
     """Executes mutating indexing, incremental batch, LSP refresh, and watch commands."""
@@ -43,49 +36,32 @@ class CommandEngine:
         lsp_pool: LspPoolProtocol,
         *,
         resolver: SymbolTargetResolver | None = None,
-        **collaborators: Any,
+        collaborators: CommandCollaborators | None = None,
     ) -> None:
-        """Initialize the command engine with injected persistence, LSP, and domain services.
-
-        Args:
-            config: Immutable runtime ``AppConfig``.
-            uow_factory: ``UnitOfWorkFactoryProtocol`` bound to the target database.
-            lsp_pool: Shared ``LspPoolProtocol`` managing warm Pyright sessions.
-            resolver: Optional ``SymbolTargetResolver`` collaborator.
-            **collaborators: Optional domain service overrides (``batch_indexer``,
-                ``incremental_indexer``, ``lsp_coordinator``, ``watcher``).
-
-        Raises:
-            TypeError: If unexpected keyword arguments are supplied in ``collaborators``.
-        """
-        unknown = sorted(set(collaborators) - _ALLOWED_COLLABORATOR_KEYS)
-        if unknown:
-            raise TypeError(
-                f"Unexpected keyword argument(s) for CommandEngine: {', '.join(unknown)}"
-            )
-
+        """Initialize the command engine with injected persistence, LSP, and domain services."""
+        deps = collaborators if collaborators is not None else CommandCollaborators()
         self._config = config
         self._uow_factory = uow_factory
         self._lsp_pool = lsp_pool
         self._resolver = resolver if resolver is not None else SymbolTargetResolver()
-        lsp_coord: RepoLspCoordinator | None = collaborators.get("lsp_coordinator")
         self._lsp_coordinator = (
-            lsp_coord if lsp_coord is not None else RepoLspCoordinator(config=config)
+            deps.lsp_coordinator
+            if deps.lsp_coordinator is not None
+            else RepoLspCoordinator(config=config)
         )
-        batch_idx: BatchIndexer | None = collaborators.get("batch_indexer")
         self._batch_indexer = (
-            batch_idx
-            if batch_idx is not None
+            deps.batch_indexer
+            if deps.batch_indexer is not None
             else BatchIndexer(config=config, lsp_coordinator=self._lsp_coordinator)
         )
-        inc_idx: IncrementalIndexer | None = collaborators.get("incremental_indexer")
         self._incremental_indexer = (
-            inc_idx if inc_idx is not None else IncrementalIndexer(config=config)
+            deps.incremental_indexer
+            if deps.incremental_indexer is not None
+            else IncrementalIndexer(config=config)
         )
-        watcher: RepoWatcher | None = collaborators.get("watcher")
         self._watcher = (
-            watcher
-            if watcher is not None
+            deps.watcher
+            if deps.watcher is not None
             else RepoWatcher(config=config, incremental=self._incremental_indexer)
         )
 

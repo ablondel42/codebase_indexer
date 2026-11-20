@@ -7,6 +7,8 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from pydantic import ValidationError as PydanticValidationError
+
 from cli.services.analysis import AnalysisCliCommands
 from cli.services.db import DbCliCommands
 from cli.services.index import IndexCliCommands
@@ -182,13 +184,15 @@ class CliApplication:
             logger.debug("CLI domain error (%s): %s", exc.error_code, exc.message)
             emit_cli_error(exc.error_code, exc.message, details=exc.context)
         except (
+            PydanticValidationError,
             FileNotFoundError,
             NotADirectoryError,
             json.JSONDecodeError,
             ValueError,
         ) as exc:
             logger.debug("CLI input or filesystem error (%s): %s", type(exc).__name__, exc)
-            emit_cli_error("error", str(exc))
+            code = "validation_error" if isinstance(exc, PydanticValidationError) else "error"
+            emit_cli_error(code, str(exc))
         except BrokenPipeError as exc:
             logger.debug("CLI stdout BrokenPipeError: %s", exc)
             silence_broken_pipe()

@@ -9,12 +9,12 @@ from lsp.utils.locations import (
     CONFIDENCE_EXACT,
     CONFIDENCE_MODULE,
     build_reference_edge,
-    extract_uri_candidates,
     find_module_node_for_file,
     get_reference_query_position,
     normalize_location,
     pick_smallest_containing_symbol,
     range_contains,
+    read_bounded_lsp_text,
 )
 from lsp.utils.utf16 import (
     codepoint_offset_to_utf16,
@@ -30,7 +30,6 @@ __all__ = [
     "build_reference_edge",
     "codepoint_offset_to_utf16",
     "encode_jsonrpc_message",
-    "extract_uri_candidates",
     "find_module_node_for_file",
     "get_reference_query_position",
     "normalize_location",
@@ -41,5 +40,6 @@ __all__ = [
     "position_utf16_to_codepoint",
     "range_contains",
     "range_utf16_to_codepoint",
+    "read_bounded_lsp_text",
     "utf16_offset_to_codepoint",
 ]

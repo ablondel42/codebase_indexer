@@ -1,6 +1,9 @@
 """AST symbol and edge extraction value objects, metrics, and file graph models."""
 
+import ast
 from typing import Any
+
+from pydantic import ConfigDict, Field
 
 from core.models.base import FrozenModel
 from core.models.edge import Edge
@@ -95,9 +98,13 @@ class ImportExtractionResult(FrozenModel):
 class DeclarationWalkResult(FrozenModel):
     """Ordered symbol declarations, extracted class nodes, and structural edges."""
 
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
     nodes: list[SymbolNode]
     class_nodes: list[SymbolNode]
     structural_edges: list[Edge]
+    symbols_by_ast_id: dict[int, SymbolNode] = Field(default_factory=dict)
+    class_ast_by_symbol_id: dict[str, ast.ClassDef] = Field(default_factory=dict)
 
 
 class ExtractionMetrics(FrozenModel):

@@ -12,36 +12,6 @@ from engine.models.responses import DirectoryFileCount
 logger = get_logger("engine.utils.formatting")
 
 
-def normalize_path_prefix(path_prefix: str) -> str:
-    """Normalize a repository path prefix without stripping leading dot-directories.
-
-    Strips surrounding whitespace, repeated leading ``./`` segments, and trailing ``/``
-    separators while preserving directory names like ``.github``.
-
-    Args:
-        path_prefix: Raw user-supplied path prefix string.
-
-    Returns:
-        Normalized POSIX path prefix string.
-    """
-    cleaned = path_prefix.strip()
-    while cleaned.startswith("./"):
-        cleaned = cleaned.removeprefix("./")
-    return cleaned.rstrip("/")
-
-
-def normalize_repo_file_filter(file_filter: str) -> str:
-    """Normalize a symbol file or directory filter string.
-
-    Args:
-        file_filter: Raw user-supplied relative file or directory filter.
-
-    Returns:
-        Normalized POSIX file or directory filter string.
-    """
-    return normalize_path_prefix(file_filter)
-
-
 def relativize_if_under_root(file_path: str, repo_root: str | None) -> str:
     """Convert an absolute ``file_path`` inside ``repo_root`` to a relative POSIX path.
 
@@ -140,8 +110,7 @@ def aggregate_top_directories(
         top_dir = rel.split("/", 1)[0] if "/" in rel else "."
         counts[top_dir] += 1
     return [
-        DirectoryFileCount(path=path, file_count=count)
-        for path, count in counts.most_common(limit)
+        DirectoryFileCount(path=path, file_count=count) for path, count in counts.most_common(limit)
     ]
 
 
@@ -149,7 +118,5 @@ __all__ = [
     "aggregate_top_directories",
     "format_cli_freshness_label",
     "matches_file_pattern",
-    "normalize_path_prefix",
-    "normalize_repo_file_filter",
     "relativize_if_under_root",
 ]

@@ -3,6 +3,7 @@
 from mcp_server.models.errors import McpErrorCode, McpErrorDetail
 from mcp_server.models.inputs import (
     AnalyzeRiskInput,
+    BaseMcpToolInput,
     GetFileOutlineInput,
     GetRepoOverviewInput,
     GetSymbolContextInput,
@@ -11,10 +12,12 @@ from mcp_server.models.inputs import (
     ListFilesInput,
     SearchCodeInput,
     SearchSymbolsInput,
+    SymbolSelectorInput,
 )
 
 __all__ = [
     "AnalyzeRiskInput",
+    "BaseMcpToolInput",
     "GetFileOutlineInput",
     "GetRepoOverviewInput",
     "GetSymbolContextInput",
@@ -25,4 +28,5 @@ __all__ = [
     "McpErrorDetail",
     "SearchCodeInput",
     "SearchSymbolsInput",
+    "SymbolSelectorInput",
 ]

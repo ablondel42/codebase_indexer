@@ -24,6 +24,7 @@ from core.models import (
     SymbolNode,
 )
 from core.utils.hashing import sha256_file
+from core.utils.pathing import extract_uri_candidates
 from graph import ReferenceAnalyzer
 from lsp import (
     LspClientOptions,
@@ -38,7 +39,6 @@ from lsp.utils.framing import (
 )
 from lsp.utils.locations import (
     build_reference_edge,
-    extract_uri_candidates,
     find_module_node_for_file,
     get_reference_query_position,
     normalize_location,
@@ -237,20 +237,18 @@ class TestResolverAndPosition:
                     created_at="2026-01-01T00:00:00Z",
                 )
             )
-            uow.files.upsert_many(
-                [
-                    FileRecord(
-                        id=f"file:{repo_id}:my file.py",
-                        repo_id=repo_id,
-                        file_path="my file.py",
-                        uri=target.resolve().as_uri(),
-                        module_path="my file",
-                        content_hash=sha256_file(target),
-                        size_bytes=target.stat().st_size,
-                        last_modified_at="2026-01-01T00:00:00Z",
-                    )
-                ]
-            )
+            uow.files.upsert_many([
+                FileRecord(
+                    id=f"file:{repo_id}:my file.py",
+                    repo_id=repo_id,
+                    file_path="my file.py",
+                    uri=target.resolve().as_uri(),
+                    module_path="my file",
+                    content_hash=sha256_file(target),
+                    size_bytes=target.stat().st_size,
+                    last_modified_at="2026-01-01T00:00:00Z",
+                )
+            ])
 
         via_symlink_uri = (symlink_root / "my file.py").as_uri()
         candidates, resolved_path = extract_uri_candidates(via_symlink_uri)
@@ -558,9 +556,7 @@ while True:
             cand_edges = uow.edges.list_for_repo(
                 scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
             )
-            link_res = linker.resolve(
-                scan_report.repo.id, scan_report.repo.name, nodes, cand_edges
-            )
+            link_res = linker.resolve(scan_report.repo.id, scan_report.repo.name, nodes, cand_edges)
             uow.edges.update_resolved_targets(link_res.updates)
 
         with uow_factory.open(read_only=True) as ro_uow:

@@ -1,19 +1,16 @@
 """SQLAlchemy Core adapter implementing ``RepoRepositoryProtocol``."""
 
-import sqlite3
 from typing import Any
 
 from sqlalchemy import ColumnElement, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
 
 from core.models.exceptions import DatabaseError
 from core.models.repo import RepoRecord
 from core.utils.logging import get_logger
 from storage.utils.mappers import repo_to_row, row_to_repo
 from storage.utils.schema import repos_table
-from storage.utils.sql_helpers import db_error_message
+from storage.utils.sql_helpers import build_sqlite_upsert, db_operation
 
 logger = get_logger("storage.services.repos")
 
@@ -22,107 +19,40 @@ class SqlRepoRepository:
     """SQLite repository adapter for ``RepoRecord`` entities."""
 
     def __init__(self, conn: Connection) -> None:
-        """Initialize the repository over an active SQLAlchemy ``Connection``.
-
-        Args:
-            conn: Active SQLAlchemy ``Connection``.
-        """
+        """Initialize the repository over an active SQLAlchemy ``Connection``."""
         self._conn = conn
 
     def upsert(self, repo: RepoRecord) -> None:
-        """Insert or update a ``RepoRecord`` row.
-
-        Args:
-            repo: Repository entity to persist.
-
-        Raises:
-            DatabaseError: If SQLite execution fails.
-        """
-        values = repo_to_row(repo)
-        stmt = sqlite_insert(repos_table).values(values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[repos_table.c.id],
-            set_={
-                "root_path": stmt.excluded.root_path,
-                "name": stmt.excluded.name,
-                "default_language": stmt.excluded.default_language,
-                "created_at": stmt.excluded.created_at,
-                "last_indexed_at": stmt.excluded.last_indexed_at,
-            },
-        )
-        try:
-            self._conn.execute(stmt)
+        """Insert or update a ``RepoRecord`` row."""
+        stmt = build_sqlite_upsert(repos_table)
+        with db_operation(f"Failed to upsert repository {repo.id}", context={"repo_id": repo.id}):
+            self._conn.execute(stmt, repo_to_row(repo))
             logger.debug("Upserted repository %s", repo.id)
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed upserting repository %s: %s", repo.id, msg)
-            raise DatabaseError(
-                f"Failed to upsert repository {repo.id}: {msg}",
-                context={"repo_id": repo.id},
-            ) from exc
 
     def get_by_id(self, repo_id: str) -> RepoRecord | None:
-        """Fetch a ``RepoRecord`` by its exact identifier.
-
-        Args:
-            repo_id: Canonical repository identifier.
-
-        Returns:
-            Matching ``RepoRecord`` or ``None`` when absent.
-
-        Raises:
-            DatabaseError: If SQLite execution fails.
-        """
-        try:
+        """Fetch a ``RepoRecord`` by its exact identifier."""
+        with db_operation(f"Failed to fetch repository {repo_id}", context={"repo_id": repo_id}):
             row = (
                 self._conn
                 .execute(select(repos_table).where(repos_table.c.id == repo_id))
                 .mappings()
                 .first()
             )
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed fetching repository %s: %s", repo_id, msg)
-            raise DatabaseError(
-                f"Failed to fetch repository {repo_id}: {msg}",
-                context={"repo_id": repo_id},
-            ) from exc
-        if row is None:
-            return None
-        return row_to_repo(row)
+        return row_to_repo(row) if row is not None else None
 
     def list_all(self) -> list[RepoRecord]:
-        """List all indexed repositories ordered deterministically by ``(name, id)``.
-
-        Returns:
-            Ordered list of ``RepoRecord`` entities.
-
-        Raises:
-            DatabaseError: If SQLite execution fails.
-        """
-        try:
+        """List all indexed repositories ordered deterministically by ``(name, id)``."""
+        with db_operation("Failed to list repositories"):
             rows = (
                 self._conn
                 .execute(select(repos_table).order_by(repos_table.c.name, repos_table.c.id))
                 .mappings()
                 .all()
             )
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed listing repositories: %s", msg)
-            raise DatabaseError(f"Failed to list repositories: {msg}") from exc
         return [row_to_repo(row) for row in rows]
 
     def _select_sole_repo_id(self) -> str:
-        """Return the sole repository ID or raise when zero or multiple exist.
-
-        Returns:
-            Canonical ``repo_id`` of the single indexed repository.
-
-        Raises:
-            DatabaseError: With ``error_code="repo_not_found"`` when empty, or
-                ``error_code="ambiguous_repo"`` when multiple repositories exist.
-        """
+        """Return the sole repository ID or raise when zero or multiple exist."""
         repos = self.list_all()
         if not repos:
             raise DatabaseError(
@@ -144,20 +74,7 @@ class SqlRepoRepository:
         target: str,
         field_name: str,
     ) -> str | None:
-        """Return the unique ``repo_id`` matching ``column == target`` or raise if ambiguous.
-
-        Args:
-            column: ``repos_table`` column expression to compare.
-            target: Candidate lookup string.
-            field_name: Column label for error diagnostics.
-
-        Returns:
-            Matching ``repo_id`` string or ``None`` when zero rows match.
-
-        Raises:
-            DatabaseError: With ``error_code="ambiguous_repo"`` if multiple rows match,
-                or ``error_code="database_error"`` if SQLite fails.
-        """
+        """Return the unique ``repo_id`` matching ``column == target`` or raise if ambiguous."""
         matched_ids = [
             str(rid)
             for rid in self._conn
@@ -178,45 +95,28 @@ class SqlRepoRepository:
         return None
 
     def resolve_id(self, repo_id_or_name: str | None = None) -> str:
-        """Resolve an explicit repository ID/name/root_path or sole-repo default.
-
-        Args:
-            repo_id_or_name: Optional repository ID, short ``name``, ``root_path``, or ``None``.
-
-        Returns:
-            Resolved canonical ``repo_id`` string.
-
-        Raises:
-            DatabaseError: With ``error_code="repo_not_found"`` or ``"ambiguous_repo"``
-                when resolution cannot uniquely identify a repository, or on SQL errors.
-        """
+        """Resolve an explicit repository ID/name/root_path or sole-repo default."""
         if repo_id_or_name is None or not str(repo_id_or_name).strip():
             return self._select_sole_repo_id()
 
         target = str(repo_id_or_name).strip()
-        try:
+        with db_operation(
+            f"Failed to resolve repository {target!r}",
+            context={"repo_id_or_name": target},
+        ):
             exact_id = self._conn.execute(
                 select(repos_table.c.id).where(repos_table.c.id == target)
             ).scalar_one_or_none()
             if exact_id is not None:
                 return str(exact_id)
 
-            name_match = self._match_unique_column(repos_table.c.name, target, "name")
-            if name_match is not None:
-                return name_match
-
-            path_match = self._match_unique_column(repos_table.c.root_path, target, "root_path")
-            if path_match is not None:
-                return path_match
-        except DatabaseError:
-            raise
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed resolving repository %r: %s", target, msg)
-            raise DatabaseError(
-                f"Failed to resolve repository {target!r}: {msg}",
-                context={"repo_id_or_name": target},
-            ) from exc
+            for col, label in (
+                (repos_table.c.name, "name"),
+                (repos_table.c.root_path, "root_path"),
+            ):
+                matched = self._match_unique_column(col, target, label)
+                if matched is not None:
+                    return matched
 
         raise DatabaseError(
             f"Repository not found: {target!r}",

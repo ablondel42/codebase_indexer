@@ -6,13 +6,15 @@ from pathlib import Path
 from core.models.config import AppConfig
 from core.models.edge import Edge
 from core.models.enums import PREFIX_SYMBOL, EdgeKind
-from core.models.exceptions import SymbolNotFoundError, ValidationError
+from core.models.exceptions import SymbolNotFoundError
 from core.models.file import FileRecord, FreshnessCheckResult
 from core.models.node import SymbolNode, SymbolSummary
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.file_io import check_file_disk_freshness
 from core.utils.logging import get_logger
+from core.utils.pathing import normalize_rel_path_prefix
 from graph.models.subgraph import SubgraphOptions, SubgraphSlice
+from graph.utils.predicates import load_verified_summaries_by_ids
 
 logger = get_logger("graph.services.navigator")
 
@@ -210,10 +212,8 @@ class GraphNavigator:
             Matching ``FileRecord`` or ``None`` if absent.
         """
         raw = file_path.strip()
-        normalized = raw
-        while normalized.startswith("./"):
-            normalized = normalized[2:]
-        record = uow.files.get_by_path(repo_id, normalized)
+        normalized = normalize_rel_path_prefix(raw, strip_trailing_slash=False)
+        record = uow.files.get_by_path(repo_id, normalized) if normalized else None
         if record is None and normalized != raw:
             record = uow.files.get_by_path(repo_id, raw)
         return record
@@ -316,33 +316,13 @@ class GraphNavigator:
         uow: UnitOfWorkProtocol,
         root_symbol_ids: Sequence[str],
     ) -> tuple[list[str], dict[str, SymbolSummary]]:
-        """Validate non-empty root symbol IDs and batch-load their ``SymbolSummary`` items.
-
-        Args:
-            uow: Active read Unit of Work.
-            root_symbol_ids: Caller-requested seed symbol identifiers.
-
-        Returns:
-            Tuple ``(unique_roots, summaries_by_id)``.
-
-        Raises:
-            ValidationError: If ``root_symbol_ids`` contains no usable IDs.
-            SymbolNotFoundError: If any root symbol ID does not exist in the graph.
-        """
-        unique_roots = list(dict.fromkeys(sid.strip() for sid in root_symbol_ids if sid.strip()))
-        if not unique_roots:
-            raise ValidationError(
-                "At least one root symbol ID must be provided.",
-                context={"root_symbol_ids": list(root_symbol_ids)},
-            )
-        summaries_by_id = uow.nodes.get_summaries_by_ids(unique_roots)
-        missing = [sid for sid in unique_roots if sid not in summaries_by_id]
-        if missing:
-            raise SymbolNotFoundError(
-                f"Symbol not found: {missing[0]}",
-                context={"symbol_id": missing[0], "missing_symbol_ids": missing},
-            )
-        return unique_roots, summaries_by_id
+        """Validate non-empty root symbol IDs and batch-load their ``SymbolSummary`` items."""
+        return load_verified_summaries_by_ids(
+            uow.nodes,
+            root_symbol_ids,
+            empty_error="At least one root symbol ID must be provided.",
+            empty_context={"root_symbol_ids": list(root_symbol_ids)},
+        )
 
     @staticmethod
     def _assemble_subgraph_slice(

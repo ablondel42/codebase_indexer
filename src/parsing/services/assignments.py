@@ -1,19 +1,26 @@
 """Module constant, ``TypeAlias``, and class-level attribute extractor service."""
 
 import ast
-import hashlib
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from core.models.enums import PREFIX_SHA256, Language, SymbolKind, SymbolScope
+from core.models.enums import SymbolKind, SymbolScope
 from core.models.node import SymbolNode
 from core.utils.hashing import compute_symbol_content_hash
 from core.utils.logging import get_logger
-from parsing.models.extraction import AssignmentSpec, ScopeTarget
+from parsing.models.extraction import (
+    AssignmentSpec,
+    DeclarationPlacement,
+    ScopeTarget,
+)
 from parsing.services.scope import FileExtractionSession
-from parsing.utils.ast_helpers import cap_signature, compute_visibility_hint, safe_unparse
-from parsing.utils.naming import build_nested_qualified_name
+from parsing.utils.ast_helpers import cap_signature, safe_unparse
+from parsing.utils.naming import (
+    build_nested_qualified_name,
+    build_symbol_node,
+    compute_semantic_digest,
+)
 from parsing.utils.ranges import (
     make_declaration_lines,
     make_name_selection_range,
@@ -30,14 +37,7 @@ class AssignmentExtractor:
 
     @staticmethod
     def _is_type_alias_annotation(annotation_str: str) -> bool:
-        """Check whether an annotation string denotes ``typing.TypeAlias``.
-
-        Args:
-            annotation_str: Unparsed annotation expression text.
-
-        Returns:
-            ``True`` when ``annotation_str`` represents a ``TypeAlias`` declaration.
-        """
+        """Check whether an annotation string denotes ``typing.TypeAlias``."""
         stripped = annotation_str.strip()
         return (
             stripped in ("TypeAlias", "typing.TypeAlias")
@@ -47,14 +47,7 @@ class AssignmentExtractor:
 
     @classmethod
     def _extract_target_names(cls, target: ast.AST) -> list[ast.Name]:
-        """Extract non-wildcard ``ast.Name`` targets from an assignment target expression.
-
-        Args:
-            target: Assignment target AST node (``Name``, ``Tuple``, ``List``, etc.).
-
-        Returns:
-            Ordered list of simple ``ast.Name`` nodes excluding ``_``.
-        """
+        """Extract non-wildcard ``ast.Name`` targets from an assignment target expression."""
         if isinstance(target, ast.Name):
             return [target] if target.id != "_" else []
         if isinstance(target, (ast.Tuple, ast.List)):
@@ -71,23 +64,13 @@ class AssignmentExtractor:
         annotation: str | None,
         value_hint: str | None,
     ) -> str:
-        """Compute a deterministic semantic hash for an assignment-derived symbol.
-
-        Args:
-            kind: ``SymbolKind`` (``constant``, ``attribute``, or ``type_alias``).
-            qualified_name: Full symbol qualified name.
-            annotation: Optional unparsed type annotation.
-            value_hint: Optional capped RHS value representation.
-
-        Returns:
-            ``sha256:``-prefixed digest string.
-        """
-        hash_obj = hashlib.sha256()
-        hash_obj.update(f"kind:{kind.value}".encode())
-        hash_obj.update(f"qualified_name:{qualified_name}".encode())
-        hash_obj.update(f"annotation:{annotation}".encode())
-        hash_obj.update(f"value_hint:{value_hint}".encode())
-        return f"{PREFIX_SHA256}{hash_obj.hexdigest()}"
+        """Compute a deterministic semantic hash for an assignment-derived symbol."""
+        return compute_semantic_digest((
+            f"kind:{kind.value}",
+            f"qualified_name:{qualified_name}",
+            f"annotation:{annotation}",
+            f"value_hint:{value_hint}",
+        ))
 
     @staticmethod
     def _make_spec(
@@ -126,17 +109,7 @@ class AssignmentExtractor:
         target: ScopeTarget,
         spec: AssignmentSpec,
     ) -> SymbolNode:
-        """Convert an ``AssignmentSpec`` into a canonical ``SymbolNode``.
-
-        Args:
-            session: Active per-file extraction session.
-            target: Enclosing module or class ``ScopeTarget``.
-            spec: Extracted ``AssignmentSpec`` metadata.
-
-        Returns:
-            Immutable ``SymbolNode`` instance.
-        """
-        file_rec = session.file_record
+        """Convert an ``AssignmentSpec`` into a canonical ``SymbolNode``."""
         qualified_name = (
             f"{target.parent_qualified_name}.{spec.name}"
             if target.parent_qualified_name
@@ -154,36 +127,37 @@ class AssignmentExtractor:
         if spec.value_hint is not None:
             payload["value_hint"] = spec.value_hint
 
-        return SymbolNode(
-            id=node_id,
-            repo_id=session.repo_id,
-            file_id=file_rec.id,
-            language=Language.PYTHON,
+        placement = DeclarationPlacement(
             kind=spec.kind,
-            name=spec.name,
-            qualified_name=qualified_name,
-            uri=file_rec.uri,
-            decl_range=spec.decl_range,
-            selection_range=spec.selection_range,
-            start_line=spec.start_line,
-            end_line=spec.end_line,
-            signature=spec.signature,
             parent_id=target.parent_id,
-            visibility_hint=compute_visibility_hint(spec.name, target.scope),
-            doc_summary=None,
-            content_hash=spec.content_hash,
-            semantic_hash=self._compute_semantic_hash(
-                spec.kind,
-                qualified_name,
-                spec.annotation,
-                spec.value_hint,
-            ),
-            source="python-ast",
-            confidence=1.0,
-            scope=target.scope,
             lexical_parent_id=None,
-            payload=payload,
-            last_indexed_at=file_rec.last_indexed_at,
+            qualified_name=qualified_name,
+            scope=target.scope,
+        )
+        semantic_hash = self._compute_semantic_hash(
+            spec.kind,
+            qualified_name,
+            spec.annotation,
+            spec.value_hint,
+        )
+        return build_symbol_node(
+            session.file_record,
+            node_id,
+            spec.name,
+            placement,
+            spans=(
+                spec.decl_range,
+                spec.selection_range,
+                spec.start_line,
+                spec.end_line,
+            ),
+            metadata=(
+                spec.signature,
+                None,
+                spec.content_hash,
+                semantic_hash,
+                payload,
+            ),
         )
 
     def _specs_for_type_alias(
@@ -218,11 +192,7 @@ class AssignmentExtractor:
         if not isinstance(stmt.target, ast.Name) or stmt.target.id == "_":
             return []
         annotation = safe_unparse(stmt.annotation)
-        kind = (
-            SymbolKind.TYPE_ALIAS
-            if self._is_type_alias_annotation(annotation)
-            else default_kind
-        )
+        kind = SymbolKind.TYPE_ALIAS if self._is_type_alias_annotation(annotation) else default_kind
         value_hint = cap_signature(safe_unparse(stmt.value)) if stmt.value is not None else None
         return [
             self._make_spec(
@@ -273,17 +243,7 @@ class AssignmentExtractor:
         body: Sequence[ast.stmt],
         default_kind: SymbolKind,
     ) -> list[SymbolNode]:
-        """Extract assignment-based ``SymbolNode`` items directly inside ``body``.
-
-        Args:
-            session: Active per-file extraction session.
-            target: Enclosing module or class ``ScopeTarget``.
-            body: AST statement list of the module or class body.
-            default_kind: Default ``SymbolKind`` (``CONSTANT`` or ``ATTRIBUTE``).
-
-        Returns:
-            Ordered list of extracted ``SymbolNode`` declarations.
-        """
+        """Extract assignment-based ``SymbolNode`` items directly inside ``body``."""
         specs: list[AssignmentSpec] = []
         for stmt in body:
             if isinstance(stmt, ast.AnnAssign):
@@ -320,14 +280,14 @@ class AssignmentExtractor:
         span = make_declaration_lines(stmt)
         return by_qname_line.get((qname, span.start_line)) or by_qname.get(qname)
 
-    def _walk_class_attributes(
+    def _walk_class_attributes_fallback(
         self,
         session: FileExtractionSession,
         stmts: Sequence[ast.stmt],
         lexical_chain: list[str],
         class_lookup: _ClassLookup,
     ) -> list[SymbolNode]:
-        """Recursively collect class-level attributes across all classes."""
+        """Fallback AST walk collecting class attributes when AST-ID maps are omitted."""
         extracted: list[SymbolNode] = []
         for stmt in stmts:
             if isinstance(stmt, ast.ClassDef):
@@ -348,13 +308,23 @@ class AssignmentExtractor:
                     )
                 lexical_chain.append(stmt.name)
                 extracted.extend(
-                    self._walk_class_attributes(session, stmt.body, lexical_chain, class_lookup)
+                    self._walk_class_attributes_fallback(
+                        session,
+                        stmt.body,
+                        lexical_chain,
+                        class_lookup,
+                    )
                 )
                 lexical_chain.pop()
             elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 lexical_chain.append(stmt.name)
                 extracted.extend(
-                    self._walk_class_attributes(session, stmt.body, lexical_chain, class_lookup)
+                    self._walk_class_attributes_fallback(
+                        session,
+                        stmt.body,
+                        lexical_chain,
+                        class_lookup,
+                    )
                 )
                 lexical_chain.pop()
         return extracted
@@ -365,30 +335,43 @@ class AssignmentExtractor:
         module_node_id: str,
         tree: ast.Module,
         class_nodes: Sequence[SymbolNode] = (),
+        *,
+        class_ast_by_symbol_id: Mapping[str, ast.ClassDef] | None = None,
     ) -> list[SymbolNode]:
-        """Extract all module constants/type aliases and class-level attributes in ``tree``.
-
-        Args:
-            session: Active per-file extraction session.
-            module_node_id: Root module ``SymbolNode`` identifier.
-            tree: Parsed ``ast.Module`` root node.
-            class_nodes: Extracted ``SymbolKind.CLASS`` nodes across ``tree``.
-
-        Returns:
-            Ordered list of ``constant``, ``type_alias``, and ``attribute`` nodes.
-        """
+        """Extract all module constants/type aliases and class-level attributes in ``tree``."""
         module_target = ScopeTarget(
             parent_id=module_node_id,
             parent_qualified_name=session.module_path,
             scope=SymbolScope.MODULE,
         )
-        extracted = self.extract_body(session, module_target, tree.body, SymbolKind.CONSTANT)
+        module_items = self.extract_body(
+            session,
+            module_target,
+            tree.body,
+            SymbolKind.CONSTANT,
+        )
         if not class_nodes:
-            return extracted
+            return module_items
+
+        if class_ast_by_symbol_id is not None:
+            class_items: list[SymbolNode] = []
+            for cls_node in class_nodes:
+                ast_node = class_ast_by_symbol_id.get(cls_node.id)
+                if ast_node is None:
+                    continue
+                cls_target = ScopeTarget(
+                    parent_id=cls_node.id,
+                    parent_qualified_name=cls_node.qualified_name,
+                    scope=SymbolScope.CLASS,
+                )
+                class_items.extend(
+                    self.extract_body(session, cls_target, ast_node.body, SymbolKind.ATTRIBUTE)
+                )
+            return [*module_items, *class_items]
 
         class_lookup = self._build_class_lookup(class_nodes)
-        extracted.extend(self._walk_class_attributes(session, tree.body, [], class_lookup))
-        return extracted
+        class_items = self._walk_class_attributes_fallback(session, tree.body, [], class_lookup)
+        return [*module_items, *class_items]
 
 
 __all__ = [

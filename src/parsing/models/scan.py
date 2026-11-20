@@ -2,6 +2,8 @@
 
 from typing import Self
 
+from pydantic import Field
+
 from core.models.base import FrozenModel
 from core.models.config import AppConfig
 from core.models.file import FileRecord
@@ -36,14 +38,24 @@ class ScanOptions(FrozenModel):
         )
 
 
+class ScannedFile(FrozenModel):
+    """Scanned ``FileRecord`` paired with pre-loaded UTF-8 source text and mtime."""
+
+    record: FileRecord
+    source_text: str | None = None
+    mtime_ns: int = 0
+
+
 class ScanReport(FrozenModel):
     """Result of scanning a repository root directory for supported source files."""
 
     repo: RepoRecord
     files: list[FileRecord]
+    source_by_file_id: dict[str, str] = Field(default_factory=dict)
 
 
 __all__ = [
     "ScanOptions",
     "ScanReport",
+    "ScannedFile",
 ]

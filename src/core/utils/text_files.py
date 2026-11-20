@@ -1,14 +1,15 @@
 """Pure stateless UTF-8 text corpus discovery, language classification, and reading utilities."""
 
 import fnmatch
-import hashlib
 import os
 import stat
 from pathlib import Path
 from types import MappingProxyType
 
+from core.models.config import IGNORED_DIRS
 from core.models.exceptions import PathSecurityError
 from core.models.search import TextDocumentRecord, TextFileStat
+from core.utils.hashing import sha256_bytes
 from core.utils.logging import get_logger
 from core.utils.pathing import (
     derive_file_id,
@@ -18,34 +19,6 @@ from core.utils.pathing import (
 )
 
 logger = get_logger("core.utils.text_files")
-
-TEXT_IGNORED_DIRS: tuple[str, ...] = (
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "env",
-    ".env",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".nox",
-    ".eggs",
-    "*.egg-info",
-    "build",
-    "dist",
-    "node_modules",
-    ".idea",
-    ".vscode",
-    ".cursor",
-    "htmlcov",
-    ".hypothesis",
-    "site",
-    ".pixi",
-)
 
 _IGNORED_EXACT_FILENAMES: frozenset[str] = frozenset({".DS_Store", "Thumbs.db"})
 
@@ -92,39 +65,37 @@ _IGNORED_FILE_SUFFIXES: tuple[str, ...] = (
     ".bak",
 )
 
-_EXT_LANGUAGE_MAP: MappingProxyType[str, str] = MappingProxyType(
-    {
-        ".py": "python",
-        ".pyi": "python",
-        ".md": "markdown",
-        ".mdx": "markdown",
-        ".toml": "toml",
-        ".json": "json",
-        ".jsonc": "json",
-        ".jsonl": "json",
-        ".yaml": "yaml",
-        ".yml": "yaml",
-        ".sh": "shell",
-        ".bash": "shell",
-        ".zsh": "shell",
-        ".sql": "sql",
-        ".html": "html",
-        ".css": "css",
-        ".js": "javascript",
-        ".mjs": "javascript",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-        ".xml": "xml",
-        ".svg": "xml",
-        ".ini": "ini",
-        ".cfg": "ini",
-    }
-)
+_EXT_LANGUAGE_MAP: MappingProxyType[str, str] = MappingProxyType({
+    ".py": "python",
+    ".pyi": "python",
+    ".md": "markdown",
+    ".mdx": "markdown",
+    ".toml": "toml",
+    ".json": "json",
+    ".jsonc": "json",
+    ".jsonl": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".sql": "sql",
+    ".html": "html",
+    ".css": "css",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".xml": "xml",
+    ".svg": "xml",
+    ".ini": "ini",
+    ".cfg": "ini",
+})
 
 _BINARY_SNIFF_BYTES = 8192
 
 
-def is_ignored_text_dir(name: str, ignored_dirs: tuple[str, ...] = TEXT_IGNORED_DIRS) -> bool:
+def is_ignored_text_dir(name: str, ignored_dirs: tuple[str, ...] = IGNORED_DIRS) -> bool:
     """Return ``True`` when directory ``name`` matches ``ignored_dirs`` globs."""
     return any(fnmatch.fnmatch(name, pattern) for pattern in ignored_dirs)
 
@@ -139,7 +110,7 @@ def is_ignored_text_filename(name: str) -> bool:
 
 def is_ignored_text_rel_path(
     rel_path: str,
-    ignored_dirs: tuple[str, ...] = TEXT_IGNORED_DIRS,
+    ignored_dirs: tuple[str, ...] = IGNORED_DIRS,
 ) -> bool:
     """Return ``True`` when any directory segment or filename in ``rel_path`` is ignored."""
     parts = [segment for segment in rel_path.replace("\\", "/").split("/") if segment]
@@ -155,8 +126,8 @@ def is_test_rel_path(
     test_dir_names: tuple[str, ...] = ("tests", "test"),
 ) -> bool:
     """Return ``True`` when ``rel_path`` resides under a test directory."""
-    parts = rel_path.replace("\\", "/").split("/")
-    return any(part in test_dir_names for part in parts[:-1])
+    parts = [segment for segment in rel_path.replace("\\", "/").split("/") if segment]
+    return any(is_ignored_text_dir(part, test_dir_names) for part in parts[:-1])
 
 
 def classify_text_language(rel_path: str, first_line: str = "") -> str:
@@ -210,7 +181,7 @@ def walk_repo_text_stats(
     repo_root: Path | str,
     *,
     max_file_size_bytes: int = 2 * 1024 * 1024,
-    ignored_dirs: tuple[str, ...] = TEXT_IGNORED_DIRS,
+    ignored_dirs: tuple[str, ...] = IGNORED_DIRS,
     test_dir_names: tuple[str, ...] = ("tests", "test"),
 ) -> list[TextFileStat]:
     """Walk ``repo_root`` safely and return sorted ``TextFileStat`` items (~5ms)."""
@@ -257,13 +228,50 @@ def _decode_utf8_non_binary(
         return None
 
 
+def build_text_document_from_source(
+    file_id: str,
+    repo_id: str,
+    rel_path: str,
+    text: str,
+    *,
+    meta: tuple[str, int, int, bool],
+) -> TextDocumentRecord:
+    """Construct a ``TextDocumentRecord`` from already-loaded UTF-8 source text.
+
+    Args:
+        file_id: Deterministic ``file:<repo_id>:<rel_path>`` identifier.
+        repo_id: Owning repository identifier.
+        rel_path: Repository-relative POSIX path string.
+        text: Decoded UTF-8 text content.
+        meta: Tuple ``(content_hash, size_bytes, mtime_ns, is_test)``.
+
+    Returns:
+        Populated ``TextDocumentRecord``.
+    """
+    content_hash, size_bytes, mtime_ns, is_test = meta
+    lines = text.splitlines()
+    first_line = lines[0] if lines else ""
+    return TextDocumentRecord(
+        id=file_id,
+        repo_id=repo_id,
+        file_path=rel_path,
+        language=classify_text_language(rel_path, first_line),
+        content_hash=content_hash,
+        size_bytes=size_bytes,
+        line_count=len(lines),
+        mtime_ns=mtime_ns,
+        is_test=is_test,
+        content=text,
+    )
+
+
 def read_text_document(
     repo_id: str,
     repo_root: Path | str,
     file_path: Path | str,
     *,
     max_file_size_bytes: int = 2 * 1024 * 1024,
-    ignored_dirs: tuple[str, ...] = TEXT_IGNORED_DIRS,
+    ignored_dirs: tuple[str, ...] = IGNORED_DIRS,
     test_dir_names: tuple[str, ...] = ("tests", "test"),
 ) -> TextDocumentRecord | None:
     """Confine, binary-check, UTF-8 decode, and hash a single repository text file."""
@@ -284,25 +292,22 @@ def read_text_document(
         return None
     raw_bytes, text = decoded
 
-    lines = text.splitlines()
-    first_line = lines[0] if lines else ""
-    digest = hashlib.sha256(raw_bytes).hexdigest()
-    return TextDocumentRecord(
-        id=derive_file_id(repo_id, rel_path),
-        repo_id=repo_id,
-        file_path=rel_path,
-        language=classify_text_language(rel_path, first_line),
-        content_hash=f"sha256:{digest}",
-        size_bytes=len(raw_bytes),
-        line_count=len(lines),
-        mtime_ns=st.st_mtime_ns,
-        is_test=is_test_rel_path(rel_path, test_dir_names),
-        content=text,
+    return build_text_document_from_source(
+        derive_file_id(repo_id, rel_path),
+        repo_id,
+        rel_path,
+        text,
+        meta=(
+            sha256_bytes(raw_bytes),
+            len(raw_bytes),
+            st.st_mtime_ns,
+            is_test_rel_path(rel_path, test_dir_names),
+        ),
     )
 
 
 __all__ = [
-    "TEXT_IGNORED_DIRS",
+    "build_text_document_from_source",
     "classify_text_language",
     "is_ignored_text_dir",
     "is_ignored_text_filename",

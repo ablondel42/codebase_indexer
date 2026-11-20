@@ -23,6 +23,7 @@ from cli.utils.output import (
     format_symbol_search_for_cli,
     format_watch_event_payload,
     resolve_cli_db_path,
+    resolve_scoped_engine,
     serialize_risk_for_cli,
     silence_broken_pipe,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "parse_mcp_call_args",
     "preprocess_argv",
     "resolve_cli_db_path",
+    "resolve_scoped_engine",
     "serialize_risk_for_cli",
     "silence_broken_pipe",
     "tokenize_shell_line",

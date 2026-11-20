@@ -1,27 +1,28 @@
 """SQLAlchemy Core adapter implementing ``TextSearchRepositoryProtocol``."""
 
-import sqlite3
 from collections.abc import Sequence
 from typing import Any
 
 from sqlalchemy import delete, select, text
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
 
-from core.models.exceptions import DatabaseError
 from core.models.search import (
     TextCandidateQuery,
     TextDocumentMeta,
     TextDocumentRecord,
 )
 from core.utils.logging import get_logger
+from storage.utils.mappers import (
+    row_to_text_doc_meta,
+    row_to_text_doc_record,
+    text_doc_to_row,
+)
 from storage.utils.schema import text_files_table
 from storage.utils.sql_helpers import (
+    build_rel_path_prefix_clause,
+    build_sqlite_upsert,
     chunked_sequence,
-    db_error_message,
-    escape_like,
-    normalize_path_filter,
+    db_operation,
 )
 
 logger = get_logger("storage.services.text_search")
@@ -37,60 +38,21 @@ class SqlTextSearchRepository:
         """Initialize the repository over an active SQLAlchemy ``Connection``."""
         self._conn = conn
 
-    @staticmethod
-    def _doc_to_row(doc: TextDocumentRecord) -> dict[str, Any]:
-        """Serialize a ``TextDocumentRecord`` into a ``text_files`` column dictionary."""
-        return {
-            "id": doc.id,
-            "repo_id": doc.repo_id,
-            "file_path": doc.file_path,
-            "language": doc.language,
-            "content_hash": doc.content_hash,
-            "size_bytes": doc.size_bytes,
-            "line_count": doc.line_count,
-            "mtime_ns": doc.mtime_ns,
-            "is_test": doc.is_test,
-            "content": doc.content,
-        }
-
-    @staticmethod
-    def _build_upsert_stmt() -> Any:
-        """Build ``INSERT ... ON CONFLICT(id) DO UPDATE`` preserving ``rowid`` triggers."""
-        ins = sqlite_insert(text_files_table)
-        return ins.on_conflict_do_update(
-            index_elements=[text_files_table.c.id],
-            set_={
-                "repo_id": ins.excluded.repo_id,
-                "file_path": ins.excluded.file_path,
-                "language": ins.excluded.language,
-                "content_hash": ins.excluded.content_hash,
-                "size_bytes": ins.excluded.size_bytes,
-                "line_count": ins.excluded.line_count,
-                "mtime_ns": ins.excluded.mtime_ns,
-                "is_test": ins.excluded.is_test,
-                "content": ins.excluded.content,
-            },
-        )
-
     def upsert_many(self, documents: Sequence[TextDocumentRecord]) -> None:
         """Insert or update a batch of ``TextDocumentRecord`` rows and sync ``text_fts``."""
         if not documents:
             return
-        stmt = self._build_upsert_stmt()
-        try:
+        stmt = build_sqlite_upsert(text_files_table)
+        with db_operation("Failed to upsert text documents"):
             for chunk in chunked_sequence(documents, _UPSERT_CHUNK_SIZE):
-                self._conn.execute(stmt, [self._doc_to_row(doc) for doc in chunk])
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed upserting %d text document(s): %s", len(documents), msg)
-            raise DatabaseError(f"Failed to upsert text documents: {msg}") from exc
+                self._conn.execute(stmt, [text_doc_to_row(doc) for doc in chunk])
 
     def delete_by_paths(self, repo_id: str, file_paths: Sequence[str]) -> int:
         """Delete ``text_files`` rows matching ``file_paths`` under ``repo_id``."""
         if not file_paths:
             return 0
         deleted = 0
-        try:
+        with db_operation("Failed to delete text documents", context={"repo_id": repo_id}):
             for chunk in chunked_sequence(list(file_paths), _DELETE_CHUNK_SIZE):
                 res = self._conn.execute(
                     delete(text_files_table).where(
@@ -99,15 +61,11 @@ class SqlTextSearchRepository:
                     )
                 )
                 deleted += int(res.rowcount or 0)
-            return deleted
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed deleting text documents in %s: %s", repo_id, msg)
-            raise DatabaseError(f"Failed to delete text documents: {msg}") from exc
+        return deleted
 
     def prune_not_in_ids(self, repo_id: str, keep_ids: set[str]) -> int:
         """Delete ``text_files`` rows for ``repo_id`` absent from ``keep_ids``."""
-        try:
+        with db_operation("Failed to prune stale text documents", context={"repo_id": repo_id}):
             rows = self._conn.execute(
                 select(text_files_table.c.id).where(text_files_table.c.repo_id == repo_id)
             ).fetchall()
@@ -121,10 +79,6 @@ class SqlTextSearchRepository:
                 )
                 deleted += int(res.rowcount or 0)
             return deleted
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed pruning stale text documents in %s: %s", repo_id, msg)
-            raise DatabaseError(f"Failed to prune stale text documents: {msg}") from exc
 
     def list_metadata_for_repo(self, repo_id: str) -> list[TextDocumentMeta]:
         """List lightweight ``TextDocumentMeta`` rows for ``repo_id`` without ``content``."""
@@ -143,26 +97,9 @@ class SqlTextSearchRepository:
             .where(text_files_table.c.repo_id == repo_id)
             .order_by(text_files_table.c.file_path)
         )
-        try:
+        with db_operation("Failed to list text document metadata", context={"repo_id": repo_id}):
             rows = self._conn.execute(stmt).mappings().fetchall()
-            return [
-                TextDocumentMeta(
-                    id=str(row["id"]),
-                    repo_id=str(row["repo_id"]),
-                    file_path=str(row["file_path"]),
-                    language=str(row["language"]),
-                    content_hash=str(row["content_hash"]),
-                    size_bytes=int(row["size_bytes"]),
-                    line_count=int(row["line_count"]),
-                    mtime_ns=int(row["mtime_ns"]),
-                    is_test=bool(row["is_test"]),
-                )
-                for row in rows
-            ]
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed listing text metadata for %s: %s", repo_id, msg)
-            raise DatabaseError(f"Failed to list text document metadata: {msg}") from exc
+            return [row_to_text_doc_meta(row) for row in rows]
 
     @staticmethod
     def _build_candidate_filters(query: TextCandidateQuery) -> list[Any]:
@@ -172,10 +109,13 @@ class SqlTextSearchRepository:
             clauses.append(text_files_table.c.is_test.is_(False))
         if query.language:
             clauses.append(text_files_table.c.language == query.language.strip().lower())
-        clean_prefix = normalize_path_filter(query.path_prefix) if query.path_prefix else None
-        if clean_prefix:
-            escaped = escape_like(clean_prefix)
-            clauses.append(text_files_table.c.file_path.like(f"{escaped}%", escape="\\"))
+        prefix_clause = build_rel_path_prefix_clause(
+            text_files_table.c.file_path,
+            query.path_prefix,
+            directory_boundary=False,
+        )
+        if prefix_clause is not None:
+            clauses.append(prefix_clause)
         if query.required_trigrams:
             match_expr = " AND ".join(
                 '"' + trig.replace('"', '""') + '"' for trig in query.required_trigrams
@@ -195,37 +135,18 @@ class SqlTextSearchRepository:
             .where(*self._build_candidate_filters(query))
             .order_by(text_files_table.c.file_path)
         )
-        try:
+        with db_operation(
+            "Failed to query text search candidates",
+            context={"repo_id": query.repo_id},
+        ):
             rows = self._conn.execute(stmt).mappings().fetchall()
-            return [
-                TextDocumentRecord(
-                    id=str(row["id"]),
-                    repo_id=str(row["repo_id"]),
-                    file_path=str(row["file_path"]),
-                    language=str(row["language"]),
-                    content_hash=str(row["content_hash"]),
-                    size_bytes=int(row["size_bytes"]),
-                    line_count=int(row["line_count"]),
-                    mtime_ns=int(row["mtime_ns"]),
-                    is_test=bool(row["is_test"]),
-                    content=str(row["content"]),
-                )
-                for row in rows
-            ]
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed querying text candidates in %s: %s", query.repo_id, msg)
-            raise DatabaseError(f"Failed to query text search candidates: {msg}") from exc
+            return [row_to_text_doc_record(row) for row in rows]
 
     def check_fts_integrity(self) -> bool:
         """Run SQLite FTS5 ``'integrity-check'`` on ``text_fts``."""
-        try:
+        with db_operation("text_fts integrity-check failed"):
             self._conn.exec_driver_sql("INSERT INTO text_fts(text_fts) VALUES ('integrity-check')")
             return True
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("text_fts integrity-check failed: %s", msg)
-            raise DatabaseError(f"text_fts integrity-check failed: {msg}") from exc
 
 
 __all__ = [

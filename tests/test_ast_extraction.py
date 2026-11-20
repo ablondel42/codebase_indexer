@@ -235,9 +235,7 @@ def test_relative_imports_calls_linker_resolution_and_broken_target_reset(
     """SymbolLinker resolves intra-repo edges and resets broken targets back to placeholders."""
     repo = tmp_path / "app_repo"
     (repo / "pkg").mkdir(parents=True)
-    (repo / "pkg" / "__init__.py").write_text(
-        "from .core import BaseService\n", encoding="utf-8"
-    )
+    (repo / "pkg" / "__init__.py").write_text("from .core import BaseService\n", encoding="utf-8")
     (repo / "pkg" / "core.py").write_text(
         "def helper(x: int) -> int:\n"
         "    return x + 1\n"
@@ -291,9 +289,7 @@ def test_relative_imports_calls_linker_resolution_and_broken_target_reset(
         inh_edges = uow.edges.list_outgoing(by_name["Worker"], EdgeKind.INHERITS)
         assert [e.to_id for e in inh_edges] == [by_name["BaseService"]]
 
-        call_targets = {
-            e.to_id for e in uow.edges.list_outgoing(by_name["run"], EdgeKind.CALLS)
-        }
+        call_targets = {e.to_id for e in uow.edges.list_outgoing(by_name["run"], EdgeKind.CALLS)}
         assert {by_name["step"], by_name["compute"], by_name["helper"]}.issubset(call_targets)
 
         # Removing core.py preserves surviving AST edges and SymbolLinker resets broken targets
@@ -335,10 +331,7 @@ def test_duplicate_names_and_generator_scope_boundary(tmp_path: Path) -> None:
     repo = tmp_path / "gen_repo"
     repo.mkdir()
     (repo / "gen.py").write_text(
-        "def outer():\n"
-        "    def inner_gen():\n"
-        "        yield 1\n"
-        "    return inner_gen\n",
+        "def outer():\n    def inner_gen():\n        yield 1\n    return inner_gen\n",
         encoding="utf-8",
     )
     gen_ext = _extract_single_file(repo, "gen.py")

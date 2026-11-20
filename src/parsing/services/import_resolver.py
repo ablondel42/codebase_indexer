@@ -84,9 +84,7 @@ class ImportLinkResolver:
         mod_name = str(payload.get("module") or "")
         sym_name = self._extract_from_symbol_name(edge, mod_name)
         target = f"{mod_name}.{sym_name}" if mod_name else sym_name
-        placeholder_id = str(
-            payload.get("unresolved_target") or f"external_or_unresolved:{target}"
-        )
+        placeholder_id = str(payload.get("unresolved_target") or f"external_or_unresolved:{target}")
 
         if sym_name == "*" or not sym_name:
             mod_node = index.find_module(mod_name)
@@ -115,12 +113,7 @@ class ImportLinkResolver:
         payload = edge.payload
         mod_name = str(payload.get("module") or "")
         sym_name = self._extract_from_symbol_name(edge, mod_name)
-        if (
-            payload.get("import_type") != "from"
-            or not mod_name
-            or not sym_name
-            or sym_name == "*"
-        ):
+        if payload.get("import_type") != "from" or not mod_name or not sym_name or sym_name == "*":
             return None
 
         mod_node = index.find_module(mod_name)
@@ -187,9 +180,7 @@ class ImportLinkResolver:
                 continue
             state.edges_checked += 1
             valid_id = (
-                resolved_id
-                if resolved_id is not None and index.has_node(resolved_id)
-                else None
+                resolved_id if resolved_id is not None and index.has_node(resolved_id) else None
             )
             r_delta, reset_delta = state.stage_edge_update(
                 edge,

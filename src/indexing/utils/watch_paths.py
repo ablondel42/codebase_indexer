@@ -6,9 +6,9 @@ from typing import Any
 
 from core.models.exceptions import PathSecurityError
 from core.utils.logging import get_logger
-from core.utils.pathing import ensure_safe_repo_file
+from core.utils.pathing import ensure_safe_repo_file, has_symlink_below_root
+from core.utils.text_files import is_ignored_text_dir
 from indexing.models.events import NormalizeContext
-from parsing.utils.filters import should_ignore_dir
 
 logger = get_logger("indexing.utils.watch_paths")
 
@@ -54,10 +54,10 @@ def is_ignored_watch_path(
 
     dir_parts, filename = parts[:-1], parts[-1]
     active_patterns = ignored_dirs if include_tests else (*ignored_dirs, *test_dir_names)
-    if any(should_ignore_dir(part, active_patterns) for part in dir_parts):
+    if any(is_ignored_text_dir(part, active_patterns) for part in dir_parts):
         return True
 
-    if not dir_parts and should_ignore_dir(filename, ignored_dirs):
+    if not dir_parts and is_ignored_text_dir(filename, ignored_dirs):
         return True
 
     return filename.startswith(".") or filename.endswith(_IGNORED_TEMP_SUFFIXES)
@@ -67,81 +67,8 @@ def is_supported_watch_file(
     repo_relative_path: str,
     supported_extensions: tuple[str, ...],
 ) -> bool:
-    """Check whether ``repo_relative_path`` ends with a supported source file suffix.
-
-    Args:
-        repo_relative_path: Repository-relative POSIX file path.
-        supported_extensions: Allowed file suffixes including leading dots (e.g. ``(".py",)``).
-
-    Returns:
-        ``True`` if ``repo_relative_path`` matches at least one supported extension.
-    """
+    """Check whether ``repo_relative_path`` ends with a supported source file suffix."""
     return any(repo_relative_path.endswith(ext) for ext in supported_extensions)
-
-
-def _find_root_base_for_candidate(
-    candidate: Path,
-    raw_root: Path,
-    resolved_root: Path,
-) -> Path | None:
-    """Locate the ancestor ``Path`` matching ``repo_root`` without flagging OS symlinks above root.
-
-    Args:
-        candidate: Absolute candidate path under inspection.
-        raw_root: Raw ``repo_root`` path as supplied by the caller.
-        resolved_root: Resolved ``repo_root`` directory path.
-
-    Returns:
-        Matching ancestor ``Path`` for relative segment walking, or ``None``.
-    """
-    if candidate.is_relative_to(resolved_root):
-        return resolved_root
-    if candidate.is_relative_to(raw_root):
-        return raw_root
-    for parent in candidate.parents:
-        try:
-            if parent.resolve() == resolved_root:
-                return parent
-        except OSError as exc:
-            logger.debug(
-                "Skipping unresolvable ancestor %s while matching root %s: %s",
-                parent,
-                resolved_root,
-                exc,
-            )
-    return None
-
-
-def has_symlink_below_root(
-    candidate: Path,
-    raw_root: Path,
-    resolved_root: Path,
-) -> bool:
-    """Return ``True`` if any path segment of ``candidate`` below ``repo_root`` is a symlink.
-
-    Args:
-        candidate: Absolute candidate path being checked.
-        raw_root: Raw ``repo_root`` path supplied by the caller.
-        resolved_root: Resolved ``repo_root`` path.
-
-    Returns:
-        ``True`` if a symlink component exists below ``repo_root``, else ``False``.
-    """
-    base_for_parts = _find_root_base_for_candidate(candidate, raw_root, resolved_root)
-    if base_for_parts is None:
-        return False
-
-    current = base_for_parts
-    for part in candidate.relative_to(base_for_parts).parts:
-        if part in ("", "."):
-            continue
-        if part == "..":
-            current = current.parent
-            continue
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
 
 
 def _coerce_path_str(value: Any) -> str | None:
@@ -223,9 +150,7 @@ def extract_watchdog_paths(raw_event: Any) -> tuple[str | None, str | None, str 
     else:
         src_path = None
 
-    dest_path = (
-        _coerce_path_str(raw_event.dest_path) if hasattr(raw_event, "dest_path") else None
-    )
+    dest_path = _coerce_path_str(raw_event.dest_path) if hasattr(raw_event, "dest_path") else None
     return raw_type, src_path, dest_path
 
 
@@ -296,6 +221,17 @@ def resolve_watch_candidate(
     if not candidate.is_absolute():
         candidate = ctx.resolved_root / candidate
 
+    if require_safe_existing_file and os.path.lexists(candidate):
+        try:
+            resolved_candidate = ensure_safe_repo_file(ctx.repo_root, candidate)
+            rel_path = resolved_candidate.relative_to(ctx.resolved_root).as_posix()
+        except (PathSecurityError, ValueError) as exc:
+            logger.warning("Rejecting unsafe watch event target %s: %s", candidate, exc)
+            return None
+        if not rel_path or rel_path == ".":
+            return None
+        return resolved_candidate, rel_path
+
     if candidate.is_symlink() or has_symlink_below_root(
         candidate,
         ctx.repo_root,
@@ -304,19 +240,7 @@ def resolve_watch_candidate(
         logger.debug("Ignoring symlink watch event path: %s", candidate)
         return None
 
-    confined = _resolve_confined_rel_path(candidate, ctx.resolved_root)
-    if confined is None:
-        return None
-    resolved_candidate, rel_path = confined
-
-    if require_safe_existing_file and os.path.lexists(candidate):
-        try:
-            resolved_candidate = ensure_safe_repo_file(ctx.repo_root, candidate)
-        except PathSecurityError as exc:
-            logger.warning("Rejecting unsafe watch event target %s: %s", candidate, exc)
-            return None
-
-    return resolved_candidate, rel_path
+    return _resolve_confined_rel_path(candidate, ctx.resolved_root)
 
 
 __all__ = [

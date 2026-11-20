@@ -1,6 +1,6 @@
-"""Async MCP handlers for repository overview, file listing, outlines, and symbol search."""
+"""Synchronous MCP handlers for repository overview, file listing, outlines, and search."""
 
-import asyncio
+from typing import Any
 
 from core.models.search import CodeSearchQuery
 from core.utils.logging import get_logger
@@ -19,48 +19,28 @@ from mcp_server.utils.compact import (
     adapt_outline,
     adapt_repo_overview,
     adapt_symbol_search,
-    serialize_mcp_json,
 )
-from mcp_server.utils.errors import success_result
 
 logger = get_logger("mcp_server.services.repo_handlers")
 
 
 class RepoMcpHandlers:
-    """Async MCP handlers for repository- and file-scoped read tools."""
+    """MCP handlers for repository- and file-scoped read tools."""
 
     def __init__(self, engine: IndexerEngine) -> None:
-        """Initialize repository MCP handlers over an ``IndexerEngine``.
-
-        Args:
-            engine: Headless ``IndexerEngine`` application facade.
-        """
+        """Initialize repository MCP handlers over an ``IndexerEngine``."""
         self._engine = engine
 
-    def _run_get_repo_overview(self, inp: GetRepoOverviewInput) -> str:
-        """Execute ``get_repo_overview`` synchronously on a worker thread.
+    def get_repo_overview(self, inp: GetRepoOverviewInput) -> dict[str, Any]:
+        """Return compact repository metadata, graph statistics, and top directories."""
+        logger.debug("Executing MCP get_repo_overview (repo_id=%s)", inp.repo_id)
+        overview = self._engine.for_db(inp.db_path).queries.get_repo_overview(inp.repo_id)
+        return adapt_repo_overview(overview)
 
-        Args:
-            inp: Validated ``GetRepoOverviewInput`` model.
-
-        Returns:
-            Serialized compact JSON success envelope.
-        """
-        scoped = self._engine.for_db(inp.db_path)
-        overview = scoped.queries.get_repo_overview(inp.repo_id)
-        return serialize_mcp_json(success_result(adapt_repo_overview(overview)))
-
-    def _run_list_files(self, inp: ListFilesInput) -> str:
-        """Execute ``list_files`` synchronously on a worker thread.
-
-        Args:
-            inp: Validated ``ListFilesInput`` model.
-
-        Returns:
-            Serialized compact JSON success envelope.
-        """
-        scoped = self._engine.for_db(inp.db_path)
-        page = scoped.queries.list_files(
+    def list_files(self, inp: ListFilesInput) -> dict[str, Any]:
+        """Return paginated tracked repository files with optional prefix filtering."""
+        logger.debug("Executing MCP list_files (repo_id=%s, limit=%d)", inp.repo_id, inp.limit)
+        page = self._engine.for_db(inp.db_path).queries.list_files(
             ListFilesQuery(
                 repo=inp.repo_id,
                 path_prefix=inp.path_prefix,
@@ -70,19 +50,12 @@ class RepoMcpHandlers:
                 offset=inp.offset,
             )
         )
-        return serialize_mcp_json(success_result(adapt_file_list(page)))
+        return adapt_file_list(page)
 
-    def _run_get_file_outline(self, inp: GetFileOutlineInput) -> str:
-        """Execute ``get_file_outline`` synchronously on a worker thread.
-
-        Args:
-            inp: Validated ``GetFileOutlineInput`` model.
-
-        Returns:
-            Serialized compact JSON success envelope.
-        """
-        scoped = self._engine.for_db(inp.db_path)
-        outline = scoped.queries.get_file_outline(
+    def get_file_outline(self, inp: GetFileOutlineInput) -> dict[str, Any]:
+        """Return hierarchical symbol outline and deduplicated imports for a file."""
+        logger.debug("Executing MCP get_file_outline (file_path=%s)", inp.file_path)
+        outline = self._engine.for_db(inp.db_path).queries.get_file_outline(
             OutlineQuery(
                 file_path=inp.file_path,
                 repo=inp.repo_id,
@@ -90,19 +63,12 @@ class RepoMcpHandlers:
                 max_depth=inp.max_depth,
             )
         )
-        return serialize_mcp_json(success_result(adapt_outline(outline)))
+        return adapt_outline(outline)
 
-    def _run_search_symbols(self, inp: SearchSymbolsInput) -> str:
-        """Execute ``search_symbols`` synchronously on a worker thread.
-
-        Args:
-            inp: Validated ``SearchSymbolsInput`` model.
-
-        Returns:
-            Serialized compact JSON success envelope.
-        """
-        scoped = self._engine.for_db(inp.db_path)
-        page = scoped.queries.search_symbols(
+    def search_symbols(self, inp: SearchSymbolsInput) -> dict[str, Any]:
+        """Search repository symbols via FTS5 with exact/prefix ranking."""
+        logger.debug("Executing MCP search_symbols (query=%r)", inp.query)
+        page = self._engine.for_db(inp.db_path).queries.search_symbols(
             SearchSymbolsQuery(
                 query=inp.query,
                 repo=inp.repo_id,
@@ -111,12 +77,12 @@ class RepoMcpHandlers:
                 limit=inp.limit,
             )
         )
-        return serialize_mcp_json(success_result(adapt_symbol_search(page)))
+        return adapt_symbol_search(page)
 
-    def _run_search_code(self, inp: SearchCodeInput) -> str:
-        """Execute ``search_code`` synchronously on a worker thread."""
-        scoped = self._engine.for_db(inp.db_path)
-        report = scoped.queries.search_code(
+    def search_code(self, inp: SearchCodeInput) -> dict[str, Any]:
+        """Search all UTF-8 repository text files with trigram pruning and live-disk overlay."""
+        logger.debug("Executing MCP search_code (query=%r, regex=%s)", inp.query, inp.regex)
+        report = self._engine.for_db(inp.db_path).queries.search_code(
             CodeSearchQuery(
                 query=inp.query,
                 repo=inp.repo_id,
@@ -131,60 +97,7 @@ class RepoMcpHandlers:
                 offset=inp.offset,
             )
         )
-        return serialize_mcp_json(success_result(adapt_code_search(report)))
-
-    async def get_repo_overview(self, inp: GetRepoOverviewInput) -> str:
-        """Return compact repository metadata, graph statistics, and top directories.
-
-        Args:
-            inp: Validated ``GetRepoOverviewInput`` model.
-
-        Returns:
-            Serialized compact JSON MCP success envelope string.
-        """
-        logger.debug("Executing MCP get_repo_overview (repo_id=%s)", inp.repo_id)
-        return await asyncio.to_thread(self._run_get_repo_overview, inp)
-
-    async def list_files(self, inp: ListFilesInput) -> str:
-        """Return paginated tracked repository files with optional prefix filtering.
-
-        Args:
-            inp: Validated ``ListFilesInput`` model.
-
-        Returns:
-            Serialized compact JSON MCP success envelope string.
-        """
-        logger.debug("Executing MCP list_files (repo_id=%s, limit=%d)", inp.repo_id, inp.limit)
-        return await asyncio.to_thread(self._run_list_files, inp)
-
-    async def get_file_outline(self, inp: GetFileOutlineInput) -> str:
-        """Return hierarchical symbol outline and deduplicated imports for a file.
-
-        Args:
-            inp: Validated ``GetFileOutlineInput`` model.
-
-        Returns:
-            Serialized compact JSON MCP success envelope string.
-        """
-        logger.debug("Executing MCP get_file_outline (file_path=%s)", inp.file_path)
-        return await asyncio.to_thread(self._run_get_file_outline, inp)
-
-    async def search_symbols(self, inp: SearchSymbolsInput) -> str:
-        """Search repository symbols via FTS5 with exact/prefix ranking.
-
-        Args:
-            inp: Validated ``SearchSymbolsInput`` model.
-
-        Returns:
-            Serialized compact JSON MCP success envelope string.
-        """
-        logger.debug("Executing MCP search_symbols (query=%r)", inp.query)
-        return await asyncio.to_thread(self._run_search_symbols, inp)
-
-    async def search_code(self, inp: SearchCodeInput) -> str:
-        """Search all UTF-8 repository text files with trigram pruning and live-disk overlay."""
-        logger.debug("Executing MCP search_code (query=%r, regex=%s)", inp.query, inp.regex)
-        return await asyncio.to_thread(self._run_search_code, inp)
+        return adapt_code_search(report)
 
 
 __all__ = [

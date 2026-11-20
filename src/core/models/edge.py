@@ -5,7 +5,7 @@ from typing import Any
 from pydantic import Field, field_validator
 
 from core.models.base import FrozenModel
-from core.models.enums import EdgeKind, SymbolKind, SymbolScope
+from core.models.enums import EdgeKind
 from core.models.range import Range
 from core.utils.pathing import format_edge_location
 from core.utils.timestamps import validate_iso_timestamp
@@ -86,26 +86,6 @@ class SymbolReferenceStats(FrozenModel):
     available: bool = False
     last_refreshed_at: str | None = None
     reference_source: str = "ast"
-
-
-class ReferencedByDetail(FrozenModel):
-    """Caller or referencing symbol metadata joined with its containing file."""
-
-    id: str
-    repo_id: str
-    file_id: str
-    language: str = "python"
-    kind: SymbolKind
-    name: str
-    qualified_name: str
-    uri: str
-    start_line: int | None = None
-    end_line: int | None = None
-    signature: str | None = None
-    scope: SymbolScope | None = None
-    lexical_parent_id: str | None = None
-    file_path: str | None = None
-    module_path: str | None = None
 
 
 class ReferencingSiteRef(FrozenModel):

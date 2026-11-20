@@ -116,14 +116,10 @@ class RepoWatcher:
         resolved_config = config if config is not None else AppConfig()
         self._config = resolved_config
         self._normalizer = (
-            normalizer
-            if normalizer is not None
-            else WatchEventNormalizer(config=resolved_config)
+            normalizer if normalizer is not None else WatchEventNormalizer(config=resolved_config)
         )
         self._incremental = (
-            incremental
-            if incremental is not None
-            else IncrementalIndexer(config=resolved_config)
+            incremental if incremental is not None else IncrementalIndexer(config=resolved_config)
         )
         self._observer_factory = observer_factory if observer_factory is not None else Observer
 
@@ -186,7 +182,12 @@ class RepoWatcher:
             on_event: Optional ``EventCallback`` receiving ``WatchFileProcessedEvent`` items.
         """
         with uow_factory.open() as uow:
-            batch_result = self._incremental.process_batch(uow, resolved_root, events)
+            batch_result = self._incremental.process_batch(
+                uow,
+                resolved_root,
+                events,
+                already_collapsed=True,
+            )
 
         for item in batch_result.results:
             self._log_file_result(item, verbose=verbose)

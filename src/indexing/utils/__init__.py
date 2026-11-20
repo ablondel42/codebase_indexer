@@ -1,6 +1,10 @@
 """Pure stateless path, symlink, and event-collapsing utilities for ``indexing``."""
 
-from indexing.utils.collapse import collapse_events, collapse_path_events
+from indexing.utils.collapse import (
+    build_repo_upsert_record,
+    collapse_events,
+    collapse_path_events,
+)
 from indexing.utils.watch_paths import (
     extract_watchdog_paths,
     has_symlink_below_root,
@@ -10,6 +14,7 @@ from indexing.utils.watch_paths import (
 )
 
 __all__ = [
+    "build_repo_upsert_record",
     "collapse_events",
     "collapse_path_events",
     "extract_watchdog_paths",

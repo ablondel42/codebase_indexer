@@ -24,7 +24,7 @@ from core.models.search import (
 )
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.logging import get_logger
-from core.utils.pathing import derive_file_id
+from core.utils.pathing import derive_file_id, normalize_rel_path_prefix
 from core.utils.text_files import read_text_document, walk_repo_text_stats
 
 logger = get_logger("context.services.code_search")
@@ -38,23 +38,13 @@ class CodeSearchService:
         self._config = config if config is not None else AppConfig()
 
     @staticmethod
-    def _clean_prefix(path_prefix: str | None) -> str:
-        """Normalize ``path_prefix`` while preserving leading dot-directories (e.g. ``.agents``)."""
-        if not path_prefix:
-            return ""
-        cleaned = path_prefix.strip().replace("\\", "/")
-        while cleaned.startswith("./"):
-            cleaned = cleaned.removeprefix("./")
-        return cleaned.rstrip("/")
-
-    @classmethod
-    def _matches_doc_filters(cls, doc: TextDocumentRecord, query: CodeSearchQuery) -> bool:
+    def _matches_doc_filters(doc: TextDocumentRecord, query: CodeSearchQuery) -> bool:
         """Return ``True`` when ``doc`` satisfies test, prefix, and language filters."""
         if not query.include_tests and doc.is_test:
             return False
         if query.language and doc.language != query.language.strip().lower():
             return False
-        clean_prefix = cls._clean_prefix(query.path_prefix)
+        clean_prefix = normalize_rel_path_prefix(query.path_prefix)
         return not (clean_prefix and not doc.file_path.startswith(clean_prefix))
 
     @staticmethod
@@ -93,7 +83,7 @@ class CodeSearchService:
             test_dir_names=self._config.test_dir_names,
         )
         deleted_paths = set(indexed_by_path) - {st.file_path for st in disk_stats}
-        clean_prefix = self._clean_prefix(query.path_prefix)
+        clean_prefix = normalize_rel_path_prefix(query.path_prefix)
         dirty_paths: set[str] = set()
         live_docs: dict[str, TextDocumentRecord] = {}
 

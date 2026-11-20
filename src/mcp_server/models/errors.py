@@ -19,7 +19,6 @@ class McpErrorCode(StrEnum):
     AMBIGUOUS_SYMBOL = "ambiguous_symbol"
     REFERENCES_UNAVAILABLE = "references_unavailable"
     LSP_FAILURE = "lsp_failure"
-    STALE_CONTEXT = "stale_context"
     PATH_SECURITY = "path_security_error"
     PARSE_ERROR = "parse_error"
     INTERNAL_ERROR = "internal_error"

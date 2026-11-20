@@ -31,24 +31,28 @@ from storage.services.uow import SqlUnitOfWorkFactory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
-EXPECTED_DOMAINS: frozenset[str] = frozenset(
-    {
-        "core",
-        "storage",
-        "lsp",
-        "parsing",
-        "graph",
-        "context",
-        "indexing",
-        "engine",
-        "mcp_server",
-        "cli",
-    }
-)
+EXPECTED_DOMAINS: frozenset[str] = frozenset({
+    "core",
+    "storage",
+    "lsp",
+    "parsing",
+    "graph",
+    "context",
+    "indexing",
+    "engine",
+    "mcp_server",
+    "cli",
+})
 
-DOMAIN_SERVICE_PACKAGES: frozenset[str] = frozenset(
-    {"storage", "parsing", "lsp", "graph", "context", "indexing", "engine"}
-)
+DOMAIN_SERVICE_PACKAGES: frozenset[str] = frozenset({
+    "storage",
+    "parsing",
+    "lsp",
+    "graph",
+    "context",
+    "indexing",
+    "engine",
+})
 
 STDLIB_NON_SQLITE: frozenset[str] = frozenset(sys.stdlib_module_names) - {"sqlite3"}
 
@@ -60,67 +64,62 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
     "graph": frozenset({"core", "graph", "pydantic"}),
     "context": frozenset({"core", "graph", "context", "pydantic"}),
     "indexing": frozenset({"core", "parsing", "lsp", "indexing", "pydantic", "watchdog"}),
-    "engine": frozenset(
-        {
-            "core",
-            "storage",
-            "lsp",
-            "parsing",
-            "graph",
-            "context",
-            "indexing",
-            "engine",
-            "pydantic",
-        }
-    ),
-    "mcp_server": frozenset(
-        {
-            "core",
-            "engine",
-            "graph.models",
-            "context.models",
-            "indexing.models",
-            "mcp_server",
-            "pydantic",
-            "mcp",
-        }
-    ),
-    "cli": frozenset(
-        {
-            "core",
-            "engine",
-            "graph.models",
-            "context.models",
-            "indexing.models",
-            "cli",
-            "pydantic",
-        }
-    ),
+    "engine": frozenset({
+        "core",
+        "storage",
+        "lsp",
+        "parsing",
+        "graph",
+        "context",
+        "indexing",
+        "engine",
+        "pydantic",
+    }),
+    "mcp_server": frozenset({
+        "core",
+        "engine",
+        "graph.models",
+        "context.models",
+        "indexing.models",
+        "mcp_server",
+        "pydantic",
+        "mcp",
+    }),
+    "cli": frozenset({
+        "core",
+        "engine",
+        "graph.models",
+        "context.models",
+        "indexing.models",
+        "cli",
+        "pydantic",
+    }),
 }
 
-ALLOWED_PROTOCOL_DICT_RETURNS: frozenset[str] = frozenset(
-    {
-        "dict[str, FileRecord]",
-        "dict[str, SymbolNode]",
-        "dict[str, SymbolSummary]",
-    }
-)
+ALLOWED_PROTOCOL_DICT_RETURNS: frozenset[str] = frozenset({
+    "dict[str, FileRecord]",
+    "dict[str, SymbolNode]",
+    "dict[str, SymbolSummary]",
+})
 
-DOCUMENTED_BROAD_EXCEPT_FILES: frozenset[str] = frozenset(
-    {
-        "cli/services/app.py",
-        "indexing/services/batch.py",
-        "indexing/services/incremental.py",
-        "indexing/services/scheduler.py",
-        "lsp/services/transport.py",
-        "mcp_server/services/registry.py",
-        "storage/services/uow.py",
-    }
-)
+DOCUMENTED_BROAD_EXCEPT_FILES: frozenset[str] = frozenset({
+    "cli/services/app.py",
+    "indexing/services/batch.py",
+    "indexing/services/incremental.py",
+    "indexing/services/scheduler.py",
+    "lsp/services/transport.py",
+    "mcp_server/services/registry.py",
+    "storage/services/uow.py",
+})
 
-LOG_METHODS: frozenset[str] = frozenset(
-    {"debug", "info", "warning", "error", "exception", "critical"}
-)
+LOG_METHODS: frozenset[str] = frozenset({
+    "debug",
+    "info",
+    "warning",
+    "error",
+    "exception",
+    "critical",
+})
 
 
 @pytest.fixture
@@ -588,9 +587,7 @@ def _inspect_except_handler(
     if node.type is None:
         errors.append(f"{rel_posix}:{node.lineno}: bare 'except:' forbidden")
     if not _handler_raises_or_logs(node):
-        errors.append(
-            f"{rel_posix}:{node.lineno}: silent except handler neither raises nor logs"
-        )
+        errors.append(f"{rel_posix}:{node.lineno}: silent except handler neither raises nor logs")
     if _is_broad_exception_type(node.type):
         if node.type is not None and "ImportError" in ast.unparse(node.type):
             errors.append(f"{rel_posix}:{node.lineno}: try/except ImportError")
@@ -652,9 +649,7 @@ class TestHexagonalArchitectureBoundaryGate:
             pkg_dir = SRC_DIR / domain
             assert (pkg_dir / "__init__.py").is_file()
             child_dirs = {
-                d.name
-                for d in pkg_dir.iterdir()
-                if d.is_dir() and d.name != "__pycache__"
+                d.name for d in pkg_dir.iterdir() if d.is_dir() and d.name != "__pycache__"
             }
             expected_layers = (
                 {"ports", "models", "utils"}

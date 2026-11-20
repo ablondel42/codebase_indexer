@@ -61,25 +61,8 @@ class ServerCliCommands:
         return 0
 
     def run_mcp_call(self, args: argparse.Namespace) -> int:
-        """Execute a registered MCP tool in-process and emit byte/token telemetry.
-
-        Args:
-            args: Parsed ``cbi mcp-call`` CLI arguments.
-
-        Returns:
-            Process exit code ``0`` on ``ok: true``, or ``1`` on ``ok: false``.
-
-        Raises:
-            ValidationError: If ``tool_name`` is unknown or ``json_args`` cannot be parsed.
-        """
+        """Execute a registered MCP tool in-process and emit byte/token telemetry."""
         tool_name: str = args.tool_name
-        if tool_name not in McpToolRegistry.TOOL_NAMES:
-            available = ", ".join(McpToolRegistry.TOOL_NAMES)
-            raise ValidationError(
-                f"Unknown MCP tool {tool_name!r}. Available tools: {available}",
-                context={"tool": tool_name},
-            )
-
         try:
             parsed_args = parse_mcp_call_args(tool_name, self._extract_raw_tokens(args))
         except json.JSONDecodeError as exc:
@@ -89,7 +72,6 @@ class ServerCliCommands:
 
         resolved_default = resolve_cli_db_path(args, self._engine.db_path)
         kwargs = normalize_mcp_tool_kwargs(
-            tool_name,
             parsed_args,
             getattr(args, "db_path", None),
             resolved_default,

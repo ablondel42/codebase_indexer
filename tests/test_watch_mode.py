@@ -246,54 +246,48 @@ class TestCollapseAndSerializedScheduler:
         """``collapse_events`` and ``collapse_path_events`` preserve net lifecycle semantics."""
         assert collapse_path_events([]) is None
 
-        replaced = collapse_events(
-            [
-                FileChangeEvent(
-                    event_type=FileEventType.DELETED,
-                    absolute_path="/r/a.py",
-                    repo_relative_path="a.py",
-                ),
-                FileChangeEvent(
-                    event_type=FileEventType.CREATED,
-                    absolute_path="/r/a.py",
-                    repo_relative_path="a.py",
-                ),
-            ]
-        )
+        replaced = collapse_events([
+            FileChangeEvent(
+                event_type=FileEventType.DELETED,
+                absolute_path="/r/a.py",
+                repo_relative_path="a.py",
+            ),
+            FileChangeEvent(
+                event_type=FileEventType.CREATED,
+                absolute_path="/r/a.py",
+                repo_relative_path="a.py",
+            ),
+        ])
         assert [(e.event_type, e.repo_relative_path) for e in replaced] == [
             (FileEventType.MODIFIED, "a.py")
         ]
 
-        ephemeral = collapse_events(
-            [
-                FileChangeEvent(
-                    event_type=FileEventType.CREATED,
-                    absolute_path="/r/b.py",
-                    repo_relative_path="b.py",
-                ),
-                FileChangeEvent(
-                    event_type=FileEventType.DELETED,
-                    absolute_path="/r/b.py",
-                    repo_relative_path="b.py",
-                ),
-            ]
-        )
+        ephemeral = collapse_events([
+            FileChangeEvent(
+                event_type=FileEventType.CREATED,
+                absolute_path="/r/b.py",
+                repo_relative_path="b.py",
+            ),
+            FileChangeEvent(
+                event_type=FileEventType.DELETED,
+                absolute_path="/r/b.py",
+                repo_relative_path="b.py",
+            ),
+        ])
         assert ephemeral == []
 
-        created_mod = collapse_events(
-            [
-                FileChangeEvent(
-                    event_type=FileEventType.CREATED,
-                    absolute_path="/r/c.py",
-                    repo_relative_path="c.py",
-                ),
-                FileChangeEvent(
-                    event_type=FileEventType.MODIFIED,
-                    absolute_path="/r/c.py",
-                    repo_relative_path="c.py",
-                ),
-            ]
-        )
+        created_mod = collapse_events([
+            FileChangeEvent(
+                event_type=FileEventType.CREATED,
+                absolute_path="/r/c.py",
+                repo_relative_path="c.py",
+            ),
+            FileChangeEvent(
+                event_type=FileEventType.MODIFIED,
+                absolute_path="/r/c.py",
+                repo_relative_path="c.py",
+            ),
+        ])
         assert [(e.event_type, e.repo_relative_path) for e in created_mod] == [
             (FileEventType.CREATED, "c.py")
         ]

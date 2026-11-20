@@ -122,13 +122,11 @@ class JsonRpcTransport:
         """
         if not self._process.is_alive or (self._closing and not allow_while_closing):
             raise LspError("LSP client is not running.")
-        self._write_message(
-            {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": dict(params) if params is not None else {},
-            }
-        )
+        self._write_message({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": dict(params) if params is not None else {},
+        })
 
     def send_request(
         self,
@@ -153,20 +151,16 @@ class JsonRpcTransport:
         if self._closing or not self._process.is_alive:
             raise LspError("LSP client is not running.")
 
-        wait_timeout = (
-            self._options.request_timeout_seconds if timeout is None else float(timeout)
-        )
+        wait_timeout = self._options.request_timeout_seconds if timeout is None else float(timeout)
         msg_id, waiter = self._register_waiter()
 
         try:
-            self._write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": msg_id,
-                    "method": method,
-                    "params": dict(params) if params is not None else {},
-                }
-            )
+            self._write_message({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "method": method,
+                "params": dict(params) if params is not None else {},
+            })
         except LspError:
             self._discard_waiter(msg_id)
             raise
@@ -426,9 +420,7 @@ class JsonRpcTransport:
             raise LspError(f"Invalid JSON in LSP payload: {exc}") from exc
 
         if not isinstance(decoded, dict):
-            raise LspError(
-                f"Expected JSON object in LSP payload, got {type(decoded).__name__}."
-            )
+            raise LspError(f"Expected JSON object in LSP payload, got {type(decoded).__name__}.")
         return decoded
 
     def _read_headers(self, stdout: IO[bytes]) -> Mapping[str, str]:

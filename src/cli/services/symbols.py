@@ -1,4 +1,4 @@
-"""CLI command handlers for ``cbi files|outline|symbols|source``."""
+"""CLI command handlers for ``cbi files|outline|symbols|source|search``."""
 
 import argparse
 
@@ -11,10 +11,9 @@ from cli.utils.output import (
     format_symbol_context_for_cli,
     format_symbol_list_for_cli,
     format_symbol_search_for_cli,
-    resolve_cli_db_path,
+    resolve_scoped_engine,
 )
 from core.models.enums import SymbolKind
-from core.models.exceptions import ValidationError
 from core.models.search import CodeSearchQuery
 from core.utils.logging import get_logger
 from engine.models.queries import (
@@ -31,58 +30,23 @@ logger = get_logger("cli.services.symbols")
 
 
 class SymbolCliCommands:
-    """Executes file listing, outline, symbol search/list/show, and source CLI commands."""
+    """Executes file listing, outline, symbol search/list/show, source, and search CLI commands."""
 
     def __init__(self, engine: IndexerEngine) -> None:
-        """Initialize file and symbol CLI command handlers.
-
-        Args:
-            engine: Headless ``IndexerEngine`` application facade.
-        """
+        """Initialize file and symbol CLI command handlers."""
         self._engine = engine
 
     @staticmethod
     def _parse_optional_kind(raw_kind: str | None) -> SymbolKind | None:
-        """Coerce an optional CLI ``--kind`` string into a ``SymbolKind`` enum.
-
-        Args:
-            raw_kind: Optional ``--kind`` flag string or ``None``.
-
-        Returns:
-            Validated ``SymbolKind`` member, or ``None``.
-
-        Raises:
-            ValidationError: If ``raw_kind`` is not a valid ``SymbolKind``.
-        """
-        if raw_kind is None:
-            return None
-        try:
-            return SymbolKind(raw_kind)
-        except ValueError as exc:
-            raise ValidationError(
-                f"Invalid symbol kind: {raw_kind!r}",
-                context={"kind": raw_kind},
-            ) from exc
+        """Coerce an optional CLI ``--kind`` string into a ``SymbolKind`` enum."""
+        return SymbolKind(raw_kind) if raw_kind is not None else None
 
     def run_files(self, args: argparse.Namespace) -> int:
-        """List indexed files with line count, symbol count, and live disk freshness.
-
-        Args:
-            args: Parsed ``cbi files`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-
-        Raises:
-            ValidationError: If ``--limit < 1``.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
+        """List indexed files with line count, symbol count, and live disk freshness."""
+        scoped = resolve_scoped_engine(self._engine, args)
         limit = int(getattr(args, "limit", 50))
-        if limit < 1:
-            raise ValidationError("--limit must be >= 1", context={"limit": limit})
-
-        logger.debug("Running cbi files (db_path=%s, limit=%d)", db_path, limit)
-        page = self._engine.for_db(db_path).queries.list_files(
+        logger.debug("Running cbi files (db_path=%s, limit=%d)", scoped.db_path, limit)
+        page = scoped.queries.list_files(
             ListFilesQuery(
                 repo=getattr(args, "repo", None),
                 pattern=getattr(args, "pattern", None),
@@ -96,98 +60,47 @@ class SymbolCliCommands:
         return 0
 
     def run_outline(self, args: argparse.Namespace) -> int:
-        """Emit hierarchical symbol outline and imports for an indexed file.
-
-        Args:
-            args: Parsed ``cbi outline`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-
-        Raises:
-            ValidationError: If ``--max-depth < 0``.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
-        max_depth = int(getattr(args, "max_depth", 3))
-        if max_depth < 0:
-            raise ValidationError("--max-depth must be >= 0", context={"max_depth": max_depth})
-
-        include_private = not bool(getattr(args, "no_private", False))
+        """Emit hierarchical symbol outline and imports for an indexed file."""
+        scoped = resolve_scoped_engine(self._engine, args)
         file_path_arg: str = args.file_path
-        logger.debug("Running cbi outline for %s (db_path=%s)", file_path_arg, db_path)
-        outline = self._engine.for_db(db_path).queries.get_file_outline(
+        logger.debug("Running cbi outline for %s (db_path=%s)", file_path_arg, scoped.db_path)
+        outline = scoped.queries.get_file_outline(
             OutlineQuery(
                 file_path=file_path_arg,
                 repo=getattr(args, "repo", None),
-                include_private=include_private,
-                max_depth=max_depth,
+                include_private=not bool(getattr(args, "no_private", False)),
+                max_depth=int(getattr(args, "max_depth", 3)),
             )
         )
         emit_json(format_outline_for_cli(outline))
         return 0
 
     def run_search(self, args: argparse.Namespace) -> int:
-        """Search symbols via FTS5 with exact/prefix ranking and ``LIKE`` fallback.
-
-        Args:
-            args: Parsed ``cbi symbols search`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-
-        Raises:
-            ValidationError: If ``--limit < 1`` or ``--kind`` is invalid.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
-        limit = int(getattr(args, "limit", 20))
-        if limit < 1:
-            raise ValidationError("--limit must be >= 1", context={"limit": limit})
-
-        kind = self._parse_optional_kind(getattr(args, "kind", None))
-        logger.debug("Running cbi symbols search %r (db_path=%s)", args.query, db_path)
-        page = self._engine.for_db(db_path).queries.search_symbols(
+        """Search symbols via FTS5 with exact/prefix ranking and ``LIKE`` fallback."""
+        scoped = resolve_scoped_engine(self._engine, args)
+        logger.debug("Running cbi symbols search %r (db_path=%s)", args.query, scoped.db_path)
+        page = scoped.queries.search_symbols(
             SearchSymbolsQuery(
                 query=args.query,
                 repo=getattr(args, "repo", None),
-                kind=kind,
+                kind=self._parse_optional_kind(getattr(args, "kind", None)),
                 file_path=getattr(args, "file", None),
-                limit=limit,
+                limit=int(getattr(args, "limit", 20)),
             )
         )
         emit_json(format_symbol_search_for_cli(page))
         return 0
 
     def run_list(self, args: argparse.Namespace) -> int:
-        """List repository symbols with pagination and optional ``--kind``/``--file`` filters.
-
-        Args:
-            args: Parsed ``cbi symbols list`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-
-        Raises:
-            ValidationError: If ``--limit < 1``, ``--offset < 0``, or ``--kind`` is invalid.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
+        """List repository symbols with pagination and optional ``--kind``/``--file`` filters."""
+        scoped = resolve_scoped_engine(self._engine, args)
         limit = int(getattr(args, "limit", 50))
         offset = int(getattr(args, "offset", 0))
-        if limit < 1:
-            raise ValidationError("--limit must be >= 1", context={"limit": limit})
-        if offset < 0:
-            raise ValidationError("--offset must be >= 0", context={"offset": offset})
-
-        kind = self._parse_optional_kind(getattr(args, "kind", None))
-        logger.debug(
-            "Running cbi symbols list (db_path=%s, limit=%d, offset=%d)",
-            db_path,
-            limit,
-            offset,
-        )
-        page = self._engine.for_db(db_path).queries.list_symbols(
+        logger.debug("Running cbi symbols list (db_path=%s, limit=%d)", scoped.db_path, limit)
+        page = scoped.queries.list_symbols(
             ListSymbolsQuery(
                 repo=getattr(args, "repo", None),
-                kind=kind,
+                kind=self._parse_optional_kind(getattr(args, "kind", None)),
                 file_path=getattr(args, "file", None),
                 limit=limit,
                 offset=offset,
@@ -197,23 +110,15 @@ class SymbolCliCommands:
         return 0
 
     def run_show(self, args: argparse.Namespace) -> int:
-        """Emit rich symbol context including hierarchy, relationships, and freshness.
-
-        Args:
-            args: Parsed ``cbi symbols show`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
-        include_source = bool(getattr(args, "source", False))
+        """Emit rich symbol context including hierarchy, relationships, and freshness."""
+        scoped = resolve_scoped_engine(self._engine, args)
         id_or_name: str = args.id_or_name
-        logger.debug("Running cbi symbols show %r (db_path=%s)", id_or_name, db_path)
-        ctx = self._engine.for_db(db_path).queries.get_symbol_context(
+        logger.debug("Running cbi symbols show %r (db_path=%s)", id_or_name, scoped.db_path)
+        ctx = scoped.queries.get_symbol_context(
             ContextQuery(
                 symbol=id_or_name,
                 repo=getattr(args, "repo", None),
-                include_source=include_source,
+                include_source=bool(getattr(args, "source", False)),
                 max_source_lines=120,
                 edge_limit=20,
                 child_limit=20,
@@ -224,33 +129,16 @@ class SymbolCliCommands:
         return 0
 
     def run_source(self, args: argparse.Namespace) -> int:
-        """Emit line-numbered source snippet for a symbol.
-
-        Args:
-            args: Parsed ``cbi source`` CLI arguments.
-
-        Returns:
-            Process exit code ``0``.
-
-        Raises:
-            ValidationError: If ``--max-lines < 1`` or ``--offset < 0``.
-        """
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
-        max_lines = int(getattr(args, "max_lines", 120))
-        offset = int(getattr(args, "offset", 0))
-        if max_lines < 1:
-            raise ValidationError("--max-lines must be >= 1", context={"max_lines": max_lines})
-        if offset < 0:
-            raise ValidationError("--offset must be >= 0", context={"offset": offset})
-
+        """Emit line-numbered source snippet for a symbol."""
+        scoped = resolve_scoped_engine(self._engine, args)
         id_or_name: str = args.id_or_name
-        logger.debug("Running cbi source %r (db_path=%s)", id_or_name, db_path)
-        snippet = self._engine.for_db(db_path).queries.get_symbol_source(
+        logger.debug("Running cbi source %r (db_path=%s)", id_or_name, scoped.db_path)
+        snippet = scoped.queries.get_symbol_source(
             SourceQuery(
                 symbol=id_or_name,
                 repo=getattr(args, "repo", None),
-                max_lines=max_lines,
-                offset=offset,
+                max_lines=int(getattr(args, "max_lines", 120)),
+                offset=int(getattr(args, "offset", 0)),
             )
         )
         emit_json(format_source_for_cli(snippet))
@@ -258,18 +146,8 @@ class SymbolCliCommands:
 
     def run_code_search(self, args: argparse.Namespace) -> int:
         """Search all UTF-8 repository text files via ``cbi search``."""
-        db_path = resolve_cli_db_path(args, self._engine.db_path)
-        limit = int(getattr(args, "limit", 50))
-        offset = int(getattr(args, "offset", 0))
-        ctx = int(getattr(args, "context_lines", 0))
-        if limit < 1 or limit > 200:
-            raise ValidationError("--limit must be between 1 and 200", context={"limit": limit})
-        if offset < 0:
-            raise ValidationError("--offset must be >= 0", context={"offset": offset})
-        if ctx < 0 or ctx > 5:
-            raise ValidationError("--context must be between 0 and 5", context={"context": ctx})
-
-        report = self._engine.for_db(db_path).queries.search_code(
+        scoped = resolve_scoped_engine(self._engine, args)
+        report = scoped.queries.search_code(
             CodeSearchQuery(
                 query=args.query,
                 repo=getattr(args, "repo", None),
@@ -279,9 +157,9 @@ class SymbolCliCommands:
                 language=getattr(args, "language", None),
                 include_tests=not bool(getattr(args, "no_tests", False)),
                 verify_disk=True,
-                context_lines=ctx,
-                limit=limit,
-                offset=offset,
+                context_lines=int(getattr(args, "context_lines", 0)),
+                limit=int(getattr(args, "limit", 50)),
+                offset=int(getattr(args, "offset", 0)),
             )
         )
         emit_json(format_code_search_for_cli(report))

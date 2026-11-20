@@ -55,6 +55,9 @@ class RepoLinkCoordinator:
         )
         if report.updates:
             uow.edges.update_resolved_targets(report.updates)
+        dangling_deleted = uow.edges.delete_dangling_lsp_references(repo_id)
+        if dangling_deleted > 0:
+            report = report.model_copy(update={"dangling_lsp_deleted": dangling_deleted})
 
         logger.debug(
             "Linked repository %s (checked=%d, resolved=%d, reset=%d, updates=%d)",

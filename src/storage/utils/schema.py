@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.types import TypeDecorator
 
 from core.models.exceptions import ValidationError
+from core.utils.json_codec import to_json
 from core.utils.logging import get_logger
 
 logger = get_logger("storage.utils.schema")
@@ -47,7 +48,7 @@ class JsonText(TypeDecorator[Any]):
             return None
         if isinstance(value, str):
             return value
-        return json.dumps(value, sort_keys=True)
+        return to_json(value)
 
     def process_result_value(self, value: str | None, dialect: Any) -> Any:
         """Deserialize a SQLite JSON text value back into a Python object.

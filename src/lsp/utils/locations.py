@@ -3,7 +3,6 @@
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 from core.models.edge import Edge
 from core.models.enums import PREFIX_EDGE, EdgeKind, SymbolKind
@@ -214,81 +213,33 @@ def get_reference_query_position(symbol: SymbolNode | SymbolSummary) -> Position
     )
 
 
-def _add_unique_uri(candidates: list[str], value: str) -> None:
-    """Append ``value`` to ``candidates`` when non-empty and not yet present.
-
-    Args:
-        candidates: Mutable list accumulating candidate URI strings.
-        value: Candidate URI string to append.
-    """
-    if value and value not in candidates:
-        candidates.append(value)
-
-
-def _add_path_uris(candidates: list[str], path: Path) -> None:
-    """Append ``as_uri()`` and percent-decoded URI variants for an absolute ``Path``.
-
-    Args:
-        candidates: Mutable list accumulating candidate URI strings.
-        path: Candidate filesystem ``Path``.
-    """
-    if not path.is_absolute():
-        return
+def read_bounded_lsp_text(file_path: Path, max_bytes: int) -> str:
+    """Read bounded UTF-8 text from ``file_path``, raising ``LspError`` on size or I/O errors."""
     try:
-        path_uri = path.as_uri()
-    except ValueError as exc:
-        logger.debug("Skipping invalid URI conversion for path %s: %s", path, exc)
-        return
-    _add_unique_uri(candidates, path_uri)
-    _add_unique_uri(candidates, unquote(path_uri))
-
-
-def _normalize_parsed_uri_path(raw_path: str) -> Path:
-    """Decode a percent-escaped URI path and normalize Windows drive prefixes.
-
-    Args:
-        raw_path: Raw ``urlparse(uri).path`` component.
-
-    Returns:
-        Normalized ``Path`` instance.
-    """
-    decoded = unquote(raw_path)
-    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
-        decoded = decoded[1:]
-    return Path(decoded)
-
-
-def extract_uri_candidates(uri: str) -> tuple[list[str], Path | None]:
-    """Derive candidate ``file://`` URI strings and canonical ``Path`` from a URI.
-
-    Args:
-        uri: Raw ``file://`` URI string reported by an LSP server.
-
-    Returns:
-        Tuple of ``(candidate_uris, resolved_path_or_none)``.
-    """
-    if not uri:
-        return [], None
-
-    candidates: list[str] = []
-    _add_unique_uri(candidates, uri)
-    _add_unique_uri(candidates, unquote(uri))
-
-    parsed = urlparse(uri)
-    if parsed.scheme not in ("file", "") or not parsed.path:
-        return candidates, None
-
-    raw_path = _normalize_parsed_uri_path(parsed.path)
-    _add_path_uris(candidates, raw_path)
-
-    try:
-        resolved_path = raw_path.resolve()
+        size_bytes = file_path.stat().st_size
     except OSError as exc:
-        logger.debug("Cannot resolve filesystem path %s for URI %s: %s", raw_path, uri, exc)
-        resolved_path = raw_path
-    _add_path_uris(candidates, resolved_path)
+        raise LspError(
+            f"Unable to stat file {file_path}: {exc}",
+            context={"file_path": str(file_path)},
+        ) from exc
 
-    return candidates, resolved_path
+    if size_bytes > max_bytes:
+        raise LspError(
+            f"File {file_path} ({size_bytes} bytes) exceeds max_file_size_bytes ({max_bytes}).",
+            context={
+                "file_path": str(file_path),
+                "size_bytes": size_bytes,
+                "limit": max_bytes,
+            },
+        )
+
+    try:
+        return file_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LspError(
+            f"Unable to read file {file_path}: {exc}",
+            context={"file_path": str(file_path)},
+        ) from exc
 
 
 def build_reference_edge(
@@ -299,26 +250,9 @@ def build_reference_edge(
     evidence_uri: str,
     usage_range: Range,
 ) -> Edge:
-    """Construct a deterministic LSP ``references`` ``Edge`` model.
-
-    Derives ``mapping_mode`` and ``confidence`` from ``source.kind``
-    (``SymbolKind.MODULE`` -> ``"module_scope"`` / ``0.9``, otherwise
-    ``"exact_symbol"`` / ``0.9``).
-
-    Args:
-        repo_id: Owning repository identifier.
-        target: Referenced target ``SymbolNode``.
-        source: Referencing source ``SymbolNode`` (symbol or module fallback).
-        file_id: Evidence ``FileRecord`` identifier containing the reference site.
-        evidence_uri: Evidence ``file://`` URI reported for the reference site.
-        usage_range: Zero-based codepoint ``Range`` of the reference site.
-
-    Returns:
-        Validated immutable ``Edge`` instance with ``source="lsp"``.
-    """
+    """Construct a deterministic LSP ``references`` ``Edge`` model."""
     is_module_scope = source.kind == SymbolKind.MODULE
     mapping_mode = "module_scope" if is_module_scope else "exact_symbol"
-    confidence = CONFIDENCE_MODULE if is_module_scope else CONFIDENCE_EXACT
     site_line = usage_range.start.line + 1
     site_col = usage_range.start.character + 1
     edge_id = (
@@ -332,7 +266,7 @@ def build_reference_edge(
         from_id=source.id,
         to_id=target.id,
         source="lsp",
-        confidence=confidence,
+        confidence=CONFIDENCE_EXACT,
         evidence_file_id=file_id,
         evidence_uri=evidence_uri,
         evidence_range=usage_range,

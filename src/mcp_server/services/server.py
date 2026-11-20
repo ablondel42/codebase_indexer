@@ -22,49 +22,29 @@ class McpServerRunner:
         *,
         engine: IndexerEngine | None = None,
     ) -> None:
-        """Initialize the MCP server runner.
-
-        Args:
-            config: Optional base ``AppConfig`` (defaults to ``AppConfig()``).
-            engine: Optional injected ``IndexerEngine`` reused across server creation.
-        """
+        """Initialize the MCP server runner."""
         self._config = config if config is not None else AppConfig()
         self._engine = engine
 
-    def _acquire_engine(self, db_path: Path | str | None) -> IndexerEngine:
-        """Acquire or scope an ``IndexerEngine`` targeting ``db_path``.
-
-        Args:
-            db_path: Optional override SQLite database path.
-
-        Returns:
-            Scoped ``IndexerEngine`` instance.
-        """
+    def _acquire_engine(self, db_path: Path | str | None) -> tuple[IndexerEngine, bool]:
+        """Acquire or scope an ``IndexerEngine`` and report whether this call owns closing it."""
         if self._engine is not None:
-            return self._engine.for_db(db_path)
+            return self._engine.for_db(db_path), False
         scoped_cfg = (
             self._config.model_copy(update={"db_path": Path(db_path)})
             if db_path is not None
             else self._config
         )
-        return IndexerEngine(scoped_cfg)
+        return IndexerEngine(scoped_cfg), True
 
-    def create_server(
+    def _build_server_with_engine(
         self,
+        db_path: Path | str | None,
         *,
-        db_path: Path | str | None = None,
-        debug: bool = False,
-    ) -> MCPServer[Any]:
-        """Construct an ``MCPServer`` with all 8 token-lean tools registered.
-
-        Args:
-            db_path: Optional SQLite database path bound to registered tools.
-            debug: Whether to emit debug creation diagnostics.
-
-        Returns:
-            Configured ``MCPServer`` instance.
-        """
-        engine = self._acquire_engine(db_path)
+        debug: bool,
+    ) -> tuple[MCPServer[Any], IndexerEngine, bool]:
+        """Construct an ``MCPServer`` bound to a scoped ``IndexerEngine``."""
+        engine, owns_engine = self._acquire_engine(db_path)
         server = MCPServer(engine.config.app_name)
         McpToolRegistry(engine).bind(server, db_path=engine.db_path)
         if debug:
@@ -72,6 +52,16 @@ class McpServerRunner:
                 "MCP server created with tools: %s",
                 ", ".join(McpToolRegistry.TOOL_NAMES),
             )
+        return server, engine, owns_engine
+
+    def create_server(
+        self,
+        *,
+        db_path: Path | str | None = None,
+        debug: bool = False,
+    ) -> MCPServer[Any]:
+        """Construct an ``MCPServer`` with all 9 token-lean tools registered."""
+        server, _, _ = self._build_server_with_engine(db_path, debug=debug)
         return server
 
     def run_stdio(
@@ -80,23 +70,17 @@ class McpServerRunner:
         db_path: Path | str | None = None,
         debug: bool = False,
     ) -> None:
-        """Run the MCP server on ``stdio`` transport and close ``engine`` on exit.
-
-        Args:
-            db_path: Optional SQLite database path bound to registered tools.
-            debug: Whether to configure ``DEBUG`` logging to ``stderr`` when unconfigured.
-        """
+        """Run the MCP server on ``stdio`` transport and close owned ``engine`` resources."""
         if debug and not is_logging_configured():
             configure_logging(level="DEBUG")
 
-        engine = self._acquire_engine(db_path)
-        server = MCPServer(engine.config.app_name)
-        McpToolRegistry(engine).bind(server, db_path=engine.db_path)
+        server, engine, owns_engine = self._build_server_with_engine(db_path, debug=debug)
         logger.info("Starting MCP server on stdio (db_path=%s)", engine.db_path)
         try:
             server.run(transport="stdio")
         finally:
-            engine.close()
+            if owns_engine:
+                engine.close()
 
 
 __all__ = [

@@ -16,7 +16,6 @@ from parsing.services.scanner import RepoScanner
 from parsing.services.scope import (
     DuplicateTracker,
     FileExtractionSession,
-    ScopeContext,
     ScopeTracker,
 )
 from parsing.services.symbol_index import RepoSymbolIndex
@@ -39,7 +38,6 @@ __all__ = [
     "ModuleExtractor",
     "RepoScanner",
     "RepoSymbolIndex",
-    "ScopeContext",
     "ScopeTracker",
     "SymbolLinker",
 ]

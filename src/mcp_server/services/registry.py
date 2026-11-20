@@ -1,20 +1,19 @@
 """MCP tool registration and in-process tool invocation registry service."""
 
-import inspect
-from collections.abc import Callable, Coroutine, Mapping
+import asyncio
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
 from pydantic import ValidationError as PydanticValidationError
 
-from core.models.enums import SymbolKind
 from core.models.exceptions import IndexerError, ValidationError
 from core.utils.logging import get_logger
 from engine.services.facade import IndexerEngine
-from graph.models.references import ReferenceDirection
 from mcp_server.models.inputs import (
     AnalyzeRiskInput,
+    BaseMcpToolInput,
     GetFileOutlineInput,
     GetRepoOverviewInput,
     GetSymbolContextInput,
@@ -27,39 +26,12 @@ from mcp_server.models.inputs import (
 from mcp_server.services.repo_handlers import RepoMcpHandlers
 from mcp_server.services.symbol_handlers import SymbolMcpHandlers
 from mcp_server.utils.compact import serialize_mcp_json
-from mcp_server.utils.errors import map_exception_to_error_result
+from mcp_server.utils.errors import map_exception_to_error_result, success_result
+from mcp_server.utils.signatures import build_mcp_tool_signature
 
 logger = get_logger("mcp_server.services.registry")
 
-_PK = inspect.Parameter.POSITIONAL_OR_KEYWORD
-_SEARCH_CODE_SIGNATURE = inspect.Signature(
-    parameters=[
-        inspect.Parameter("query", _PK, annotation=str),
-        inspect.Parameter("repo_id", _PK, default=None, annotation=str | None),
-        inspect.Parameter("regex", _PK, default=False, annotation=bool),
-        inspect.Parameter("case_sensitive", _PK, default=False, annotation=bool),
-        inspect.Parameter("path_prefix", _PK, default=None, annotation=str | None),
-        inspect.Parameter("language", _PK, default=None, annotation=str | None),
-        inspect.Parameter("include_tests", _PK, default=True, annotation=bool),
-        inspect.Parameter("context_lines", _PK, default=0, annotation=int),
-        inspect.Parameter("limit", _PK, default=50, annotation=int),
-        inspect.Parameter("offset", _PK, default=0, annotation=int),
-    ],
-    return_annotation=str,
-)
-_SEARCH_CODE_ANNOTATIONS: dict[str, Any] = {
-    "query": str,
-    "repo_id": str | None,
-    "regex": bool,
-    "case_sensitive": bool,
-    "path_prefix": str | None,
-    "language": str | None,
-    "include_tests": bool,
-    "context_lines": int,
-    "limit": int,
-    "offset": int,
-    "return": str,
-}
+_ToolSpec = tuple[str, str, type[BaseMcpToolInput], Callable[[Any], dict[str, Any]]]
 
 
 class McpToolRegistry:
@@ -84,13 +56,7 @@ class McpToolRegistry:
         repo_handlers: RepoMcpHandlers | None = None,
         symbol_handlers: SymbolMcpHandlers | None = None,
     ) -> None:
-        """Initialize the MCP tool registry over an ``IndexerEngine``.
-
-        Args:
-            engine: Headless ``IndexerEngine`` application facade.
-            repo_handlers: Optional ``RepoMcpHandlers`` override.
-            symbol_handlers: Optional ``SymbolMcpHandlers`` override.
-        """
+        """Initialize the MCP tool registry over an ``IndexerEngine``."""
         self._engine = engine
         self._repo_handlers = (
             repo_handlers if repo_handlers is not None else RepoMcpHandlers(engine)
@@ -98,272 +64,106 @@ class McpToolRegistry:
         self._symbol_handlers = (
             symbol_handlers if symbol_handlers is not None else SymbolMcpHandlers(engine)
         )
+        self._specs: dict[str, _ToolSpec] = {spec[0]: spec for spec in self._build_specs()}
 
-    def _register_repo_tools(self, server: MCPServer[Any] | Any, target_db: str) -> None:
-        """Bind the 4 repository and file MCP tools onto ``server``.
-
-        Args:
-            server: Target ``MCPServer`` (or compatible ``.tool()`` stub).
-            target_db: Default database path string bound to registered tools.
-        """
-
-        @server.tool(name="get_repo_overview")
-        async def get_repo_overview(repo_id: str | None = None) -> str:
-            """Get repository overview, symbol/edge statistics, and top directories."""
-            return await self.call_tool(
+    def _build_specs(self) -> tuple[_ToolSpec, ...]:
+        """Return the declarative specification table for all 9 MCP tools."""
+        rh = self._repo_handlers
+        sh = self._symbol_handlers
+        return (
+            (
                 "get_repo_overview",
-                {"repo_id": repo_id, "db_path": target_db},
-            )
-
-        @server.tool(name="list_files")
-        async def list_files(
-            repo_id: str | None = None,
-            path_prefix: str | None = None,
-            include_tests: bool = False,
-            limit: int = 100,
-            offset: int = 0,
-        ) -> str:
-            """List indexed Python files in the repository with pagination and prefix filter."""
-            return await self.call_tool(
+                "Get repository overview, symbol/edge statistics, and top directories.",
+                GetRepoOverviewInput,
+                rh.get_repo_overview,
+            ),
+            (
                 "list_files",
-                {
-                    "repo_id": repo_id,
-                    "path_prefix": path_prefix,
-                    "include_tests": include_tests,
-                    "limit": limit,
-                    "offset": offset,
-                    "db_path": target_db,
-                },
-            )
-
-        @server.tool(name="get_file_outline")
-        async def get_file_outline(
-            file_path: str,
-            repo_id: str | None = None,
-            include_private: bool = True,
-            max_depth: int = 3,
-        ) -> str:
-            """Get a hierarchical symbol skeleton and imports for a repository file."""
-            return await self.call_tool(
+                "List indexed Python files in the repository with pagination and prefix filter.",
+                ListFilesInput,
+                rh.list_files,
+            ),
+            (
                 "get_file_outline",
-                {
-                    "file_path": file_path,
-                    "repo_id": repo_id,
-                    "include_private": include_private,
-                    "max_depth": max_depth,
-                    "db_path": target_db,
-                },
-            )
-
-        @server.tool(name="search_symbols")
-        async def search_symbols(
-            query: str,
-            repo_id: str | None = None,
-            kind: SymbolKind | None = None,
-            file_path: str | None = None,
-            limit: int = 20,
-        ) -> str:
-            """Search symbols by name, signature, or docstring using FTS5 ranking."""
-            return await self.call_tool(
+                "Get a hierarchical symbol skeleton and imports for a repository file.",
+                GetFileOutlineInput,
+                rh.get_file_outline,
+            ),
+            (
                 "search_symbols",
-                {
-                    "query": query,
-                    "repo_id": repo_id,
-                    "kind": kind,
-                    "file_path": file_path,
-                    "limit": limit,
-                    "db_path": target_db,
-                },
-            )
-
-    def _register_symbol_tools(self, server: MCPServer[Any] | Any, target_db: str) -> None:
-        """Bind the 4 symbol source, context, reference, and risk MCP tools onto ``server``.
-
-        Args:
-            server: Target ``MCPServer`` (or compatible ``.tool()`` stub).
-            target_db: Default database path string bound to registered tools.
-        """
-
-        @server.tool(name="get_symbol_source")
-        async def get_symbol_source(
-            symbol: str,
-            repo_id: str | None = None,
-            max_lines: int = 120,
-            offset: int = 0,
-        ) -> str:
-            """Read bounded, line-numbered source code for a symbol ID or qualified name."""
-            return await self.call_tool(
+                "Search symbols by name, signature, or docstring using FTS5 ranking.",
+                SearchSymbolsInput,
+                rh.search_symbols,
+            ),
+            (
+                "search_code",
+                "Search all UTF-8 repository text files (literal or regex) with symbol spans.",
+                SearchCodeInput,
+                rh.search_code,
+            ),
+            (
                 "get_symbol_source",
-                {
-                    "symbol": symbol,
-                    "repo_id": repo_id,
-                    "max_lines": max_lines,
-                    "offset": offset,
-                    "db_path": target_db,
-                },
-            )
-
-        @server.tool(name="get_symbol_context")
-        async def get_symbol_context(
-            symbol: str,
-            repo_id: str | None = None,
-            edge_limit: int = 20,
-            include_source: bool = False,
-            max_source_lines: int = 80,
-        ) -> str:
-            """Get bounded symbol context: hierarchy, relationships, and freshness."""
-            return await self.call_tool(
+                "Read bounded, line-numbered source code for a symbol ID or qualified name.",
+                GetSymbolSourceInput,
+                sh.get_symbol_source,
+            ),
+            (
                 "get_symbol_context",
-                {
-                    "symbol": symbol,
-                    "repo_id": repo_id,
-                    "edge_limit": edge_limit,
-                    "include_source": include_source,
-                    "max_source_lines": max_source_lines,
-                    "db_path": target_db,
-                },
-            )
-
-        @server.tool(name="get_symbol_references")
-        async def get_symbol_references(
-            symbol: str,
-            repo_id: str | None = None,
-            direction: ReferenceDirection = ReferenceDirection.INCOMING,
-            refresh_lsp: bool = False,
-            limit: int = 30,
-            offset: int = 0,
-        ) -> str:
-            """Get paginated LSP references and AST dependencies with 1-line source previews."""
-            return await self.call_tool(
+                "Get bounded symbol context: hierarchy, relationships, and freshness.",
+                GetSymbolContextInput,
+                sh.get_symbol_context,
+            ),
+            (
                 "get_symbol_references",
-                {
-                    "symbol": symbol,
-                    "repo_id": repo_id,
-                    "direction": direction,
-                    "refresh_lsp": refresh_lsp,
-                    "limit": limit,
-                    "offset": offset,
-                    "db_path": target_db,
-                },
-            )
-
-        @server.tool(name="analyze_risk")
-        async def analyze_risk(
-            symbols: list[str],
-            repo_id: str | None = None,
-        ) -> str:
-            """Analyze change risk, blast radius, and staleness for 1 to 50 target symbols."""
-            return await self.call_tool(
+                "Get paginated LSP references and AST dependencies with 1-line source previews.",
+                GetSymbolReferencesInput,
+                sh.get_symbol_references,
+            ),
+            (
                 "analyze_risk",
-                {"symbols": symbols, "repo_id": repo_id, "db_path": target_db},
-            )
+                "Analyze change risk, blast radius, and staleness for 1 to 50 target symbols.",
+                AnalyzeRiskInput,
+                sh.analyze_risk,
+            ),
+        )
 
-    def _register_search_tools(self, server: MCPServer[Any] | Any, target_db: str) -> None:
-        """Bind the ``search_code`` full-codebase text/regex search tool onto ``server``."""
+    def _bind_single_tool(
+        self,
+        server: MCPServer[Any] | Any,
+        spec: _ToolSpec,
+        target_db: str,
+    ) -> None:
+        """Bind a single declarative ``_ToolSpec`` onto ``server``."""
+        tool_name, description, input_cls, _ = spec
+        signature, annotations = build_mcp_tool_signature(input_cls)
 
-        async def search_code(**kwargs: Any) -> str:
-            """Search all UTF-8 repository text files (literal or regex) with symbol spans."""
-            payload = dict(kwargs)
+        async def _tool_entry(*args: Any, **kwargs: Any) -> str:
+            bound = signature.bind(*args, **kwargs)
+            payload = dict(bound.arguments)
             payload["db_path"] = target_db
-            return await self.call_tool("search_code", payload)
+            return await self.call_tool(tool_name, payload)
 
-        fn_meta: Any = search_code
-        fn_meta.__signature__ = _SEARCH_CODE_SIGNATURE
-        fn_meta.__annotations__ = dict(_SEARCH_CODE_ANNOTATIONS)
-        server.tool(name="search_code")(search_code)
+        fn_meta: Any = _tool_entry
+        fn_meta.__name__ = tool_name
+        fn_meta.__doc__ = description
+        fn_meta.__signature__ = signature
+        fn_meta.__annotations__ = annotations
+        server.tool(name=tool_name)(_tool_entry)
 
     def bind(self, server: MCPServer[Any] | Any, *, db_path: Path | str | None = None) -> None:
-        """Register all 9 token-lean MCP tools onto ``server``.
-
-        Args:
-            server: ``MCPServer`` instance (or compatible ``.tool()`` decorator target).
-            db_path: Optional override SQLite database path bound to the tools.
-        """
+        """Register all 9 token-lean MCP tools onto ``server``."""
         target_db = str(db_path) if db_path is not None else str(self._engine.db_path)
-        self._register_repo_tools(server, target_db)
-        self._register_search_tools(server, target_db)
-        self._register_symbol_tools(server, target_db)
-
-    def _dispatch_repo_tool(
-        self,
-        tool_name: str,
-        payload: Mapping[str, Any],
-    ) -> Coroutine[Any, Any, str] | None:
-        """Validate ``payload`` and return the matching repo/search-tool coroutine if matched.
-
-        Args:
-            tool_name: Validated MCP tool name.
-            payload: Raw argument mapping including ``db_path``.
-
-        Returns:
-            Handler coroutine when ``tool_name`` is a repository/search tool, else ``None``.
-        """
-        dispatchers: dict[str, Callable[[], Coroutine[Any, Any, str]]] = {
-            "get_repo_overview": lambda: self._repo_handlers.get_repo_overview(
-                GetRepoOverviewInput.model_validate(payload)
-            ),
-            "list_files": lambda: self._repo_handlers.list_files(
-                ListFilesInput.model_validate(payload)
-            ),
-            "get_file_outline": lambda: self._repo_handlers.get_file_outline(
-                GetFileOutlineInput.model_validate(payload)
-            ),
-            "search_symbols": lambda: self._repo_handlers.search_symbols(
-                SearchSymbolsInput.model_validate(payload)
-            ),
-            "search_code": lambda: self._repo_handlers.search_code(
-                SearchCodeInput.model_validate(payload)
-            ),
-        }
-        factory = dispatchers.get(tool_name)
-        return factory() if factory is not None else None
-
-    def _dispatch_symbol_tool(
-        self,
-        tool_name: str,
-        payload: Mapping[str, Any],
-    ) -> Coroutine[Any, Any, str]:
-        """Validate ``payload`` and return the matching symbol-tool coroutine.
-
-        Args:
-            tool_name: Validated symbol MCP tool name.
-            payload: Raw argument mapping including ``db_path``.
-
-        Returns:
-            Handler coroutine for ``tool_name``.
-        """
-        if tool_name == "get_symbol_source":
-            return self._symbol_handlers.get_symbol_source(
-                GetSymbolSourceInput.model_validate(payload)
-            )
-        if tool_name == "get_symbol_context":
-            return self._symbol_handlers.get_symbol_context(
-                GetSymbolContextInput.model_validate(payload)
-            )
-        if tool_name == "get_symbol_references":
-            return self._symbol_handlers.get_symbol_references(
-                GetSymbolReferencesInput.model_validate(payload)
-            )
-        return self._symbol_handlers.analyze_risk(AnalyzeRiskInput.model_validate(payload))
+        for name in self.TOOL_NAMES:
+            self._bind_single_tool(server, self._specs[name], target_db)
 
     async def call_tool(
         self,
         tool_name: str,
         arguments: Mapping[str, Any] | None = None,
     ) -> str:
-        """Validate ``arguments`` and execute ``tool_name`` in-process.
-
-        Args:
-            tool_name: Registered MCP tool name (one of ``TOOL_NAMES``).
-            arguments: Optional raw keyword argument mapping.
-
-        Returns:
-            Compact JSON string containing the MCP success or error envelope.
-
-        Raises:
-            ValidationError: If ``tool_name`` is not one of the 8 registered tools.
-        """
-        if tool_name not in self.TOOL_NAMES:
+        """Validate ``arguments`` and execute ``tool_name`` in-process."""
+        spec = self._specs.get(tool_name)
+        if spec is None:
             available = ", ".join(self.TOOL_NAMES)
             raise ValidationError(
                 f"Unknown MCP tool {tool_name!r}. Available tools: {available}",
@@ -374,11 +174,11 @@ class McpToolRegistry:
         if merged.get("db_path") is None:
             merged["db_path"] = str(self._engine.db_path)
 
+        _, _, input_cls, handler = spec
         try:
-            repo_coro = self._dispatch_repo_tool(tool_name, merged)
-            if repo_coro is not None:
-                return await repo_coro
-            return await self._dispatch_symbol_tool(tool_name, merged)
+            validated = input_cls.model_validate(merged)
+            data = await asyncio.to_thread(handler, validated)
+            return serialize_mcp_json(success_result(data))
         except (PydanticValidationError, IndexerError) as exc:
             logger.debug(
                 "MCP call_tool %s failed validation or domain check (%s): %s",
@@ -386,9 +186,7 @@ class McpToolRegistry:
                 type(exc).__name__,
                 exc,
             )
-            return serialize_mcp_json(
-                map_exception_to_error_result(exc, operation=tool_name)
-            )
+            return serialize_mcp_json(map_exception_to_error_result(exc, operation=tool_name))
         except Exception as exc:
             logger.exception("Unhandled error in MCP tool %s", tool_name)
             return serialize_mcp_json(

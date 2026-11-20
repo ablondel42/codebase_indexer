@@ -65,23 +65,19 @@ class RefreshStatus(StrEnum):
     ERROR = "error"
 
 
-CALLABLE_KINDS: frozenset[SymbolKind] = frozenset(
-    {
-        SymbolKind.FUNCTION,
-        SymbolKind.ASYNC_FUNCTION,
-        SymbolKind.METHOD,
-        SymbolKind.ASYNC_METHOD,
-        SymbolKind.LOCAL_FUNCTION,
-        SymbolKind.LOCAL_ASYNC_FUNCTION,
-    }
-)
+CALLABLE_KINDS: frozenset[SymbolKind] = frozenset({
+    SymbolKind.FUNCTION,
+    SymbolKind.ASYNC_FUNCTION,
+    SymbolKind.METHOD,
+    SymbolKind.ASYNC_METHOD,
+    SymbolKind.LOCAL_FUNCTION,
+    SymbolKind.LOCAL_ASYNC_FUNCTION,
+})
 
-LOCAL_CALLABLE_KINDS: frozenset[SymbolKind] = frozenset(
-    {
-        SymbolKind.LOCAL_FUNCTION,
-        SymbolKind.LOCAL_ASYNC_FUNCTION,
-    }
-)
+LOCAL_CALLABLE_KINDS: frozenset[SymbolKind] = frozenset({
+    SymbolKind.LOCAL_FUNCTION,
+    SymbolKind.LOCAL_ASYNC_FUNCTION,
+})
 
 AST_DEPENDENCY_EDGE_KINDS: tuple[EdgeKind, ...] = (
     EdgeKind.CALLS,
@@ -101,8 +97,3 @@ PREFIX_FILE = "file:"
 PREFIX_SYMBOL = "node:"
 PREFIX_EDGE = "edge:"
 PREFIX_SHA256 = "sha256:"
-SCHEME_FILE = "file://"
-
-DEFAULT_LANGUAGE = Language.PYTHON
-DEFAULT_SOURCE = "python-ast"
-DEFAULT_CONFIDENCE = 1.0

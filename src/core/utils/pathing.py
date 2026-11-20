@@ -37,7 +37,7 @@ def normalize_repo_root(path: str | Path) -> Path:
     return resolved
 
 
-def _find_base_for_parts(
+def find_root_base_for_candidate(
     raw_root: Path,
     resolved_root: Path,
     candidate_path: Path,
@@ -71,20 +71,15 @@ def _find_base_for_parts(
     return None
 
 
-def _reject_intermediate_symlinks(
-    base_for_parts: Path,
-    candidate_path: Path,
-    resolved_root: Path,
-) -> None:
-    """Reject any intermediate symlink component below ``base_for_parts``.
+def find_symlink_below_base(base_for_parts: Path, candidate_path: Path) -> Path | None:
+    """Return the first symlink component below ``base_for_parts``, or ``None``.
 
     Args:
         base_for_parts: Matched repository root prefix for ``candidate_path``.
-        candidate_path: Absolute candidate file path.
-        resolved_root: Resolved repository root path for error context.
+        candidate_path: Absolute candidate path inside ``base_for_parts``.
 
-    Raises:
-        PathSecurityError: If any component below ``base_for_parts`` is a symlink.
+    Returns:
+        Symlink ``Path`` component when detected, otherwise ``None``.
     """
     current = base_for_parts
     for part in candidate_path.relative_to(base_for_parts).parts:
@@ -95,10 +90,34 @@ def _reject_intermediate_symlinks(
             continue
         current = current / part
         if current.is_symlink():
-            raise PathSecurityError(
-                f"Symlink path component rejected: {current}",
-                context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
-            )
+            return current
+    return None
+
+
+def has_symlink_below_root(
+    candidate: Path,
+    raw_root: Path,
+    resolved_root: Path,
+) -> bool:
+    """Return ``True`` if any path segment of ``candidate`` below ``repo_root`` is a symlink."""
+    base_for_parts = find_root_base_for_candidate(raw_root, resolved_root, candidate)
+    if base_for_parts is None:
+        return False
+    return find_symlink_below_base(base_for_parts, candidate) is not None
+
+
+def _reject_intermediate_symlinks(
+    base_for_parts: Path,
+    candidate_path: Path,
+    resolved_root: Path,
+) -> None:
+    """Reject any intermediate symlink component below ``base_for_parts``."""
+    symlink_path = find_symlink_below_base(base_for_parts, candidate_path)
+    if symlink_path is not None:
+        raise PathSecurityError(
+            f"Symlink path component rejected: {symlink_path}",
+            context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
+        )
 
 
 def _resolve_and_verify_regular_file(candidate_path: Path, resolved_root: Path) -> Path:
@@ -174,7 +193,7 @@ def ensure_safe_repo_file(repo_root: Path, candidate: Path | str) -> Path:
             context={"repo_root": str(resolved_root), "candidate": str(candidate_path)},
         )
 
-    base_for_parts = _find_base_for_parts(raw_root, resolved_root, candidate_path)
+    base_for_parts = find_root_base_for_candidate(raw_root, resolved_root, candidate_path)
     if base_for_parts is not None:
         _reject_intermediate_symlinks(base_for_parts, candidate_path, resolved_root)
 
@@ -290,6 +309,30 @@ def derive_module_path(repo_root: Path, file_path: Path) -> str:
     return ".".join(parts)
 
 
+def normalize_rel_path_prefix(
+    path_prefix: str | None,
+    *,
+    strip_trailing_slash: bool = True,
+) -> str:
+    """Normalize a relative POSIX path or directory prefix while preserving dot-directories."""
+    if not path_prefix:
+        return ""
+    cleaned = path_prefix.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned.removeprefix("./")
+    if strip_trailing_slash:
+        cleaned = cleaned.rstrip("/")
+    return "" if cleaned == "." else cleaned
+
+
+def _decode_uri_path(raw_path: str) -> str:
+    """Percent-decode a URI path and normalize Windows ``/C:/`` drive prefixes."""
+    decoded = unquote(raw_path)
+    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
+        decoded = decoded[1:]
+    return decoded
+
+
 def uri_to_file_path(uri: str | None) -> str | None:
     """Convert a ``file://`` URI into a clean filesystem path string."""
     if not uri:
@@ -297,10 +340,52 @@ def uri_to_file_path(uri: str | None) -> str | None:
     parsed = urlparse(uri)
     if parsed.scheme != "file" or not parsed.path:
         return None
-    decoded = unquote(parsed.path)
-    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
-        decoded = decoded[1:]
-    return decoded
+    return _decode_uri_path(parsed.path)
+
+
+def _add_unique_uri(candidates: list[str], value: str) -> None:
+    """Append ``value`` to ``candidates`` when non-empty and not yet present."""
+    if value and value not in candidates:
+        candidates.append(value)
+
+
+def _add_path_uris(candidates: list[str], path: Path) -> None:
+    """Append RFC 8089 ``as_uri()`` and unquoted URI variants for an absolute ``Path``."""
+    if not path.is_absolute():
+        return
+    try:
+        path_uri = path.as_uri()
+    except ValueError as exc:
+        logger.debug("Skipping invalid URI conversion for path %s: %s", path, exc)
+        return
+    _add_unique_uri(candidates, path_uri)
+    _add_unique_uri(candidates, unquote(path_uri))
+
+
+def extract_uri_candidates(uri: str) -> tuple[list[str], Path | None]:
+    """Derive candidate ``file://`` URI strings and canonical ``Path`` from a URI or path."""
+    if not uri:
+        return [], None
+
+    candidates: list[str] = []
+    _add_unique_uri(candidates, uri)
+    _add_unique_uri(candidates, unquote(uri))
+
+    parsed = urlparse(uri)
+    if parsed.scheme not in ("file", "") or not parsed.path:
+        return candidates, None
+
+    raw_path = Path(_decode_uri_path(parsed.path))
+    _add_path_uris(candidates, raw_path)
+
+    try:
+        resolved_path = raw_path.resolve()
+    except OSError as exc:
+        logger.debug("Cannot resolve filesystem path %s for URI %s: %s", raw_path, uri, exc)
+        resolved_path = raw_path
+    _add_path_uris(candidates, resolved_path)
+
+    return candidates, resolved_path
 
 
 def format_symbol_location(
@@ -327,9 +412,4 @@ def format_edge_location(
     evidence_range: Range | None = None,
 ) -> str | None:
     """Format a 1-based Cmd+Click ``/abs/path:line:col`` jump string for an edge site."""
-    abs_path = uri_to_file_path(evidence_uri)
-    if not abs_path:
-        return None
-    if evidence_range is not None:
-        return f"{abs_path}:{evidence_range.start.line + 1}:{evidence_range.start.character + 1}"
-    return f"{abs_path}:1:1"
+    return format_symbol_location(evidence_uri, selection_range=evidence_range)

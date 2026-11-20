@@ -27,6 +27,7 @@ from lsp.utils.locations import (
     get_reference_query_position,
     normalize_location,
     pick_smallest_containing_symbol,
+    read_bounded_lsp_text,
 )
 from lsp.utils.utf16 import position_codepoint_to_utf16, range_utf16_to_codepoint
 
@@ -312,44 +313,8 @@ class ReferenceEnricher:
 
     @staticmethod
     def _read_safe_repo_text(file_path: Path, max_bytes: int) -> str:
-        """Read bounded UTF-8 text from an already confined repository ``file_path``.
-
-        Args:
-            file_path: Validated regular file path inside ``repo_root``.
-            max_bytes: Maximum allowed file size in bytes.
-
-        Returns:
-            Decoded UTF-8 file text.
-
-        Raises:
-            LspError: If stating, size verification, or UTF-8 decoding fails.
-        """
-        try:
-            size_bytes = file_path.stat().st_size
-        except OSError as exc:
-            raise LspError(
-                f"Unable to stat file {file_path}: {exc}",
-                context={"file_path": str(file_path)},
-            ) from exc
-
-        if size_bytes > max_bytes:
-            raise LspError(
-                f"File {file_path} ({size_bytes} bytes) exceeds "
-                f"max_file_size_bytes ({max_bytes}).",
-                context={
-                    "file_path": str(file_path),
-                    "size_bytes": size_bytes,
-                    "limit": max_bytes,
-                },
-            )
-
-        try:
-            return file_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise LspError(
-                f"Unable to read file {file_path}: {exc}",
-                context={"file_path": str(file_path)},
-            ) from exc
+        """Read bounded UTF-8 text from an already confined repository ``file_path``."""
+        return read_bounded_lsp_text(file_path, max_bytes)
 
     def _open_auxiliary_python_files(
         self,

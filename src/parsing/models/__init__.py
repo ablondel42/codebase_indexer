@@ -19,7 +19,7 @@ from parsing.models.linking import (
     ResolutionState,
     SymbolBinding,
 )
-from parsing.models.scan import ScanOptions, ScanReport
+from parsing.models.scan import ScannedFile, ScanOptions, ScanReport
 
 __all__ = [
     "AssignmentSpec",
@@ -35,6 +35,7 @@ __all__ = [
     "ResolutionState",
     "ScanOptions",
     "ScanReport",
+    "ScannedFile",
     "ScopeFrame",
     "ScopeTarget",
     "SymbolBinding",

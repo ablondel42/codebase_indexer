@@ -5,7 +5,6 @@ from typing import Any
 
 from core.models.config import AppConfig
 from core.models.enums import AST_DEPENDENCY_EDGE_KINDS, EdgeKind, SymbolKind, SymbolScope
-from core.models.exceptions import SymbolNotFoundError, ValidationError
 from core.models.file import FileRecord
 from core.models.node import SymbolSummary
 from core.ports.uow import UnitOfWorkProtocol
@@ -13,20 +12,22 @@ from core.utils.logging import get_logger
 from graph.models.risk import RiskFacts, RiskTarget, TargetReferenceAggregation
 from graph.services.navigator import GraphNavigator
 from graph.services.references import ReferenceAnalyzer
-from graph.utils.predicates import derive_target_lines, is_public_like
+from graph.utils.predicates import (
+    derive_target_lines,
+    is_public_like,
+    load_verified_summaries_by_ids,
+)
 
 logger = get_logger("graph.services.risk_facts")
 
 LOW_CONFIDENCE_EDGE_LIMIT: int = 25
 LOW_CONFIDENCE_THRESHOLD: float = 0.8
 
-_CLASS_MEMBER_INHERITANCE_KINDS: frozenset[SymbolKind] = frozenset(
-    {
-        SymbolKind.METHOD,
-        SymbolKind.ASYNC_METHOD,
-        SymbolKind.ATTRIBUTE,
-    }
-)
+_CLASS_MEMBER_INHERITANCE_KINDS: frozenset[SymbolKind] = frozenset({
+    SymbolKind.METHOD,
+    SymbolKind.ASYNC_METHOD,
+    SymbolKind.ATTRIBUTE,
+})
 
 
 class RiskFactCollector:
@@ -94,34 +95,13 @@ class RiskFactCollector:
         uow: UnitOfWorkProtocol,
         symbol_ids: Sequence[str],
     ) -> list[RiskTarget]:
-        """Bulk-load and normalize ``RiskTarget`` items preserving exact input order.
-
-        Args:
-            uow: Active read Unit of Work.
-            symbol_ids: Ordered sequence of canonical symbol identifiers.
-
-        Returns:
-            Deduplicated ordered list of ``RiskTarget`` models.
-
-        Raises:
-            ValidationError: If ``symbol_ids`` is empty or contains only blank strings.
-            SymbolNotFoundError: If any requested symbol ID does not exist in the graph.
-        """
-        ordered_ids = list(dict.fromkeys(sid.strip() for sid in symbol_ids if sid and sid.strip()))
-        if not ordered_ids:
-            raise ValidationError(
-                "At least one symbol ID must be provided for risk analysis.",
-                context={"symbol_ids": list(symbol_ids)},
-            )
-
-        summaries_by_id = uow.nodes.get_summaries_by_ids(ordered_ids)
-        missing = [sid for sid in ordered_ids if sid not in summaries_by_id]
-        if missing:
-            raise SymbolNotFoundError(
-                f"Symbol not found: {missing[0]}",
-                context={"symbol_id": missing[0], "missing_symbol_ids": missing},
-            )
-
+        """Bulk-load and normalize ``RiskTarget`` items preserving exact input order."""
+        ordered_ids, summaries_by_id = load_verified_summaries_by_ids(
+            uow.nodes,
+            symbol_ids,
+            empty_error="At least one symbol ID must be provided for risk analysis.",
+            empty_context={"symbol_ids": list(symbol_ids)},
+        )
         return [self._summary_to_risk_target(summaries_by_id[sid]) for sid in ordered_ids]
 
     @staticmethod
@@ -269,13 +249,14 @@ class RiskFactCollector:
             file_counts[target.symbol_id] = stats.referencing_file_count
             mod_counts[target.symbol_id] = stats.referencing_module_count
             sources[target.symbol_id] = stats.reference_source
-            t_file, t_mod = self._detect_target_impact_spread(
-                uow,
-                target,
-                stats.reference_source,
-            )
-            cross_file = cross_file or t_file
-            cross_module = cross_module or t_mod
+            if stats.reference_count > 0:
+                t_file, t_mod = self._detect_target_impact_spread(
+                    uow,
+                    target,
+                    stats.reference_source,
+                )
+                cross_file = cross_file or t_file
+                cross_module = cross_module or t_mod
 
         return TargetReferenceAggregation(
             reference_counts=ref_counts,
@@ -342,9 +323,7 @@ class RiskFactCollector:
             target_spans_multiple_modules=len(all_module_keys) > 1,
             cross_file_impact=agg.cross_file_impact,
             cross_module_impact=agg.cross_module_impact,
-            inheritance_involved=any(
-                self._target_has_inheritance_risk(uow, t) for t in targets
-            ),
+            inheritance_involved=any(self._target_has_inheritance_risk(uow, t) for t in targets),
             stale_symbols=stale_symbols,
             low_confidence_symbols=low_conf_symbols,
             low_confidence_edges=low_edge_sample.edge_ids,

@@ -1,7 +1,8 @@
 """Per-file symbol duplicate disambiguation, lexical scope stack, and extraction session."""
 
-from collections.abc import Sequence
-from types import TracebackType
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
+from typing import Self
 
 from core.models.enums import PREFIX_SYMBOL, SymbolKind, SymbolScope
 from core.models.file import FileRecord
@@ -44,54 +45,6 @@ class DuplicateTracker:
             logger.debug("Disambiguated duplicate symbol %s as :dup%d", base_id, count)
             return f"{base_id}:dup{count}"
         return base_id
-
-
-class ScopeContext:
-    """Context manager keeping ``ScopeTracker`` push/pop operations balanced."""
-
-    def __init__(
-        self,
-        tracker: "ScopeTracker",
-        symbol_id: str,
-        name: str,
-        scope: SymbolScope,
-    ) -> None:
-        """Initialize a balanced scope context frame.
-
-        Args:
-            tracker: Owning ``ScopeTracker`` stack.
-            symbol_id: Enclosing declaration symbol identifier.
-            name: Simple declared identifier name.
-            scope: Enclosing ``SymbolScope`` kind.
-        """
-        self._tracker = tracker
-        self._symbol_id = symbol_id
-        self._name = name
-        self._scope = scope
-
-    def __enter__(self) -> "ScopeTracker":
-        """Push the declaration frame onto ``ScopeTracker`` on block entry.
-
-        Returns:
-            Active ``ScopeTracker`` instance.
-        """
-        self._tracker.push_declaration(self._symbol_id, self._name, self._scope)
-        return self._tracker
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        """Pop the declaration frame from ``ScopeTracker`` without suppressing errors.
-
-        Args:
-            exc_type: Exception class if raised inside the ``with`` block, else ``None``.
-            exc_val: Exception instance if raised, else ``None``.
-            exc_tb: Traceback object if raised, else ``None``.
-        """
-        self._tracker.pop_declaration()
 
 
 class ScopeTracker:
@@ -155,14 +108,6 @@ class ScopeTracker:
         """
         return [frame.name for frame in self._stack]
 
-    def get_lexical_chain_ids(self) -> list[str]:
-        """Return enclosing declaration symbol IDs ordered from outermost to innermost.
-
-        Returns:
-            List of ``symbol_id`` values on the stack.
-        """
-        return [frame.symbol_id for frame in self._stack]
-
     def is_empty(self) -> bool:
         """Return ``True`` when no declarations are pushed onto the stack.
 
@@ -171,32 +116,28 @@ class ScopeTracker:
         """
         return len(self._stack) == 0
 
-    def depth(self) -> int:
-        """Return the number of active frames on the scope stack.
-
-        Returns:
-            Current integer stack depth.
-        """
-        return len(self._stack)
-
+    @contextmanager
     def scope_context(
         self,
         symbol_id: str,
         name: str,
         scope: SymbolScope | str,
-    ) -> ScopeContext:
-        """Create a context manager that pushes on entry and pops on exit.
+    ) -> Generator[Self, None, None]:
+        """Push a declaration frame on entry and pop it symmetrically on exit.
 
         Args:
             symbol_id: Enclosing symbol's deterministic ID.
             name: Simple declared name.
             scope: Enclosing ``SymbolScope`` value.
 
-        Returns:
-            ``ScopeContext`` bound to this tracker.
+        Yields:
+            Active ``ScopeTracker`` instance.
         """
-        resolved_scope = scope if isinstance(scope, SymbolScope) else SymbolScope(scope)
-        return ScopeContext(self, symbol_id, name, resolved_scope)
+        self.push_declaration(symbol_id, name, scope)
+        try:
+            yield self
+        finally:
+            self.pop_declaration()
 
 
 class FileExtractionSession:
@@ -247,6 +188,5 @@ class FileExtractionSession:
 __all__ = [
     "DuplicateTracker",
     "FileExtractionSession",
-    "ScopeContext",
     "ScopeTracker",
 ]

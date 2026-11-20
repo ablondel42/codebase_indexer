@@ -148,18 +148,16 @@ def test_cli_serve_stdio_initialize_handshake(tmp_path: Path) -> None:
     """``python -m cli.main serve`` completes an MCP ``initialize`` handshake cleanly on stdio."""
     unindexed_db = tmp_path / "serve_check.db"
     init_request = (
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "integration-test", "version": "0.2.0"},
-                },
-            }
-        )
+        json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "integration-test", "version": "0.2.0"},
+            },
+        })
         + "\n"
     )
     proc = subprocess.run(

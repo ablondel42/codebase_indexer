@@ -1,7 +1,7 @@
 """Pure in-memory repository symbol lookup index for ``SymbolLinker``."""
 
 from collections import defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 from core.models.enums import CALLABLE_KINDS, SymbolKind
 from core.models.node import SymbolNode
@@ -28,8 +28,8 @@ class RepoSymbolIndex:
         self._module_by_file_id: dict[str, SymbolNode] = {}
         self._module_by_qname: dict[str, SymbolNode] = {}
         self._module_by_alt_qname: dict[str, SymbolNode] = {}
-        self._children_by_parent_and_name: dict[tuple[str, str], list[SymbolNode]] = (
-            defaultdict(list)
+        self._children_by_parent_and_name: dict[tuple[str, str], list[SymbolNode]] = defaultdict(
+            list
         )
 
         ordered = sorted(
@@ -89,26 +89,31 @@ class RepoSymbolIndex:
         """
         return self._module_by_file_id.get(file_id)
 
-    def find_module(self, qname: str) -> SymbolNode | None:
-        """Find a module node by qualified name with ``src.`` and ``repo_name.`` fallbacks.
-
-        Args:
-            qname: Dotted Python module path to resolve.
-
-        Returns:
-            Matching ``SymbolKind.MODULE`` ``SymbolNode``, or ``None``.
-        """
+    def _lookup_with_prefix_fallback(
+        self,
+        qname: str,
+        exact_map: Mapping[str, list[SymbolNode] | SymbolNode],
+        alt_map: Mapping[str, list[SymbolNode] | SymbolNode],
+    ) -> list[SymbolNode] | SymbolNode | None:
+        """Look up ``qname`` across exact, ``src.``-stripped, and ``repo_name.``-stripped maps."""
         if not qname:
             return None
-        mod = self._module_by_qname.get(qname) or self._module_by_alt_qname.get(qname)
-        if mod is not None:
-            return mod
+        hit = exact_map.get(qname) or alt_map.get(qname)
+        if hit:
+            return hit
         if self._repo_name and qname.startswith(f"{self._repo_name}."):
             stripped = qname[len(self._repo_name) + 1 :]
-            return self._module_by_qname.get(stripped) or self._module_by_alt_qname.get(
-                stripped
-            )
+            return exact_map.get(stripped) or alt_map.get(stripped)
         return None
+
+    def find_module(self, qname: str) -> SymbolNode | None:
+        """Find a module node by qualified name with ``src.`` and ``repo_name.`` fallbacks."""
+        hit = self._lookup_with_prefix_fallback(
+            qname,
+            self._module_by_qname,
+            self._module_by_alt_qname,
+        )
+        return hit if isinstance(hit, SymbolNode) else None
 
     def find_node(
         self,
@@ -116,30 +121,19 @@ class RepoSymbolIndex:
         *,
         prefer_kind: SymbolKind | str | None = None,
     ) -> SymbolNode | None:
-        """Find a symbol node by qualified name with ``src.`` and ``repo_name.`` fallbacks.
-
-        Args:
-            qname: Dotted symbol qualified name to resolve.
-            prefer_kind: Optional preferred ``SymbolKind`` when multiple nodes share ``qname``.
-
-        Returns:
-            Matching ``SymbolNode``, or ``None``.
-        """
-        if not qname:
-            return None
-        candidates = self._nodes_by_qname.get(qname) or self._nodes_by_alt_qname.get(qname)
-        if not candidates and self._repo_name and qname.startswith(f"{self._repo_name}."):
-            stripped = qname[len(self._repo_name) + 1 :]
-            candidates = self._nodes_by_qname.get(stripped) or self._nodes_by_alt_qname.get(
-                stripped
-            )
-        if not candidates:
+        """Find a symbol node by qualified name with ``src.`` and ``repo_name.`` fallbacks."""
+        hit = self._lookup_with_prefix_fallback(
+            qname,
+            self._nodes_by_qname,
+            self._nodes_by_alt_qname,
+        )
+        if not isinstance(hit, list) or not hit:
             return None
         if prefer_kind is not None:
-            for cand in candidates:
+            for cand in hit:
                 if cand.kind == prefer_kind:
                     return cand
-        return candidates[0]
+        return hit[0]
 
     def find_direct_child(
         self,
@@ -167,25 +161,31 @@ class RepoSymbolIndex:
                     return cand
         return candidates[0]
 
-    def find_enclosing_class_id(self, node_id: str) -> str | None:
-        """Walk structural ``parent_id`` links upward to find the nearest enclosing class.
-
-        Args:
-            node_id: Starting ``SymbolNode`` identifier.
-
-        Returns:
-            Enclosing ``SymbolKind.CLASS`` node ID, or ``None`` if not inside a class.
-        """
+    def iter_parent_chain(
+        self,
+        start_id: str | None,
+        *,
+        include_start: bool = True,
+    ) -> Iterator[SymbolNode]:
+        """Yield structural ancestor ``SymbolNode`` items upward without cycles."""
         visited: set[str] = set()
-        cur_id: str | None = node_id
+        cur_id = start_id
+        is_first = True
         while cur_id is not None and cur_id not in visited:
             visited.add(cur_id)
             node = self._node_by_id.get(cur_id)
             if node is None:
-                return None
-            if node.kind == SymbolKind.CLASS:
-                return cur_id
+                return
+            if include_start or not is_first:
+                yield node
+            is_first = False
             cur_id = node.parent_id
+
+    def find_enclosing_class_id(self, node_id: str) -> str | None:
+        """Walk structural ``parent_id`` links upward to find the nearest enclosing class."""
+        for node in self.iter_parent_chain(node_id, include_start=True):
+            if node.kind == SymbolKind.CLASS:
+                return node.id
         return None
 
     def pick_member_on_hierarchy(
@@ -272,9 +272,7 @@ class RepoSymbolIndex:
                 if reexport_id and self.has_node(reexport_id):
                     return reexport_id
         elif bound_node.kind == SymbolKind.CLASS and len(remainder) == 1:
-            member_prefer = (
-                frozenset({prefer_kind}) if prefer_kind is not None else CALLABLE_KINDS
-            )
+            member_prefer = frozenset({prefer_kind}) if prefer_kind is not None else CALLABLE_KINDS
             return self.pick_member_on_hierarchy(
                 bound_node.id,
                 remainder[0],

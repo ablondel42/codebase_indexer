@@ -19,6 +19,7 @@ from mcp_server.utils.errors import (
     map_exception_to_error_result,
     success_result,
 )
+from mcp_server.utils.signatures import build_mcp_tool_signature
 
 __all__ = [
     "adapt_code_search",
@@ -31,6 +32,7 @@ __all__ = [
     "adapt_symbol_search",
     "adapt_symbol_source",
     "adapt_symbol_summary",
+    "build_mcp_tool_signature",
     "error_result",
     "map_exception_to_error_result",
     "omit_none",

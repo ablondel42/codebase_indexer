@@ -1,5 +1,6 @@
 """Typed query and response Pydantic v2 models for the application engine layer."""
 
+from engine.models.collaborators import CommandCollaborators, QueryCollaborators
 from engine.models.queries import (
     ContextQuery,
     ListFilesQuery,
@@ -23,6 +24,7 @@ from engine.models.responses import (
 )
 
 __all__ = [
+    "CommandCollaborators",
     "ContextQuery",
     "DirectoryFileCount",
     "FileListPage",
@@ -30,6 +32,7 @@ __all__ = [
     "ListFilesQuery",
     "ListSymbolsQuery",
     "OutlineQuery",
+    "QueryCollaborators",
     "RepoOverview",
     "RepoSummaryListReport",
     "SearchSymbolsQuery",

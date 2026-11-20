@@ -80,12 +80,8 @@ def indexed_context_repo(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path, st
             ext = pipeline.extract_file(repo_root, rec)
             uow.replace_file_graph(rec, ext.nodes, ext.edges)
         nodes = uow.nodes.list_for_repo(scan_report.repo.id)
-        cand_edges = uow.edges.list_for_repo(
-            scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS
-        )
-        link_res = linker.resolve(
-            scan_report.repo.id, scan_report.repo.name, nodes, cand_edges
-        )
+        cand_edges = uow.edges.list_for_repo(scan_report.repo.id, kinds=AST_DEPENDENCY_EDGE_KINDS)
+        link_res = linker.resolve(scan_report.repo.id, scan_report.repo.name, nodes, cand_edges)
         uow.edges.update_resolved_targets(link_res.updates)
 
     return factory, repo_root, scan_report.repo.id
@@ -99,11 +95,7 @@ def _find_node_id(
 ) -> str:
     """Resolve a symbol ID by short name and kind inside ``repo_id``."""
     with factory.open(read_only=True) as uow:
-        matches = [
-            n
-            for n in uow.nodes.find_by_name(repo_id, name, kind=kind)
-            if n.name == name
-        ]
+        matches = [n for n in uow.nodes.find_by_name(repo_id, name, kind=kind) if n.name == name]
     assert matches, f"Node not found: {name} ({kind})"
     return matches[0].id
 
@@ -215,9 +207,7 @@ def test_read_symbol_source_pagination_batch_staleness_and_path_security(
     helper_id = _find_node_id(factory, repo_id, "helper", SymbolKind.FUNCTION)
 
     with factory.open(read_only=True) as uow:
-        page1 = reader.read_symbol_snippet(
-            uow, run_id, SnippetOptions(max_lines=3, offset=0)
-        )
+        page1 = reader.read_symbol_snippet(uow, run_id, SnippetOptions(max_lines=3, offset=0))
         assert page1.is_fresh is True
         assert page1.truncated is True
         assert page1.total_lines == 6  # lines 11..16 inclusive of @dec

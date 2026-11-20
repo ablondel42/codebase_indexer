@@ -63,23 +63,15 @@ class CallLinkResolver:
         target: str,
     ) -> str | None:
         """Search enclosing function/module scopes (skipping class bodies per Python LEGB)."""
-        cur_scope_id: str | None = caller_id
-        visited_scopes: set[str] = set()
-
-        while cur_scope_id is not None and cur_scope_id not in visited_scopes:
-            visited_scopes.add(cur_scope_id)
-            scope_node = index.get_node(cur_scope_id)
-            if scope_node is None:
-                break
-            if scope_node.kind != SymbolKind.CLASS or cur_scope_id == caller_id:
+        for scope_node in index.iter_parent_chain(caller_id, include_start=True):
+            if scope_node.kind != SymbolKind.CLASS or scope_node.id == caller_id:
                 child = index.find_direct_child(
-                    cur_scope_id,
+                    scope_node.id,
                     target,
                     prefer_kinds=_CALL_OR_CLASS_KINDS,
                 )
                 if child is not None:
                     return child.id
-            cur_scope_id = scope_node.parent_id
         return None
 
     def _resolve_bare_name_call(

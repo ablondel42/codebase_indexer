@@ -6,7 +6,7 @@ from pathlib import Path
 from core.models.enums import FreshnessStatus
 from core.models.exceptions import ParseError, PathSecurityError
 from core.models.file import FileRecord, FreshnessCheckResult, VerifiedFileText
-from core.utils.hashing import sha256_file
+from core.utils.hashing import sha256_bytes, sha256_file
 from core.utils.logging import get_logger
 from core.utils.pathing import ensure_safe_repo_file
 
@@ -130,6 +130,12 @@ def _read_bounded_bytes(safe_path: Path, max_file_size_bytes: int) -> bytes:
         ParseError: If reading fails or the read payload exceeds ``max_file_size_bytes``.
     """
     try:
+        stat_size = safe_path.stat().st_size
+        if stat_size > max_file_size_bytes:
+            raise ParseError(
+                f"File exceeds max_file_size_bytes ({max_file_size_bytes}): {safe_path}",
+                context={"file_path": str(safe_path), "size_bytes": stat_size},
+            )
         raw_bytes = safe_path.read_bytes()
     except OSError as exc:
         raise ParseError(
@@ -172,16 +178,8 @@ def read_verified_file_text(
         ParseError: If the file cannot be read or exceeds ``max_file_size_bytes``.
     """
     safe_path = ensure_safe_repo_file(Path(repo_root), rel_file_path)
-
-    try:
-        content_hash = sha256_file(safe_path, max_file_size_bytes=max_file_size_bytes)
-    except OSError as exc:
-        raise ParseError(
-            f"Unable to hash file {safe_path}: {exc}",
-            context={"file_path": str(safe_path)},
-        ) from exc
-
     raw_bytes = _read_bounded_bytes(safe_path, max_file_size_bytes)
+    content_hash = sha256_bytes(raw_bytes)
     text = raw_bytes.decode("utf-8", errors="replace")
     is_fresh = True if expected_content_hash is None else (content_hash == expected_content_hash)
 

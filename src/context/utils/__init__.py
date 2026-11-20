@@ -7,10 +7,12 @@ from context.utils.formatting import (
     edges_have_placeholder_targets,
     format_import_label,
     is_lsp_enriched,
+    is_nested_lexical_declaration,
     is_private_symbol,
     resolve_symbol_line_bounds,
     select_balanced_edges,
     slice_source_window,
+    validate_window_bounds,
 )
 from context.utils.trigram import (
     compile_search_pattern,
@@ -27,9 +29,11 @@ __all__ = [
     "extract_required_ascii_trigrams",
     "format_import_label",
     "is_lsp_enriched",
+    "is_nested_lexical_declaration",
     "is_private_symbol",
     "match_document_lines",
     "resolve_symbol_line_bounds",
     "select_balanced_edges",
     "slice_source_window",
+    "validate_window_bounds",
 ]

@@ -1,7 +1,7 @@
 """Public re-exports for ``core.models``."""
 
 from core.models.base import FrozenModel, MutableModel
-from core.models.config import DEFAULT_IGNORED_DIRS, AppConfig, build_config
+from core.models.config import IGNORED_DIRS, AppConfig, build_config
 from core.models.diagnostics import (
     DatabaseStatusReport,
     LspCoverageMetrics,
@@ -18,7 +18,6 @@ from core.models.edge import (
     EdgeBucketStats,
     EdgeTargetUpdate,
     LowConfidenceEdgeSample,
-    ReferencedByDetail,
     ReferencingSiteRef,
     SymbolReferenceStats,
 )
@@ -26,9 +25,6 @@ from core.models.enums import (
     APP_VERSION,
     AST_DEPENDENCY_EDGE_KINDS,
     CALLABLE_KINDS,
-    DEFAULT_CONFIDENCE,
-    DEFAULT_LANGUAGE,
-    DEFAULT_SOURCE,
     LOCAL_CALLABLE_KINDS,
     PREFIX_EDGE,
     PREFIX_FILE,
@@ -36,7 +32,6 @@ from core.models.enums import (
     PREFIX_SHA256,
     PREFIX_SYMBOL,
     REFERENCE_AND_DEPENDENCY_EDGE_KINDS,
-    SCHEME_FILE,
     EdgeKind,
     FreshnessStatus,
     Language,
@@ -94,10 +89,6 @@ __all__ = [
     "CodeSearchQuery",
     "CodeSearchReport",
     "CodeSearchStats",
-    "DEFAULT_CONFIDENCE",
-    "DEFAULT_IGNORED_DIRS",
-    "DEFAULT_LANGUAGE",
-    "DEFAULT_SOURCE",
     "DatabaseError",
     "DatabaseNotFoundError",
     "DatabaseStatusReport",
@@ -114,6 +105,7 @@ __all__ = [
     "FreshnessCheckResult",
     "FreshnessStatus",
     "FrozenModel",
+    "IGNORED_DIRS",
     "IndexRunMetrics",
     "IndexRunRecord",
     "IndexerError",
@@ -135,13 +127,11 @@ __all__ = [
     "REFERENCE_AND_DEPENDENCY_EDGE_KINDS",
     "Range",
     "ReferenceRefreshState",
-    "ReferencedByDetail",
     "ReferencingSiteRef",
     "RefreshStatus",
     "RepoGraphStats",
     "RepoRecord",
     "RepoStorageSummary",
-    "SCHEME_FILE",
     "SelectedRepoSummary",
     "SqlQueryResult",
     "SymbolKind",

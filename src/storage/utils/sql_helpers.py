@@ -1,22 +1,29 @@
-"""Stateless SQL, FTS5, URI candidate, chunking, and SQLite authorizer helpers."""
+"""Stateless SQL, FTS5, upsert, error-boundary, cascade, and SQLite authorizer helpers."""
 
 import re
 import sqlite3
-from collections.abc import Iterator, Sequence
-from pathlib import Path
+from collections.abc import Collection, Generator, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, TypeVar
-from urllib.parse import unquote, urlparse
 
-from sqlalchemy import ColumnElement, func
+from sqlalchemy import ColumnElement, Table, delete, func, or_, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
+from core.models.enums import EdgeKind
+from core.models.exceptions import DatabaseError, IndexerError
 from core.utils.logging import get_logger
-from storage.utils.schema import edges_table
+from core.utils.pathing import normalize_rel_path_prefix
+from storage.utils.schema import edges_table, files_table, nodes_table
 
 logger = get_logger("storage.utils.sql_helpers")
 
 T = TypeVar("T")
 
 _SPECIAL_FTS_CHARS_RE = re.compile(r"[^A-Za-z0-9_.\s]")
+_DEFAULT_CHUNK_SIZE = 400
+_BIDIRECTIONAL_CHUNK_SIZE = 200
 
 _ALLOWED_READ_ONLY_SQL_ACTIONS: frozenset[int] = frozenset({
     sqlite3.SQLITE_SELECT,
@@ -26,19 +33,8 @@ _ALLOWED_READ_ONLY_SQL_ACTIONS: frozenset[int] = frozenset({
 })
 
 
-def chunked_sequence(items: Sequence[T], size: int = 400) -> Iterator[Sequence[T]]:
-    """Yield contiguous slices of ``items`` bounded below SQLite bind-parameter limits.
-
-    Args:
-        items: Sequence of elements to partition.
-        size: Maximum slice length (default ``400``, must be ``>= 1``).
-
-    Yields:
-        Contiguous sub-sequences of length at most ``size``.
-
-    Raises:
-        ValueError: If ``size < 1``.
-    """
+def chunked_sequence(items: Sequence[T], size: int = _DEFAULT_CHUNK_SIZE) -> Iterator[Sequence[T]]:
+    """Yield contiguous slices of ``items`` bounded below SQLite bind-parameter limits."""
     if size < 1:
         raise ValueError(f"Chunk size must be >= 1, got {size}")
     for start in range(0, len(items), size):
@@ -46,42 +42,131 @@ def chunked_sequence(items: Sequence[T], size: int = 400) -> Iterator[Sequence[T
 
 
 def escape_like(value: str) -> str:
-    """Escape SQLite ``LIKE`` metacharacters (``\\``, ``%``, ``_``) for ``ESCAPE '\\'``.
-
-    Args:
-        value: Raw literal search string.
-
-    Returns:
-        Escaped string safe for ``column.like(..., escape='\\')``.
-    """
+    """Escape SQLite ``LIKE`` metacharacters (``\\``, ``%``, ``_``) for ``ESCAPE '\\'``."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def normalize_path_filter(path_filter: str) -> str:
-    """Normalize a relative path/directory filter without stripping dot-directories.
+def build_rel_path_prefix_clause(
+    column: ColumnElement[Any],
+    path_prefix: str | None,
+    *,
+    directory_boundary: bool = True,
+) -> ColumnElement[bool] | None:
+    """Build an escaped SQLite ``file_path`` prefix filter clause (or ``None`` if empty)."""
+    cleaned = normalize_rel_path_prefix(path_prefix)
+    if not cleaned:
+        return None
+    escaped = escape_like(cleaned)
+    if not directory_boundary:
+        return column.like(f"{escaped}%", escape="\\")
+    return or_(column == cleaned, column.like(f"{escaped}/%", escape="\\"))
 
-    Args:
-        path_filter: User-supplied file path or directory prefix (e.g., ``"./.github/"``).
 
-    Returns:
-        Normalized POSIX filter with leading ``"./"`` and trailing ``"/"`` stripped.
-    """
-    cleaned = path_filter.strip()
-    while cleaned.startswith("./"):
-        cleaned = cleaned.removeprefix("./")
-    return cleaned.rstrip("/")
+def build_sqlite_upsert(
+    table: Table,
+    *,
+    conflict_col: str = "id",
+    exclude_cols: Collection[str] = ("id",),
+) -> Any:
+    """Build ``INSERT ... ON CONFLICT(conflict_col) DO UPDATE`` for ``table``."""
+    base = sqlite_insert(table)
+    return base.on_conflict_do_update(
+        index_elements=[table.c[conflict_col]],
+        set_={
+            col.name: base.excluded[col.name]
+            for col in table.columns
+            if col.name not in exclude_cols
+        },
+    )
+
+
+def db_error_message(exc: BaseException) -> str:
+    """Extract the underlying DBAPI message from a SQLAlchemy or SQLite exception."""
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        return str(orig)
+    return str(exc)
+
+
+@contextmanager
+def db_operation(
+    message: str,
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> Generator[None, None, None]:
+    """Execute a SQLite block and wrap SQLAlchemy/sqlite3 failures in ``DatabaseError``."""
+    try:
+        yield
+    except IndexerError:
+        raise
+    except (SQLAlchemyError, sqlite3.Error) as exc:
+        detail = db_error_message(exc)
+        logger.error("%s: %s", message, detail)
+        raise DatabaseError(
+            f"{message}: {detail}",
+            context=dict(context) if context is not None else None,
+        ) from exc
+
+
+def delete_lsp_references_for_symbol_ids(conn: Connection, symbol_ids: Sequence[str]) -> int:
+    """Delete LSP ``references`` edges touching ``symbol_ids`` in bounded chunks."""
+    unique_ids = list(dict.fromkeys(sid for sid in symbol_ids if sid))
+    if not unique_ids:
+        return 0
+    deleted = 0
+    for chunk in chunked_sequence(unique_ids, _BIDIRECTIONAL_CHUNK_SIZE):
+        res = conn.execute(
+            delete(edges_table).where(
+                edges_table.c.kind == str(EdgeKind.REFERENCES),
+                or_(edges_table.c.from_id.in_(chunk), edges_table.c.to_id.in_(chunk)),
+            )
+        )
+        deleted += max(res.rowcount or 0, 0)
+    return deleted
+
+
+def delete_file_graph_batches(
+    conn: Connection,
+    file_ids: Sequence[str],
+    *,
+    repo_id: str | None = None,
+    preserve_incoming_ast_edges: bool = True,
+) -> int:
+    """Delete ``files``, ``nodes``, owned edges, and incoming LSP refs in bounded chunks."""
+    if not file_ids:
+        return 0
+    deleted = 0
+    for batch in chunked_sequence(file_ids, _DEFAULT_CHUNK_SIZE):
+        node_subq = select(nodes_table.c.id).where(nodes_table.c.file_id.in_(batch))
+        conn.execute(
+            delete(edges_table).where(
+                or_(
+                    edges_table.c.evidence_file_id.in_(batch),
+                    edges_table.c.from_id.in_(node_subq),
+                )
+            )
+        )
+        incoming_cond = (
+            (
+                edges_table.c.kind == str(EdgeKind.REFERENCES),
+                edges_table.c.to_id.in_(node_subq),
+            )
+            if preserve_incoming_ast_edges
+            else (edges_table.c.to_id.in_(node_subq),)
+        )
+        conn.execute(delete(edges_table).where(*incoming_cond))
+        conn.execute(delete(nodes_table).where(nodes_table.c.file_id.in_(batch)))
+
+        del_stmt = delete(files_table).where(files_table.c.id.in_(batch))
+        if repo_id is not None:
+            del_stmt = del_stmt.where(files_table.c.repo_id == repo_id)
+        res = conn.execute(del_stmt)
+        deleted += max(res.rowcount or 0, 0)
+    return deleted
 
 
 def build_fts_match_expression(raw_query: str) -> str | None:
-    """Build a safely quoted FTS5 prefix ``MATCH`` expression or ``None`` for ``LIKE`` fallback.
-
-    Args:
-        raw_query: Trimmed user search query.
-
-    Returns:
-        Space-joined quoted FTS5 prefix terms (e.g., ``'"foo"* "bar"*'``), or ``None``
-        when ``raw_query`` contains punctuation/operators requiring escaped ``LIKE``.
-    """
+    """Build a safely quoted FTS5 prefix ``MATCH`` expression or ``None`` for ``LIKE`` fallback."""
     if _SPECIAL_FTS_CHARS_RE.search(raw_query):
         return None
     tokens = [tok.strip(".") for tok in raw_query.split()]
@@ -93,11 +178,7 @@ def build_fts_match_expression(raw_query: str) -> str | None:
 
 
 def evidence_line_expr() -> ColumnElement[Any]:
-    """Return a SQLAlchemy expression extracting ``evidence_range_json.start.line`` (or ``0``).
-
-    Returns:
-        ``COALESCE(json_extract(edges.evidence_range_json, '$.start.line'), 0)`` expression.
-    """
+    """Return ``COALESCE(json_extract(edges.evidence_range_json, '$.start.line'), 0)``."""
     return func.coalesce(
         func.json_extract(edges_table.c.evidence_range_json, "$.start.line"),
         0,
@@ -105,11 +186,7 @@ def evidence_line_expr() -> ColumnElement[Any]:
 
 
 def evidence_char_expr() -> ColumnElement[Any]:
-    """Return a SQLAlchemy expression extracting ``evidence_range_json.start.character`` (or ``0``).
-
-    Returns:
-        ``COALESCE(json_extract(edges.evidence_range_json, '$.start.character'), 0)`` expression.
-    """
+    """Return ``COALESCE(json_extract(edges.evidence_range_json, '$.start.character'), 0)``."""
     return func.coalesce(
         func.json_extract(edges_table.c.evidence_range_json, "$.start.character"),
         0,
@@ -123,106 +200,8 @@ def sqlite_select_only_authorizer(
     db_name: str | None,
     trigger_name: str | None,
 ) -> int:
-    """SQLite authorizer callback permitting strictly read-only ``SELECT``/``PRAGMA`` actions.
-
-    Args:
-        action: SQLite action code (e.g., ``sqlite3.SQLITE_SELECT``).
-        arg1: Action-specific first argument supplied by SQLite.
-        arg2: Action-specific second argument supplied by SQLite.
-        db_name: Database name supplied by SQLite.
-        trigger_name: Trigger or view name supplied by SQLite.
-
-    Returns:
-        ``sqlite3.SQLITE_OK`` for read-only actions, ``sqlite3.SQLITE_DENY`` otherwise.
-    """
+    """SQLite authorizer callback permitting strictly read-only ``SELECT``/``PRAGMA`` actions."""
     _ = (arg1, arg2, db_name, trigger_name)
     if action in _ALLOWED_READ_ONLY_SQL_ACTIONS:
         return sqlite3.SQLITE_OK
     return sqlite3.SQLITE_DENY
-
-
-def _add_unique_uri(candidates: list[str], value: str) -> None:
-    """Append ``value`` to ``candidates`` when non-empty and not yet present.
-
-    Args:
-        candidates: Mutable list of candidate URI strings.
-        value: Candidate URI string to append.
-    """
-    if value and value not in candidates:
-        candidates.append(value)
-
-
-def _add_path_uris(candidates: list[str], path: Path) -> None:
-    """Append RFC 8089 ``as_uri()`` and unquoted URI variants for an absolute ``Path``.
-
-    Args:
-        candidates: Mutable list of candidate URI strings.
-        path: Filesystem path to convert when absolute.
-    """
-    if not path.is_absolute():
-        return
-    try:
-        path_uri = path.as_uri()
-    except ValueError as exc:
-        logger.debug("Cannot convert path %s to file URI: %s", path, exc)
-        return
-    _add_unique_uri(candidates, path_uri)
-    _add_unique_uri(candidates, unquote(path_uri))
-
-
-def _normalize_parsed_uri_path(raw_path: str) -> Path:
-    """Decode a percent-escaped URI path and normalize Windows drive prefixes.
-
-    Args:
-        raw_path: Raw ``urlparse(uri).path`` string.
-
-    Returns:
-        Decoded ``Path`` instance.
-    """
-    decoded = unquote(raw_path)
-    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
-        decoded = decoded[1:]
-    return Path(decoded)
-
-
-def extract_uri_candidates(uri: str) -> tuple[list[str], Path | None]:
-    """Extract normalized ``file://`` URI candidates and resolved filesystem path.
-
-    Args:
-        uri: Raw ``file://`` URI or path string.
-
-    Returns:
-        Tuple of ``(candidate_uris, resolved_path_or_none)``.
-    """
-    candidates: list[str] = []
-    _add_unique_uri(candidates, uri)
-    _add_unique_uri(candidates, unquote(uri))
-
-    parsed = urlparse(uri)
-    if parsed.scheme not in ("file", "") or not parsed.path:
-        return candidates, None
-
-    raw_path = _normalize_parsed_uri_path(parsed.path)
-    _add_path_uris(candidates, raw_path)
-
-    try:
-        resolved_path = raw_path.resolve()
-    except OSError as exc:
-        logger.debug("Cannot resolve URI filesystem path %s: %s", raw_path, exc)
-        resolved_path = raw_path
-    _add_path_uris(candidates, resolved_path)
-
-    return candidates, resolved_path
-
-
-def db_error_message(exc: BaseException) -> str:
-    """Extract the underlying DBAPI message from a SQLAlchemy or SQLite exception.
-
-    Args:
-        exc: Raised ``SQLAlchemyError``, ``sqlite3.Error``, or ``OSError``.
-
-    Returns:
-        Concise error description string.
-    """
-    orig = getattr(exc, "orig", None)
-    return str(orig) if orig is not None else str(exc)

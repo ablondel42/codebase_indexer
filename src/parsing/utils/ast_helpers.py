@@ -44,11 +44,7 @@ def load_python_source(
         OSError: If stating or reading ``file_path`` fails.
         ParseError: If the file exceeds ``max_file_size_bytes`` or fails UTF-8 decoding.
     """
-    limit = (
-        max_file_size_bytes
-        if max_file_size_bytes is not None
-        else DEFAULT_MAX_FILE_SIZE_BYTES
-    )
+    limit = max_file_size_bytes if max_file_size_bytes is not None else DEFAULT_MAX_FILE_SIZE_BYTES
     size_bytes = file_path.stat().st_size
     if size_bytes > limit:
         logger.warning(
@@ -262,9 +258,8 @@ def resolve_relative_module(file_record: FileRecord, raw_module: str, level: int
 
     module_path = file_record.module_path or ""
     parts = [part for part in module_path.split(".") if part]
-    is_package_init = (
-        file_record.file_path == "__init__.py"
-        or file_record.file_path.endswith("/__init__.py")
+    is_package_init = file_record.file_path == "__init__.py" or file_record.file_path.endswith(
+        "/__init__.py"
     )
     package_parts = parts if is_package_init else parts[:-1]
 

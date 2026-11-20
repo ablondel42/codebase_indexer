@@ -172,9 +172,7 @@ def match_document_lines(
         if found is None:
             continue
         before = (
-            tuple(lines[max(0, zero_idx - context_lines) : zero_idx])
-            if context_lines > 0
-            else ()
+            tuple(lines[max(0, zero_idx - context_lines) : zero_idx]) if context_lines > 0 else ()
         )
         after = (
             tuple(lines[zero_idx + 1 : min(total, zero_idx + 1 + context_lines)])

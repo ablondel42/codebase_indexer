@@ -13,13 +13,20 @@ from context.models.outline import FileOutline
 from context.models.source import SymbolSnippet
 from context.models.symbol_context import ContextEdge, FocusSymbol, SymbolContext
 from core.models.base import FrozenModel
-from core.models.node import SymbolSummary
-from core.models.search import CodeMatchItem, CodeSearchReport
-from core.utils.file_io import format_line_span
+from core.models.search import CodeSearchReport
 from core.utils.logging import get_logger
 from engine.models.responses import FileListPage, SymbolListPage, SymbolSearchPage
-from graph.models.references import ReferenceSiteEntry, SymbolReferencesReport
-from graph.models.risk import RiskAssessment, RiskTarget
+from engine.services.facade import IndexerEngine
+from engine.utils.projections import (
+    project_code_search,
+    project_risk_assessment,
+    project_symbol_references,
+    project_symbol_search,
+    project_symbol_source,
+    project_symbol_summary,
+)
+from graph.models.references import SymbolReferencesReport
+from graph.models.risk import RiskAssessment
 from indexing.models.events import (
     WatchFileProcessedEvent,
     WatchStartedEvent,
@@ -31,19 +38,16 @@ logger = get_logger("cli.utils.output")
 
 
 def resolve_cli_db_path(args: argparse.Namespace, default_db_path: Path) -> Path:
-    """Resolve explicit ``--db-path`` on ``args`` or fall back to ``default_db_path``.
-
-    Args:
-        args: Parsed CLI ``argparse.Namespace``.
-        default_db_path: Default configured SQLite database path.
-
-    Returns:
-        Resolved ``Path`` targeting the SQLite database file.
-    """
+    """Resolve explicit ``--db-path`` on ``args`` or fall back to ``default_db_path``."""
     raw = getattr(args, "db_path", None)
     if raw is not None:
         return Path(raw)
     return default_db_path
+
+
+def resolve_scoped_engine(engine: IndexerEngine, args: argparse.Namespace) -> IndexerEngine:
+    """Return ``engine`` scoped to ``args.db_path`` when supplied."""
+    return engine.for_db(resolve_cli_db_path(args, engine.db_path))
 
 
 def emit_json(
@@ -250,56 +254,13 @@ def format_outline_for_cli(outline: FileOutline) -> dict[str, Any]:
     return dumped
 
 
-def _serialize_cli_symbol_entry(symbol: SymbolSummary) -> dict[str, Any]:
-    """Format one ``SymbolSummary`` into the ``cbi symbols {search,list}`` item shape.
-
-    Args:
-        symbol: ``SymbolSummary`` projection.
-
-    Returns:
-        Dictionary containing symbol identity, file/module path, lines, and signature.
-    """
-    return {
-        "id": symbol.id,
-        "kind": str(symbol.kind),
-        "name": symbol.name,
-        "qualified_name": symbol.qualified_name,
-        "location": symbol.location,
-        "file_path": symbol.file_path or None,
-        "module_path": symbol.module_path or None,
-        "start_line": symbol.start_line,
-        "end_line": symbol.end_line,
-        "signature": symbol.signature,
-        "doc_summary": symbol.doc_summary,
-    }
-
-
 def format_symbol_search_for_cli(page: SymbolSearchPage) -> dict[str, Any]:
-    """Format a ``SymbolSearchPage`` into the ``cbi symbols search`` JSON output shape.
-
-    Args:
-        page: ``SymbolSearchPage`` model.
-
-    Returns:
-        Dictionary matching the legacy ``cbi symbols search`` JSON structure.
-    """
-    return {
-        "repo_id": page.repo_id,
-        "query": page.query,
-        "count": page.count,
-        "symbols": [_serialize_cli_symbol_entry(item) for item in page.symbols],
-    }
+    """Format a ``SymbolSearchPage`` into the ``cbi symbols search`` JSON output shape."""
+    return project_symbol_search(page, compact=False)
 
 
 def format_symbol_list_for_cli(page: SymbolListPage) -> dict[str, Any]:
-    """Format a ``SymbolListPage`` into the ``cbi symbols list`` JSON output shape.
-
-    Args:
-        page: ``SymbolListPage`` model.
-
-    Returns:
-        Dictionary matching the legacy ``cbi symbols list`` JSON structure.
-    """
+    """Format a ``SymbolListPage`` into the ``cbi symbols list`` JSON output shape."""
     return {
         "repo_id": page.repo_id,
         "total_count": page.total_count,
@@ -307,38 +268,13 @@ def format_symbol_list_for_cli(page: SymbolListPage) -> dict[str, Any]:
         "offset": page.offset,
         "limit": page.limit,
         "has_more": page.has_more,
-        "symbols": [_serialize_cli_symbol_entry(item) for item in page.symbols],
+        "symbols": [project_symbol_summary(item, compact=False) for item in page.symbols],
     }
 
 
 def format_source_for_cli(snippet: SymbolSnippet) -> dict[str, Any]:
-    """Format a ``SymbolSnippet`` into the ``cbi source`` JSON output shape.
-
-    Args:
-        snippet: ``SymbolSnippet`` model from ``QueryEngine.get_symbol_source``.
-
-    Returns:
-        Dictionary mapping ``numbered_source`` onto ``"source"`` for CLI parity.
-    """
-    return {
-        "symbol_id": snippet.symbol_id,
-        "qualified_name": snippet.qualified_name,
-        "kind": str(snippet.kind),
-        "location": snippet.location,
-        "module_path": snippet.module_path,
-        "lines": snippet.lines,
-        "signature": snippet.signature,
-        "file_path": snippet.file_path,
-        "start_line": snippet.start_line,
-        "end_line": snippet.end_line,
-        "source": snippet.numbered_source,
-        "truncated": snippet.truncated,
-        "total_lines": snippet.total_lines,
-        "returned_lines": snippet.returned_lines,
-        "next_offset": snippet.next_offset,
-        "is_fresh": snippet.is_fresh,
-        "stale_reason": snippet.stale_reason,
-    }
+    """Format a ``SymbolSnippet`` into the ``cbi source`` JSON output shape."""
+    return project_symbol_source(snippet, drop_none=False)
 
 
 def _format_cli_focus_symbol(focus: FocusSymbol) -> dict[str, Any]:
@@ -416,13 +352,9 @@ def format_symbol_context_for_cli(ctx: SymbolContext) -> dict[str, Any]:
             if ctx.structural_parent is not None
             else None
         ),
-        "structural_children": [
-            item.model_dump(mode="json") for item in ctx.structural_children
-        ],
+        "structural_children": [item.model_dump(mode="json") for item in ctx.structural_children],
         "lexical_parent": (
-            _format_cli_focus_symbol(ctx.lexical_parent)
-            if ctx.lexical_parent is not None
-            else None
+            _format_cli_focus_symbol(ctx.lexical_parent) if ctx.lexical_parent is not None else None
         ),
         "lexical_children": [item.model_dump(mode="json") for item in ctx.lexical_children],
         "incoming_edges": [_format_cli_context_edge(edge) for edge in ctx.incoming_edges],
@@ -435,136 +367,18 @@ def format_symbol_context_for_cli(ctx: SymbolContext) -> dict[str, Any]:
     }
 
 
-def _format_cli_ref_site(site: ReferenceSiteEntry) -> dict[str, Any]:
-    """Format one ``ReferenceSiteEntry`` for ``cbi refs`` JSON output.
-
-    Args:
-        site: ``ReferenceSiteEntry`` model.
-
-    Returns:
-        Dictionary matching the ``cbi refs`` item shape.
-    """
-    return {
-        "id": site.id,
-        "direction": site.direction,
-        "kind": str(site.kind),
-        "from_id": site.from_id,
-        "to_id": site.to_id,
-        "peer_id": site.peer_id,
-        "peer_name": site.peer_name,
-        "location": site.location,
-        "file_path": site.file_path,
-        "line": site.line,
-        "column": site.column,
-        "confidence": site.confidence,
-        "source": site.source,
-        "preview": site.preview,
-    }
-
-
 def format_references_for_cli(report: SymbolReferencesReport) -> dict[str, Any]:
-    """Format a ``SymbolReferencesReport`` into the ``cbi refs`` JSON output shape.
-
-    Args:
-        report: ``SymbolReferencesReport`` model.
-
-    Returns:
-        Dictionary matching the ``cbi refs`` JSON structure.
-    """
-    sym = report.symbol
-    return {
-        "symbol": {
-            "id": sym.id,
-            "kind": str(sym.kind),
-            "qualified_name": sym.qualified_name,
-            "location": sym.location,
-            "file_path": sym.file_path,
-            "lines": sym.lines,
-            "signature": sym.signature,
-        },
-        "direction": str(report.direction),
-        "total_count": report.total_count,
-        "returned_count": report.returned_count,
-        "offset": report.offset,
-        "limit": report.limit,
-        "has_more": report.has_more,
-        "reference_summary": report.stats.model_dump(mode="json"),
-        "references": [_format_cli_ref_site(site) for site in report.references],
-    }
-
-
-def _serialize_cli_risk_target(target: RiskTarget) -> dict[str, Any]:
-    """Format one ``RiskTarget`` for ``cbi risk`` JSON output omitting null fields.
-
-    Args:
-        target: ``RiskTarget`` model.
-
-    Returns:
-        Compact dictionary describing ``target``.
-    """
-    raw = {
-        "symbol_id": target.symbol_id,
-        "qualified_name": target.qualified_name,
-        "kind": str(target.kind),
-        "scope": target.scope,
-        "location": target.location,
-        "file_path": target.file_path,
-        "module_path": target.module_path,
-        "lines": format_line_span(target.start_line, target.end_line),
-        "signature": target.signature,
-        "is_test": target.is_test,
-    }
-    return {key: val for key, val in raw.items() if val is not None}
+    """Format a ``SymbolReferencesReport`` into the ``cbi refs`` JSON output shape."""
+    return project_symbol_references(report, compact=False)
 
 
 def serialize_risk_for_cli(result: RiskAssessment) -> dict[str, Any]:
-    """Serialize a ``RiskAssessment`` into the deterministic ``cbi risk`` JSON shape.
-
-    Args:
-        result: ``RiskAssessment`` report.
-
-    Returns:
-        Dictionary matching the legacy ``cbi risk`` JSON structure.
-    """
-    facts = result.facts
-    return {
-        "risk_score": result.risk_score,
-        "decision": str(result.decision),
-        "issues": list(result.issues),
-        "targets": [_serialize_cli_risk_target(target) for target in result.targets],
-        "facts": {
-            "target_count": facts.target_count,
-            "symbol_ids": list(facts.symbol_ids),
-            "symbol_kinds": sorted(facts.symbol_kinds),
-            "reference_counts": dict(facts.reference_counts),
-            "reference_availability": dict(facts.reference_availability),
-            "referencing_file_counts": dict(facts.referencing_file_counts),
-            "referencing_module_counts": dict(facts.referencing_module_counts),
-            "touches_public_surface": facts.touches_public_surface,
-            "touches_local_scope_only": facts.touches_local_scope_only,
-            "target_spans_multiple_files": facts.target_spans_multiple_files,
-            "target_spans_multiple_modules": facts.target_spans_multiple_modules,
-            "cross_file_impact": facts.cross_file_impact,
-            "cross_module_impact": facts.cross_module_impact,
-            "inheritance_involved": facts.inheritance_involved,
-            "stale_symbols": list(facts.stale_symbols),
-            "low_confidence_symbols": list(facts.low_confidence_symbols),
-            "low_confidence_edges": list(facts.low_confidence_edges),
-            "extra": dict(facts.extra),
-        },
-    }
+    """Serialize a ``RiskAssessment`` into the deterministic ``cbi risk`` JSON shape."""
+    return project_risk_assessment(result)
 
 
 def format_mcp_call_envelope(tool_name: str, raw_response: str) -> tuple[McpCallEnvelope, int]:
-    """Measure MCP payload byte/token metrics and build ``McpCallEnvelope`` + exit code.
-
-    Args:
-        tool_name: Executed MCP tool name.
-        raw_response: Raw compact JSON response string returned by the tool.
-
-    Returns:
-        Tuple ``(envelope, exit_code)`` where ``exit_code == 1`` on ``ok: false``.
-    """
+    """Measure MCP payload byte/token metrics and build ``McpCallEnvelope`` + exit code."""
     byte_size = len(raw_response.encode("utf-8"))
     est_tokens = max(1, (byte_size + 3) // 4) if byte_size > 0 else 0
     try:
@@ -573,11 +387,7 @@ def format_mcp_call_envelope(tool_name: str, raw_response: str) -> tuple[McpCall
         logger.debug("Non-JSON MCP tool response from %s: %s", tool_name, exc)
         parsed_response = {"raw": raw_response}
 
-    exit_code = (
-        1
-        if isinstance(parsed_response, dict) and parsed_response.get("ok") is False
-        else 0
-    )
+    exit_code = 1 if isinstance(parsed_response, dict) and parsed_response.get("ok") is False else 0
     envelope = McpCallEnvelope(
         tool=tool_name,
         bytes=byte_size,
@@ -587,43 +397,9 @@ def format_mcp_call_envelope(tool_name: str, raw_response: str) -> tuple[McpCall
     return envelope, exit_code
 
 
-def _serialize_cli_code_match(item: CodeMatchItem) -> dict[str, Any]:
-    """Serialize a ``CodeMatchItem`` omitting empty context tuples and ``None`` symbol fields."""
-    raw: dict[str, Any] = {
-        "location": item.location,
-        "file_path": item.file_path,
-        "language": item.language,
-        "line": item.line,
-        "column": item.column,
-        "preview": item.preview,
-        "context_before": list(item.context_before) if item.context_before else None,
-        "context_after": list(item.context_after) if item.context_after else None,
-        "symbol_id": item.symbol_id,
-        "qualified_name": item.qualified_name,
-        "symbol_kind": item.symbol_kind,
-        "symbol_lines": item.symbol_lines,
-        "symbol_location": item.symbol_location,
-    }
-    return {key: val for key, val in raw.items() if val is not None}
-
-
 def format_code_search_for_cli(report: CodeSearchReport) -> dict[str, Any]:
     """Format a ``CodeSearchReport`` into the ``cbi search`` JSON output shape."""
-    return {
-        "repo_id": report.repo_id,
-        "query": report.query,
-        "regex": report.regex,
-        "case_sensitive": report.case_sensitive,
-        "total_matches": report.total_matches,
-        "matched_file_count": report.matched_file_count,
-        "returned_count": report.returned_count,
-        "offset": report.offset,
-        "limit": report.limit,
-        "has_more": report.has_more,
-        "file_counts": [fc.model_dump() for fc in report.file_counts],
-        "matches": [_serialize_cli_code_match(item) for item in report.matches],
-        "stats": report.stats.model_dump(),
-    }
+    return project_code_search(report)
 
 
 __all__ = [
@@ -641,6 +417,7 @@ __all__ = [
     "format_symbol_search_for_cli",
     "format_watch_event_payload",
     "resolve_cli_db_path",
+    "resolve_scoped_engine",
     "serialize_risk_for_cli",
     "silence_broken_pipe",
 ]

@@ -7,6 +7,7 @@ from graph.utils.predicates import (
     extract_edge_line,
     format_site_location,
     is_public_like,
+    load_verified_summaries_by_ids,
     resolve_endpoint_name,
     resolve_peer_label,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "extract_edge_line",
     "format_site_location",
     "is_public_like",
+    "load_verified_summaries_by_ids",
     "resolve_endpoint_name",
     "resolve_peer_label",
     "score_risk",

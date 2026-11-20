@@ -16,7 +16,6 @@ from core.models.edge import (
     EdgeBucketStats,
     EdgeTargetUpdate,
     LowConfidenceEdgeSample,
-    ReferencedByDetail,
     ReferencingSiteRef,
 )
 from core.models.enums import EdgeKind, SymbolKind
@@ -201,18 +200,6 @@ class FileRepositoryProtocol(Protocol):
         Args:
             repo_id: Owning repository identifier.
             keep_file_ids: Set of active ``file_id``s to retain.
-
-        Returns:
-            Number of pruned file records.
-        """
-        ...
-
-    def prune_not_in_paths(self, repo_id: str, keep_paths: set[str]) -> int:
-        """Delete files in ``repo_id`` whose ``file_path`` values are not in ``keep_paths``.
-
-        Args:
-            repo_id: Owning repository identifier.
-            keep_paths: Set of active relative POSIX paths to retain.
 
         Returns:
             Number of pruned file records.
@@ -441,17 +428,6 @@ class NodeRepositoryProtocol(Protocol):
         """
         ...
 
-    def delete_for_file(self, file_id: str) -> int:
-        """Delete all symbol nodes belonging to ``file_id``.
-
-        Args:
-            file_id: Containing file identifier.
-
-        Returns:
-            Number of deleted symbol rows.
-        """
-        ...
-
 
 @runtime_checkable
 class EdgeRepositoryProtocol(Protocol):
@@ -587,42 +563,6 @@ class EdgeRepositoryProtocol(Protocol):
 
         Returns:
             Deduplicated list of ``Edge`` entities incident to ``symbol_ids``.
-        """
-        ...
-
-    def list_referenced_by(
-        self,
-        target_id: str,
-        kinds: Sequence[EdgeKind] | None = None,
-        limit: int | None = None,
-        offset: int = 0,
-    ) -> list[ReferencedByDetail]:
-        """List distinct symbols referencing ``target_id`` joined with file metadata.
-
-        Args:
-            target_id: Target symbol identifier.
-            kinds: Optional ``EdgeKind`` filter (defaults to reference/dependency kinds).
-            limit: Optional page size limit.
-            offset: Zero-based pagination offset.
-
-        Returns:
-            Ordered list of ``ReferencedByDetail`` items.
-        """
-        ...
-
-    def list_referencing_modules(
-        self,
-        target_id: str,
-        kinds: Sequence[EdgeKind] | None = None,
-    ) -> list[str]:
-        """List distinct Python ``module_path`` names referencing ``target_id``.
-
-        Args:
-            target_id: Target symbol identifier.
-            kinds: Optional ``EdgeKind`` filter.
-
-        Returns:
-            Sorted list of referencing module paths.
         """
         ...
 

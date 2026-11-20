@@ -24,21 +24,14 @@ class InheritanceLinkResolver:
         lookup_name: str,
     ) -> str | None:
         """Search enclosing class/function/module scopes upward for ``lookup_name``."""
-        from_node = index.get_node(from_id)
-        cur_parent = from_node.parent_id if from_node is not None else None
-        visited_parents: set[str] = set()
-
-        while cur_parent is not None and cur_parent not in visited_parents:
-            visited_parents.add(cur_parent)
+        for parent_node in index.iter_parent_chain(from_id, include_start=False):
             child = index.find_direct_child(
-                cur_parent,
+                parent_node.id,
                 lookup_name,
                 prefer_kinds=_CLASS_PREFER_KINDS,
             )
             if child is not None and child.id != from_id:
                 return child.id
-            parent_node = index.get_node(cur_parent)
-            cur_parent = parent_node.parent_id if parent_node is not None else None
         return None
 
     @staticmethod

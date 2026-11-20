@@ -16,10 +16,15 @@ from context.models.symbol_context import (
 )
 from context.services.evaluator import ContextEvaluator
 from context.services.source import SourceReader
-from context.utils.formatting import edge_sort_key, select_balanced_edges
+from context.utils.formatting import (
+    edge_sort_key,
+    is_lsp_enriched,
+    is_nested_lexical_declaration,
+    select_balanced_edges,
+)
 from core.models.config import AppConfig
 from core.models.edge import Edge
-from core.models.enums import EdgeKind, SymbolKind, SymbolScope
+from core.models.enums import EdgeKind, SymbolScope
 from core.models.exceptions import (
     ParseError,
     PathSecurityError,
@@ -42,12 +47,10 @@ from graph.utils.predicates import (
 
 logger = get_logger("context.services.builder")
 
-_STRUCTURAL_EDGE_KINDS: frozenset[EdgeKind] = frozenset(
-    {
-        EdgeKind.CONTAINS,
-        EdgeKind.SCOPE_PARENT,
-    }
-)
+_STRUCTURAL_EDGE_KINDS: frozenset[EdgeKind] = frozenset({
+    EdgeKind.CONTAINS,
+    EdgeKind.SCOPE_PARENT,
+})
 
 
 class SymbolContextBuilder:
@@ -86,20 +89,8 @@ class SymbolContextBuilder:
 
     @staticmethod
     def _has_real_lexical_parent(node: SymbolNode) -> bool:
-        """Return ``True`` when ``node`` has a non-class-method lexical parent.
-
-        Args:
-            node: Focus ``SymbolNode``.
-
-        Returns:
-            ``True`` for function-nested symbols; ``False`` for top-level or class methods.
-        """
-        if node.lexical_parent_id is None:
-            return False
-        return not (
-            node.kind in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
-            and node.scope == SymbolScope.CLASS
-        )
+        """Return ``True`` when ``node`` has a non-class-method lexical parent."""
+        return is_nested_lexical_declaration(node)
 
     def _load_hierarchy(
         self,
@@ -534,6 +525,7 @@ class SymbolContextBuilder:
                 ),
             ),
         )
+        lsp_enriched = is_lsp_enriched(base_ctx, edges.all_raw)
         freshness = self._evaluator.evaluate_freshness(
             base_ctx,
             FreshnessEvalInputs(
@@ -542,8 +534,13 @@ class SymbolContextBuilder:
                 file_record=focus_file,
             ),
             uow=uow,
+            lsp_enriched=lsp_enriched,
         )
-        confidence = self._evaluator.evaluate_confidence(base_ctx, raw_edges=edges.all_raw)
+        confidence = self._evaluator.evaluate_confidence(
+            base_ctx,
+            raw_edges=edges.all_raw,
+            lsp_enriched=lsp_enriched,
+        )
 
         return base_ctx.model_copy(
             update={

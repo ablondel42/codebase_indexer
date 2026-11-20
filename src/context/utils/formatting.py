@@ -5,9 +5,9 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 
 from context.models.source import SnippetOptions, SourceWindow
-from context.models.symbol_context import ContextEdge, SymbolContext
+from context.models.symbol_context import ContextEdge, FocusSymbol, SymbolContext
 from core.models.edge import Edge
-from core.models.enums import EdgeKind
+from core.models.enums import EdgeKind, SymbolKind, SymbolScope
 from core.models.exceptions import ValidationError
 from core.models.node import SymbolNode, SymbolSummary
 from graph.utils.predicates import (
@@ -18,14 +18,12 @@ from graph.utils.predicates import (
 
 PLACEHOLDER_PREFIXES: tuple[str, ...] = UNRESOLVED_ENDPOINT_PREFIXES
 
-_SEMANTIC_EDGE_ORDER: Mapping[EdgeKind, int] = MappingProxyType(
-    {
-        EdgeKind.REFERENCES: 0,
-        EdgeKind.CALLS: 1,
-        EdgeKind.INHERITS: 2,
-        EdgeKind.IMPORTS: 3,
-    }
-)
+_SEMANTIC_EDGE_ORDER: Mapping[EdgeKind, int] = MappingProxyType({
+    EdgeKind.REFERENCES: 0,
+    EdgeKind.CALLS: 1,
+    EdgeKind.INHERITS: 2,
+    EdgeKind.IMPORTS: 3,
+})
 
 
 def edges_have_placeholder_targets(edges: Sequence[Edge | ContextEdge]) -> bool:
@@ -64,13 +62,9 @@ def is_lsp_enriched(
     ):
         return True
     edges_to_check: Sequence[Edge | ContextEdge] = (
-        raw_edges
-        if raw_edges is not None
-        else [*context.incoming_edges, *context.outgoing_edges]
+        raw_edges if raw_edges is not None else [*context.incoming_edges, *context.outgoing_edges]
     )
-    return any(
-        edge.kind == EdgeKind.REFERENCES or edge.source == "lsp" for edge in edges_to_check
-    )
+    return any(edge.kind == EdgeKind.REFERENCES or edge.source == "lsp" for edge in edges_to_check)
 
 
 def is_private_symbol(node: SymbolNode | SymbolSummary) -> bool:
@@ -225,16 +219,18 @@ def resolve_symbol_line_bounds(node: SymbolNode | SymbolSummary) -> tuple[int, i
     )
 
 
-def _validate_window_bounds(start_line: int, end_line: int) -> None:
-    """Validate 1-based inclusive ``start_line`` and ``end_line`` invariants.
+def is_nested_lexical_declaration(symbol: SymbolNode | FocusSymbol) -> bool:
+    """Return ``True`` when ``symbol`` has a lexical parent and is not a standard class method."""
+    if symbol.lexical_parent_id is None:
+        return False
+    return not (
+        symbol.kind in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
+        and symbol.scope == SymbolScope.CLASS
+    )
 
-    Args:
-        start_line: One-based inclusive start line.
-        end_line: One-based inclusive end line.
 
-    Raises:
-        ValidationError: If ``start_line < 1`` or ``end_line < start_line``.
-    """
+def validate_window_bounds(start_line: int, end_line: int) -> None:
+    """Validate 1-based inclusive ``start_line`` and ``end_line`` invariants."""
     if start_line < 1:
         raise ValidationError("start_line must be >= 1", context={"start_line": start_line})
     if end_line < start_line:
@@ -267,7 +263,7 @@ def slice_source_window(
     Raises:
         ValidationError: If ``start_line < 1`` or ``end_line < start_line``.
     """
-    _validate_window_bounds(start_line, end_line)
+    validate_window_bounds(start_line, end_line)
     opts = options if options is not None else SnippetOptions()
     clamped_decl_end = min(end_line, len(all_lines))
     padded_start = max(1, start_line - opts.padding_lines)
@@ -292,9 +288,7 @@ def slice_source_window(
     next_idx = opts.offset + len(window)
     truncated = next_idx < len(slice_lines)
     win_start = (
-        padded_start + opts.offset
-        if window
-        else min(padded_start + opts.offset, padded_end)
+        padded_start + opts.offset if window else min(padded_start + opts.offset, padded_end)
     )
     win_end = win_start + len(window) - 1 if window else win_start
 
@@ -304,9 +298,7 @@ def slice_source_window(
         window_start_line=win_start,
         window_end_line=win_end,
         raw_source="\n".join(window),
-        numbered_source="\n".join(
-            f"{win_start + idx}: {line}" for idx, line in enumerate(window)
-        ),
+        numbered_source="\n".join(f"{win_start + idx}: {line}" for idx, line in enumerate(window)),
         truncated=truncated,
         total_lines=len(slice_lines),
         returned_lines=len(window),
@@ -321,8 +313,10 @@ __all__ = [
     "edges_have_placeholder_targets",
     "format_import_label",
     "is_lsp_enriched",
+    "is_nested_lexical_declaration",
     "is_private_symbol",
     "resolve_symbol_line_bounds",
     "select_balanced_edges",
     "slice_source_window",
+    "validate_window_bounds",
 ]

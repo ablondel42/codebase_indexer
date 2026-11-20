@@ -94,22 +94,20 @@ def test_interactive_shell_commands_and_error_recovery(
     capsys.readouterr()
 
     commands = (
-        "\n".join(
-            [
-                "help",
-                "db status",
-                "db sql SELECT kind, COUNT(*) AS n FROM nodes GROUP BY kind ORDER BY n DESC",
-                "db sql DELETE FROM nodes",
-                "outline pkg/greeter.py",
-                "symbols search hello",
-                "source pkg.greeter.hello",
-                "mcp-call get_symbol_context hello",
-                "mcp-call get_symbol_context hello include_source=true",
-                "unknown-command",
-                "shell",
-                "exit",
-            ]
-        )
+        "\n".join([
+            "help",
+            "db status",
+            "db sql SELECT kind, COUNT(*) AS n FROM nodes GROUP BY kind ORDER BY n DESC",
+            "db sql DELETE FROM nodes",
+            "outline pkg/greeter.py",
+            "symbols search hello",
+            "source pkg.greeter.hello",
+            "mcp-call get_symbol_context hello",
+            "mcp-call get_symbol_context hello include_source=true",
+            "unknown-command",
+            "shell",
+            "exit",
+        ])
         + "\n"
     )
     monkeypatch.setattr(sys, "stdin", io.StringIO(commands))

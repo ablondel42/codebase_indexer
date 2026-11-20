@@ -12,57 +12,55 @@ from core.utils.logging import get_logger
 
 logger = get_logger("cli.utils.argv")
 
-KNOWN_COMMANDS: frozenset[str] = frozenset(
-    {
-        "index",
-        "db",
-        "files",
-        "outline",
-        "symbols",
-        "search",
-        "source",
-        "refs",
-        "risk",
-        "shell",
-        "watch",
-        "serve",
-        "mcp-call",
-    }
-)
+KNOWN_COMMANDS: frozenset[str] = frozenset({
+    "index",
+    "db",
+    "files",
+    "outline",
+    "symbols",
+    "search",
+    "source",
+    "refs",
+    "risk",
+    "shell",
+    "watch",
+    "serve",
+    "mcp-call",
+})
 
-_REPO_SCOPED_ROOT: frozenset[str] = frozenset(
-    {"files", "outline", "search", "source", "refs", "risk", "mcp-call"}
-)
-_REPO_SCOPED_SUBS: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("db", "status"),
-        ("db", "runs"),
-        ("symbols", "search"),
-        ("symbols", "list"),
-        ("symbols", "show"),
-    }
-)
-_PRIMARY_ARG_BY_TOOL: Mapping[str, str] = MappingProxyType(
-    {
-        "get_repo_overview": "repo_id",
-        "list_files": "path_prefix",
-        "get_file_outline": "file_path",
-        "search_symbols": "query",
-        "search_code": "query",
-        "get_symbol_source": "symbol",
-        "get_symbol_context": "symbol",
-        "get_symbol_references": "symbol",
-        "analyze_risk": "symbols",
-    }
-)
-_LITERAL_SHORTHAND_VALUES: Mapping[str, bool | None] = MappingProxyType(
-    {
-        "true": True,
-        "false": False,
-        "null": None,
-        "none": None,
-    }
-)
+_REPO_SCOPED_ROOT: frozenset[str] = frozenset({
+    "files",
+    "outline",
+    "search",
+    "source",
+    "refs",
+    "risk",
+    "mcp-call",
+})
+_REPO_SCOPED_SUBS: frozenset[tuple[str, str]] = frozenset({
+    ("db", "status"),
+    ("db", "runs"),
+    ("symbols", "search"),
+    ("symbols", "list"),
+    ("symbols", "show"),
+})
+_PRIMARY_ARG_BY_TOOL: Mapping[str, str] = MappingProxyType({
+    "get_repo_overview": "repo_id",
+    "list_files": "path_prefix",
+    "get_file_outline": "file_path",
+    "search_symbols": "query",
+    "search_code": "query",
+    "get_symbol_source": "symbol",
+    "get_symbol_context": "symbol",
+    "get_symbol_references": "symbol",
+    "analyze_risk": "symbols",
+})
+_LITERAL_SHORTHAND_VALUES: Mapping[str, bool | None] = MappingProxyType({
+    "true": True,
+    "false": False,
+    "null": None,
+    "none": None,
+})
 _KV_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 
 
@@ -200,10 +198,7 @@ def _assign_positional_args(
         return
     if primary_key == "symbols":
         parsed_kwargs[primary_key] = [
-            part.strip()
-            for item in positional
-            for part in item.split(",")
-            if part.strip()
+            part.strip() for item in positional for part in item.split(",") if part.strip()
         ]
         return
     parsed_kwargs[primary_key] = " ".join(positional)
@@ -251,32 +246,14 @@ def parse_mcp_call_args(tool_name: str, raw_tokens: Sequence[str]) -> dict[str, 
 
 
 def normalize_mcp_tool_kwargs(
-    tool_name: str,
     raw_args: Mapping[str, Any],
     explicit_db_path: Path | None,
     default_db_path: Path,
     *,
     repo_arg: str | None = None,
 ) -> dict[str, Any]:
-    """Normalize MCP alias keys and inject CLI ``--db-path`` and ``--repo`` overrides.
-
-    Args:
-        tool_name: Target MCP tool name.
-        raw_args: Parsed raw argument mapping.
-        explicit_db_path: Explicit ``--db-path`` supplied on CLI, or ``None``.
-        default_db_path: Fallback ``AppConfig.db_path`` when ``--db-path`` is omitted.
-        repo_arg: Optional ``--repo`` CLI argument value.
-
-    Returns:
-        Normalized argument dictionary ready for ``McpToolRegistry.call_tool``.
-    """
+    """Inject CLI ``--db-path`` and ``--repo`` overrides into MCP tool kwargs."""
     kwargs = dict(raw_args)
-    if tool_name in ("get_symbol_source", "get_symbol_context", "get_symbol_references"):
-        if "symbol" not in kwargs and "symbol_id_or_name" in kwargs:
-            kwargs["symbol"] = kwargs.pop("symbol_id_or_name")
-    elif tool_name == "analyze_risk" and "symbols" not in kwargs and "symbol_ids" in kwargs:
-        kwargs["symbols"] = kwargs.pop("symbol_ids")
-
     if repo_arg and "repo_id" not in kwargs:
         kwargs["repo_id"] = repo_arg
 

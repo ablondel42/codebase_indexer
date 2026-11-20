@@ -73,7 +73,7 @@ class RiskAnalyzer:
         facts = self._collector.collect_facts(uow, targets)
         issues = detect_risk_issues(facts)
         risk_score = score_risk(issues, facts)
-        decision = decide_risk(issues, facts, risk_score)
+        decision = decide_risk(issues, risk_score)
         logger.debug(
             "Analyzed risk for %d target(s): score=%d decision=%s issues=%s",
             len(targets),

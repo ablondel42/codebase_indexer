@@ -159,9 +159,7 @@ class ReferenceAnalyzer:
         file_path = ev_file.file_path if ev_file is not None else None
         line_num = extract_edge_line(edge)
         col_num = (
-            edge.evidence_range.start.character + 1
-            if edge.evidence_range is not None
-            else None
+            edge.evidence_range.start.character + 1 if edge.evidence_range is not None else None
         )
         site_loc = (
             edge.location

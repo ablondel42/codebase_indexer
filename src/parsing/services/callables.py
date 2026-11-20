@@ -1,11 +1,10 @@
 """Leaf callable ``SymbolNode`` and parameter extractor service."""
 
 import ast
-import hashlib
 from collections.abc import Sequence
 from types import MappingProxyType
 
-from core.models.enums import PREFIX_SHA256, Language, SymbolKind, SymbolScope
+from core.models.enums import SymbolKind, SymbolScope
 from core.models.node import SymbolNode
 from core.utils.hashing import compute_symbol_content_hash
 from core.utils.logging import get_logger
@@ -13,12 +12,15 @@ from parsing.models.extraction import DeclarationPlacement, ParameterSpec, Scope
 from parsing.services.scope import FileExtractionSession
 from parsing.utils.ast_helpers import (
     cap_signature,
-    compute_visibility_hint,
     get_doc_summary,
     is_generator_callable,
     safe_unparse,
 )
-from parsing.utils.naming import build_callable_qualified_name, build_nested_qualified_name
+from parsing.utils.naming import (
+    build_symbol_node,
+    compute_semantic_digest,
+    resolve_symbol_placement,
+)
 from parsing.utils.ranges import (
     make_declaration_lines,
     make_name_selection_range,
@@ -27,14 +29,12 @@ from parsing.utils.ranges import (
 
 logger = get_logger("parsing.services.callables")
 
-_CALLABLE_KIND_BY_SCOPE = MappingProxyType(
-    {
-        (SymbolScope.MODULE, False): SymbolKind.FUNCTION,
-        (SymbolScope.MODULE, True): SymbolKind.ASYNC_FUNCTION,
-        (SymbolScope.CLASS, False): SymbolKind.METHOD,
-        (SymbolScope.CLASS, True): SymbolKind.ASYNC_METHOD,
-    }
-)
+_CALLABLE_KIND_BY_SCOPE = MappingProxyType({
+    (SymbolScope.MODULE, False): SymbolKind.FUNCTION,
+    (SymbolScope.MODULE, True): SymbolKind.ASYNC_FUNCTION,
+    (SymbolScope.CLASS, False): SymbolKind.METHOD,
+    (SymbolScope.CLASS, True): SymbolKind.ASYNC_METHOD,
+})
 
 
 class CallableExtractor:
@@ -46,17 +46,7 @@ class CallableExtractor:
         kind: str,
         default_node: ast.expr | None = None,
     ) -> ParameterSpec:
-        """Build a ``ParameterSpec`` for one AST parameter node.
-
-        Args:
-            arg: ``ast.arg`` parameter node.
-            kind: Parameter category (``positional_only``, ``positional_or_keyword``,
-                ``var_positional``, ``keyword_only``, or ``var_keyword``).
-            default_node: Optional AST expression providing the default value.
-
-        Returns:
-            Immutable ``ParameterSpec`` model.
-        """
+        """Build a ``ParameterSpec`` for one AST parameter node."""
         annotation = safe_unparse(arg.annotation) if arg.annotation is not None else None
         default_hint = safe_unparse(default_node) if default_node is not None else None
         return ParameterSpec(
@@ -67,14 +57,7 @@ class CallableExtractor:
         )
 
     def extract_parameters(self, args: ast.arguments) -> list[ParameterSpec]:
-        """Extract ordered ``ParameterSpec`` models from ``ast.arguments``.
-
-        Args:
-            args: Python AST callable arguments node.
-
-        Returns:
-            Ordered list of ``ParameterSpec`` models.
-        """
+        """Extract ordered ``ParameterSpec`` models from ``ast.arguments``."""
         parameters: list[ParameterSpec] = []
         posonlyargs = list(getattr(args, "posonlyargs", []))
         positional = posonlyargs + list(args.args)
@@ -101,14 +84,7 @@ class CallableExtractor:
 
     @staticmethod
     def _format_single_param(param: ParameterSpec) -> str:
-        """Format a single ``ParameterSpec`` for a compact Python signature.
-
-        Args:
-            param: Normalized parameter metadata.
-
-        Returns:
-            Rendered parameter segment string.
-        """
+        """Format a single ``ParameterSpec`` for a compact Python signature."""
         if param.kind == "var_positional":
             prefix = f"*{param.name}"
         elif param.kind == "var_keyword":
@@ -133,17 +109,7 @@ class CallableExtractor:
         *,
         is_async: bool,
     ) -> str:
-        """Build a compact single-line callable signature capped at 240 characters.
-
-        Args:
-            callable_name: Declared callable identifier.
-            parameters: Ordered ``ParameterSpec`` sequence.
-            return_annotation: Unparsed return type annotation, or ``None``.
-            is_async: Whether the callable is ``async def``.
-
-        Returns:
-            Normalized capped signature string.
-        """
+        """Build a compact single-line callable signature capped at 240 characters."""
         by_kind: dict[str, list[str]] = {
             "positional_only": [],
             "positional_or_keyword": [],
@@ -179,30 +145,16 @@ class CallableExtractor:
         *,
         is_async: bool,
     ) -> str:
-        """Compute a semantic hash preserving parameter order, annotations, and defaults.
-
-        Args:
-            placement: Resolved ``DeclarationPlacement`` of the callable.
-            parameters: Ordered ``ParameterSpec`` sequence.
-            return_annotation: Unparsed return annotation or ``None``.
-            decorators: Unparsed decorator expressions.
-            is_async: Whether the callable is ``async def``.
-
-        Returns:
-            ``sha256:``-prefixed digest string.
-        """
-        hash_obj = hashlib.sha256()
-        hash_obj.update(f"kind:{placement.kind.value}".encode())
-        hash_obj.update(f"qualified_name:{placement.qualified_name}".encode())
-        hash_obj.update(f"is_async:{is_async}".encode())
-        param_data = [
-            (p.name, p.kind, p.annotation, p.default_value_hint)
-            for p in parameters
-        ]
-        hash_obj.update(f"parameters:{param_data}".encode())
-        hash_obj.update(f"return:{return_annotation}".encode())
-        hash_obj.update(f"decorators:{decorators}".encode())
-        return f"{PREFIX_SHA256}{hash_obj.hexdigest()}"
+        """Compute a semantic hash preserving parameter order, annotations, and defaults."""
+        param_data = [(p.name, p.kind, p.annotation, p.default_value_hint) for p in parameters]
+        return compute_semantic_digest((
+            f"kind:{placement.kind.value}",
+            f"qualified_name:{placement.qualified_name}",
+            f"is_async:{is_async}",
+            f"parameters:{param_data}",
+            f"return:{return_annotation}",
+            f"decorators:{decorators}",
+        ))
 
     def resolve_placement(
         self,
@@ -210,53 +162,19 @@ class CallableExtractor:
         target: ScopeTarget,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> DeclarationPlacement:
-        """Resolve kind, structural/lexical parent IDs, and qualified name for a callable.
-
-        Args:
-            session: Active per-file extraction session.
-            target: Enclosing ``ScopeTarget`` metadata.
-            node: ``ast.FunctionDef`` or ``ast.AsyncFunctionDef`` node.
-
-        Returns:
-            Resolved ``DeclarationPlacement`` for the callable.
-        """
+        """Resolve kind, structural/lexical parent IDs, and qualified name for a callable."""
         is_async = isinstance(node, ast.AsyncFunctionDef)
-        current_scope = session.scope_tracker.get_current_scope()
-        enclosing_id = session.scope_tracker.get_lexical_parent_id()
-
-        default_local = (
-            SymbolKind.LOCAL_ASYNC_FUNCTION if is_async else SymbolKind.LOCAL_FUNCTION
-        )
+        tracker = session.scope_tracker
+        current_scope = tracker.get_current_scope()
+        default_local = SymbolKind.LOCAL_ASYNC_FUNCTION if is_async else SymbolKind.LOCAL_FUNCTION
         kind = _CALLABLE_KIND_BY_SCOPE.get((current_scope, is_async), default_local)
-        actual_parent_id = (
-            target.parent_id
-            if current_scope == SymbolScope.MODULE or enclosing_id is None
-            else enclosing_id
-        )
-        lexical_parent_id = (
-            enclosing_id
-            if current_scope not in (SymbolScope.MODULE, SymbolScope.CLASS)
-            else None
-        )
-
-        if session.scope_tracker.is_empty():
-            qualified_name = build_callable_qualified_name(
-                target.parent_qualified_name,
-                node.name,
-            )
-        else:
-            qualified_name = build_nested_qualified_name(
-                session.module_path,
-                session.scope_tracker.get_lexical_chain(),
-                node.name,
-            )
-
-        return DeclarationPlacement(
+        return resolve_symbol_placement(
+            session.module_path,
+            tracker.get_lexical_chain(),
+            (current_scope, tracker.get_lexical_parent_id()),
             kind=kind,
-            parent_id=actual_parent_id,
-            lexical_parent_id=lexical_parent_id,
-            qualified_name=qualified_name,
-            scope=current_scope,
+            name=node.name,
+            target=(target, None),
         )
 
     def extract(
@@ -265,17 +183,7 @@ class CallableExtractor:
         target: ScopeTarget,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
     ) -> SymbolNode:
-        """Build an immutable ``SymbolNode`` for one callable AST node without recursion.
-
-        Args:
-            session: Active per-file extraction session.
-            target: Enclosing ``ScopeTarget`` metadata.
-            node: ``ast.FunctionDef`` or ``ast.AsyncFunctionDef`` node.
-
-        Returns:
-            Constructed immutable ``SymbolNode`` for the callable.
-        """
-        file_rec = session.file_record
+        """Build an immutable ``SymbolNode`` for one callable AST node without recursion."""
         placement = self.resolve_placement(session, target, node)
         node_id = session.duplicate_tracker.get_symbol_id(
             session.repo_id,
@@ -300,44 +208,37 @@ class CallableExtractor:
             decorators,
             is_async=is_async,
         )
-
-        return SymbolNode(
-            id=node_id,
-            repo_id=session.repo_id,
-            file_id=file_rec.id,
-            language=Language.PYTHON,
-            kind=placement.kind,
-            name=node.name,
-            qualified_name=placement.qualified_name,
-            uri=file_rec.uri,
-            decl_range=make_range(node, lines=session.lines),
-            selection_range=make_name_selection_range(node, lines=session.lines),
-            start_line=span.start_line,
-            end_line=span.end_line,
-            signature=signature,
-            parent_id=placement.parent_id,
-            visibility_hint=compute_visibility_hint(node.name, placement.scope),
-            doc_summary=get_doc_summary(node),
-            content_hash=compute_symbol_content_hash(
-                node,
-                session.lines,
+        content_hash = compute_symbol_content_hash(
+            node,
+            session.lines,
+            span.start_line,
+            span.end_line,
+        )
+        return build_symbol_node(
+            session.file_record,
+            node_id,
+            node.name,
+            placement,
+            spans=(
+                make_range(node, lines=session.lines),
+                make_name_selection_range(node, lines=session.lines),
                 span.start_line,
                 span.end_line,
             ),
-            semantic_hash=semantic_hash,
-            source="python-ast",
-            confidence=1.0,
-            scope=placement.scope,
-            lexical_parent_id=placement.lexical_parent_id,
-            payload={
-                "parameters": [param.to_payload() for param in parameters],
-                "return_annotation": return_annotation,
-                "decorators": decorators,
-                "is_async": is_async,
-                "is_method": placement.scope == SymbolScope.CLASS,
-                "is_generator": is_generator_callable(node),
-            },
-            last_indexed_at=file_rec.last_indexed_at,
+            metadata=(
+                signature,
+                get_doc_summary(node),
+                content_hash,
+                semantic_hash,
+                {
+                    "parameters": [param.to_payload() for param in parameters],
+                    "return_annotation": return_annotation,
+                    "decorators": decorators,
+                    "is_async": is_async,
+                    "is_method": placement.scope == SymbolScope.CLASS,
+                    "is_generator": is_generator_callable(node),
+                },
+            ),
         )
 
 

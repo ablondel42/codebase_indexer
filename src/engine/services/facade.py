@@ -14,6 +14,7 @@ from core.models.exceptions import IndexerError
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol
 from core.utils.logging import get_logger
+from engine.models.collaborators import CommandCollaborators, QueryCollaborators
 from engine.services.command import CommandEngine
 from engine.services.query import QueryEngine
 from engine.services.resolver import SymbolTargetResolver
@@ -131,10 +132,12 @@ class _EngineRuntime:
             uow_factory,
             self.lsp_pool,
             resolver=self.resolver,
-            batch_indexer=self.batch_indexer,
-            incremental_indexer=self.incremental_indexer,
-            lsp_coordinator=self.lsp_coordinator,
-            watcher=self.watcher,
+            collaborators=CommandCollaborators(
+                batch_indexer=self.batch_indexer,
+                incremental_indexer=self.incremental_indexer,
+                lsp_coordinator=self.lsp_coordinator,
+                watcher=self.watcher,
+            ),
         )
 
     def build_queries(
@@ -143,28 +146,21 @@ class _EngineRuntime:
         uow_factory: UnitOfWorkFactoryProtocol,
         command_engine: CommandEngine,
     ) -> QueryEngine:
-        """Construct a ``QueryEngine`` sharing this runtime's read collaborators.
-
-        Args:
-            config: Scoped ``AppConfig`` for the engine instance.
-            uow_factory: Scoped ``UnitOfWorkFactoryProtocol``.
-            command_engine: Paired ``CommandEngine`` for optional ``refresh_lsp`` runs.
-
-        Returns:
-            Configured ``QueryEngine`` instance.
-        """
+        """Construct a ``QueryEngine`` sharing this runtime's read collaborators."""
         return QueryEngine(
             config,
             uow_factory,
             resolver=self.resolver,
             command_engine=command_engine,
-            navigator=self.navigator,
-            reference_analyzer=self.reference_analyzer,
-            risk_analyzer=self.risk_analyzer,
-            source_reader=self.source_reader,
-            outline_builder=self.outline_builder,
-            context_builder=self.context_builder,
-            code_search=self.code_search,
+            collaborators=QueryCollaborators(
+                navigator=self.navigator,
+                reference_analyzer=self.reference_analyzer,
+                risk_analyzer=self.risk_analyzer,
+                source_reader=self.source_reader,
+                outline_builder=self.outline_builder,
+                context_builder=self.context_builder,
+                code_search=self.code_search,
+            ),
         )
 
     def close_all(self) -> None:
@@ -220,7 +216,6 @@ class IndexerEngine:
             _runtime if _runtime is not None else _EngineRuntime(base_config, resolved_pool)
         )
         self._lsp_pool = self._runtime.lsp_pool
-        self._factories_by_key = self._runtime.factories_by_key
 
         if uow_factory is not None:
             self._uow_factory = uow_factory
@@ -284,7 +279,6 @@ class IndexerEngine:
         return IndexerEngine(
             scoped_config,
             uow_factory=scoped_factory,
-            lsp_pool=self._lsp_pool,
             _runtime=self._runtime,
         )
 

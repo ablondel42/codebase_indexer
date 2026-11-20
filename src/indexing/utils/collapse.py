@@ -3,6 +3,7 @@
 from collections import defaultdict
 from collections.abc import Sequence
 
+from core.models.repo import RepoRecord
 from indexing.models.events import FileChangeEvent, FileEventType
 
 
@@ -79,7 +80,23 @@ def collapse_path_events(events: Sequence[FileChangeEvent]) -> FileChangeEvent |
     )
 
 
+def build_repo_upsert_record(
+    existing: RepoRecord | None,
+    candidate: RepoRecord,
+    *,
+    last_indexed_at: str | None = None,
+) -> RepoRecord:
+    """Merge ``candidate`` with ``existing`` preserving ``created_at`` and optional timestamp."""
+    if existing is None:
+        return candidate
+    updates: dict[str, str | None] = {"created_at": existing.created_at}
+    if last_indexed_at is not None:
+        updates["last_indexed_at"] = last_indexed_at
+    return candidate.model_copy(update=updates)
+
+
 __all__ = [
+    "build_repo_upsert_record",
     "collapse_events",
     "collapse_path_events",
 ]

@@ -123,30 +123,28 @@ def test_repo_and_file_record_v2_fields() -> None:
 def test_symbol_node_supports_all_v2_kinds_and_structured_ranges(kind: SymbolKind) -> None:
     """SymbolNode validates all v2 symbol kinds, structured Range fields, and SymbolSummary."""
     long_name = "S" * 512
-    node = SymbolNode.model_validate(
-        {
-            "id": f"node:project:test:{kind.value}:app.{long_name}",
-            "repo_id": "project:test:1234abcd",
-            "file_id": "file:project:test:1234abcd:app/service.py",
-            "kind": kind.value,
-            "name": long_name,
-            "qualified_name": f"app.{long_name}",
-            "uri": "file:///path/to/repo/app/service.py",
-            "decl_range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 2, "character": 0},
-            },
-            "selection_range": {
-                "start": {"line": 0, "character": 0},
-                "end": {"line": 0, "character": 5},
-            },
-            "start_line": 1,
-            "end_line": 3,
-            "signature": "MAX_RETRIES: int = 3",
-            "scope": SymbolScope.MODULE,
-            "payload": {"value_hint": "3"},
-        }
-    )
+    node = SymbolNode.model_validate({
+        "id": f"node:project:test:{kind.value}:app.{long_name}",
+        "repo_id": "project:test:1234abcd",
+        "file_id": "file:project:test:1234abcd:app/service.py",
+        "kind": kind.value,
+        "name": long_name,
+        "qualified_name": f"app.{long_name}",
+        "uri": "file:///path/to/repo/app/service.py",
+        "decl_range": {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 2, "character": 0},
+        },
+        "selection_range": {
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 5},
+        },
+        "start_line": 1,
+        "end_line": 3,
+        "signature": "MAX_RETRIES: int = 3",
+        "scope": SymbolScope.MODULE,
+        "payload": {"value_hint": "3"},
+    })
     assert node.kind == kind
     assert node.start_line == 1
     assert node.end_line == 3
@@ -172,32 +170,28 @@ def test_symbol_node_supports_all_v2_kinds_and_structured_ranges(kind: SymbolKin
 def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> None:
     """SymbolNode forbids legacy *_json fields, invalid payload types, and name > 1024."""
     with pytest.raises(PydanticValidationError):
-        SymbolNode.model_validate(
-            {
-                "id": "node:project:test:constant:app.X",
-                "repo_id": "project:test:1234abcd",
-                "file_id": "file:project:test:1234abcd:app/service.py",
-                "kind": "constant",
-                "name": "X",
-                "qualified_name": "app.X",
-                "uri": "file:///path/to/repo/app/service.py",
-                "payload_json": '{"legacy": true}',
-            }
-        )
+        SymbolNode.model_validate({
+            "id": "node:project:test:constant:app.X",
+            "repo_id": "project:test:1234abcd",
+            "file_id": "file:project:test:1234abcd:app/service.py",
+            "kind": "constant",
+            "name": "X",
+            "qualified_name": "app.X",
+            "uri": "file:///path/to/repo/app/service.py",
+            "payload_json": '{"legacy": true}',
+        })
 
     with pytest.raises(PydanticValidationError):
-        SymbolNode.model_validate(
-            {
-                "id": "node:project:test:constant:app.X",
-                "repo_id": "project:test:1234abcd",
-                "file_id": "file:project:test:1234abcd:app/service.py",
-                "kind": "constant",
-                "name": "X",
-                "qualified_name": "app.X",
-                "uri": "file:///path/to/repo/app/service.py",
-                "payload": "not-a-dict",
-            }
-        )
+        SymbolNode.model_validate({
+            "id": "node:project:test:constant:app.X",
+            "repo_id": "project:test:1234abcd",
+            "file_id": "file:project:test:1234abcd:app/service.py",
+            "kind": "constant",
+            "name": "X",
+            "qualified_name": "app.X",
+            "uri": "file:///path/to/repo/app/service.py",
+            "payload": "not-a-dict",
+        })
 
     with pytest.raises(PydanticValidationError):
         SymbolNode(
@@ -224,47 +218,41 @@ def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> No
 )
 def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKind) -> None:
     """Edge accepts normalized v2 kinds and structured evidence_range, rejecting bad inputs."""
-    edge = Edge.model_validate(
-        {
-            "id": f"edge:project:test:{kind.value}:a->b",
-            "repo_id": "project:test:1234abcd",
-            "kind": kind.value,
-            "from_id": "node:a",
-            "to_id": "node:b",
-            "payload": {"target": "b"},
-            "evidence_range": {
-                "start": {"line": 1, "character": 0},
-                "end": {"line": 1, "character": 3},
-            },
-        }
-    )
+    edge = Edge.model_validate({
+        "id": f"edge:project:test:{kind.value}:a->b",
+        "repo_id": "project:test:1234abcd",
+        "kind": kind.value,
+        "from_id": "node:a",
+        "to_id": "node:b",
+        "payload": {"target": "b"},
+        "evidence_range": {
+            "start": {"line": 1, "character": 0},
+            "end": {"line": 1, "character": 3},
+        },
+    })
     assert edge.kind == kind
     assert edge.payload == {"target": "b"}
     assert edge.evidence_range is not None
     assert edge.evidence_range.start.line == 1
 
     with pytest.raises(PydanticValidationError):
-        Edge.model_validate(
-            {
-                "id": "edge:bad",
-                "repo_id": "project:test:1234abcd",
-                "kind": "calls",
-                "from_id": "node:a",
-                "to_id": "node:b",
-                "evidence_range_json": "[legacy",
-            }
-        )
+        Edge.model_validate({
+            "id": "edge:bad",
+            "repo_id": "project:test:1234abcd",
+            "kind": "calls",
+            "from_id": "node:a",
+            "to_id": "node:b",
+            "evidence_range_json": "[legacy",
+        })
 
     with pytest.raises(PydanticValidationError):
-        Edge.model_validate(
-            {
-                "id": "edge:legacy_kind",
-                "repo_id": "project:test:1234abcd",
-                "kind": "SCOPE_PARENT",
-                "from_id": "node:a",
-                "to_id": "node:b",
-            }
-        )
+        Edge.model_validate({
+            "id": "edge:legacy_kind",
+            "repo_id": "project:test:1234abcd",
+            "kind": "SCOPE_PARENT",
+            "from_id": "node:a",
+            "to_id": "node:b",
+        })
 
 
 def test_symbol_context_and_risk_assessment_frozen_and_independent_defaults() -> None:

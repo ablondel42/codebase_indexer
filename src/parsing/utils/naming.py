@@ -1,50 +1,22 @@
-"""Pure qualified-name and deterministic symbol/edge identifier builders."""
+"""Pure qualified-name, semantic-hash, placement, and symbol/edge builders."""
 
+import hashlib
 from collections.abc import Sequence
+from typing import Any
 
-from core.models.enums import PREFIX_EDGE, PREFIX_SYMBOL, EdgeKind, SymbolKind
-
-
-def build_module_qualified_name(module_path: str) -> str:
-    """Build the canonical qualified name for a Python module.
-
-    Args:
-        module_path: Dotted Python module path.
-
-    Returns:
-        Module qualified name string.
-    """
-    return module_path
-
-
-def build_class_qualified_name(module_path: str, class_name: str) -> str:
-    """Build the canonical qualified name for a top-level class.
-
-    Args:
-        module_path: Dotted Python module path.
-        class_name: Simple declared class name.
-
-    Returns:
-        Dotted qualified name for the class.
-    """
-    if module_path:
-        return f"{module_path}.{class_name}"
-    return class_name
-
-
-def build_callable_qualified_name(parent_qualified_name: str, callable_name: str) -> str:
-    """Build the canonical qualified name for a function or method.
-
-    Args:
-        parent_qualified_name: Enclosing module or class qualified name.
-        callable_name: Simple declared callable name.
-
-    Returns:
-        Dotted qualified name for the callable.
-    """
-    if parent_qualified_name:
-        return f"{parent_qualified_name}.{callable_name}"
-    return callable_name
+from core.models.enums import (
+    PREFIX_EDGE,
+    PREFIX_SHA256,
+    EdgeKind,
+    Language,
+    SymbolKind,
+    SymbolScope,
+)
+from core.models.file import FileRecord
+from core.models.node import SymbolNode
+from core.models.range import Range
+from parsing.models.extraction import DeclarationPlacement, ScopeTarget
+from parsing.utils.ast_helpers import compute_visibility_hint
 
 
 def build_nested_qualified_name(
@@ -68,62 +40,6 @@ def build_nested_qualified_name(
     return ".".join(parts)
 
 
-def build_module_node_id(repo_id: str, module_path: str) -> str:
-    """Build a deterministic node ID for a module symbol.
-
-    Args:
-        repo_id: Owning repository identifier.
-        module_path: Dotted Python module path.
-
-    Returns:
-        Canonical ``sym:<repo_id>:module:<module_path>`` identifier.
-    """
-    return f"{PREFIX_SYMBOL}{repo_id}:{SymbolKind.MODULE.value}:{module_path}"
-
-
-def build_class_node_id(repo_id: str, qualified_name: str) -> str:
-    """Build a deterministic node ID for a class symbol.
-
-    Args:
-        repo_id: Owning repository identifier.
-        qualified_name: Full class qualified name.
-
-    Returns:
-        Canonical ``sym:<repo_id>:class:<qualified_name>`` identifier.
-    """
-    return f"{PREFIX_SYMBOL}{repo_id}:{SymbolKind.CLASS.value}:{qualified_name}"
-
-
-def build_callable_node_id(repo_id: str, kind: SymbolKind | str, qualified_name: str) -> str:
-    """Build a deterministic node ID for a callable symbol.
-
-    Args:
-        repo_id: Owning repository identifier.
-        kind: Callable ``SymbolKind`` (e.g., ``function``, ``method``, ``local_function``).
-        qualified_name: Full callable qualified name.
-
-    Returns:
-        Canonical ``sym:<repo_id>:<kind>:<qualified_name>`` identifier.
-    """
-    kind_val = kind.value if isinstance(kind, SymbolKind) else str(kind)
-    return f"{PREFIX_SYMBOL}{repo_id}:{kind_val}:{qualified_name}"
-
-
-def build_assignment_node_id(repo_id: str, kind: SymbolKind | str, qualified_name: str) -> str:
-    """Build a deterministic node ID for a constant, attribute, or type alias symbol.
-
-    Args:
-        repo_id: Owning repository identifier.
-        kind: Assignment ``SymbolKind`` (``constant``, ``attribute``, or ``type_alias``).
-        qualified_name: Full symbol qualified name.
-
-    Returns:
-        Canonical ``sym:<repo_id>:<kind>:<qualified_name>`` identifier.
-    """
-    kind_val = kind.value if isinstance(kind, SymbolKind) else str(kind)
-    return f"{PREFIX_SYMBOL}{repo_id}:{kind_val}:{qualified_name}"
-
-
 def make_structural_edge_id(
     repo_id: str,
     kind: EdgeKind | str,
@@ -145,14 +61,135 @@ def make_structural_edge_id(
     return f"{PREFIX_EDGE}{repo_id}:{kind_val}:{from_id}->{to_id}"
 
 
+def compute_semantic_digest(parts: Sequence[str]) -> str:
+    """Compute a deterministic ``sha256:`` digest over ordered semantic ``key:value`` parts.
+
+    Args:
+        parts: Ordered string fragments hashed sequentially as UTF-8 bytes.
+
+    Returns:
+        ``sha256:``-prefixed digest string.
+    """
+    hash_obj = hashlib.sha256()
+    for part in parts:
+        hash_obj.update(part.encode("utf-8"))
+    return f"{PREFIX_SHA256}{hash_obj.hexdigest()}"
+
+
+def resolve_symbol_placement(
+    module_path: str,
+    lexical_chain: Sequence[str],
+    scope_state: tuple[SymbolScope, str | None],
+    *,
+    kind: SymbolKind,
+    name: str,
+    target: tuple[ScopeTarget | None, str | None] = (None, None),
+) -> DeclarationPlacement:
+    """Resolve structural/lexical parent IDs and qualified name for a declaration.
+
+    Args:
+        module_path: Dotted Python module path.
+        lexical_chain: Ordered enclosing declaration names from outermost to innermost.
+        scope_state: Tuple ``(current_scope, enclosing_id)`` from ``ScopeTracker``.
+        kind: Resolved ``SymbolKind`` for the declaration.
+        name: Simple declared identifier name.
+        target: Tuple ``(scope_target, fallback_parent_id)``.
+
+    Returns:
+        Resolved ``DeclarationPlacement`` value object.
+    """
+    current_scope, enclosing_id = scope_state
+    scope_target, fallback_parent_id = target
+    if kind == SymbolKind.CLASS:
+        explicit_parent = scope_target.parent_id if scope_target is not None else None
+        fallback = fallback_parent_id if current_scope == SymbolScope.MODULE else enclosing_id
+        actual_parent_id = explicit_parent if explicit_parent is not None else fallback
+    else:
+        target_parent = scope_target.parent_id if scope_target is not None else fallback_parent_id
+        actual_parent_id = (
+            target_parent
+            if current_scope == SymbolScope.MODULE or enclosing_id is None
+            else enclosing_id
+        )
+
+    lexical_parent_id = (
+        enclosing_id if current_scope not in (SymbolScope.MODULE, SymbolScope.CLASS) else None
+    )
+
+    if lexical_chain:
+        qualified_name = build_nested_qualified_name(module_path, lexical_chain, name)
+    elif scope_target is not None and scope_target.parent_qualified_name:
+        qualified_name = f"{scope_target.parent_qualified_name}.{name}"
+    elif module_path:
+        qualified_name = f"{module_path}.{name}"
+    else:
+        qualified_name = name
+
+    return DeclarationPlacement(
+        kind=kind,
+        parent_id=actual_parent_id,
+        lexical_parent_id=lexical_parent_id,
+        qualified_name=qualified_name,
+        scope=current_scope,
+    )
+
+
+def build_symbol_node(
+    file_record: FileRecord,
+    node_id: str,
+    name: str,
+    placement: DeclarationPlacement,
+    *,
+    spans: tuple[Range | None, Range | None, int, int],
+    metadata: tuple[str | None, str | None, str, str, dict[str, Any]],
+) -> SymbolNode:
+    """Construct an immutable Python AST ``SymbolNode`` from normalized components.
+
+    Args:
+        file_record: Tracked ``FileRecord`` owning the declaration.
+        node_id: Deterministic allocated ``SymbolNode`` identifier.
+        name: Simple declared identifier name.
+        placement: Resolved ``DeclarationPlacement`` for this symbol.
+        spans: Tuple ``(decl_range, selection_range, start_line, end_line)``.
+        metadata: Tuple ``(signature, doc_summary, content_hash, semantic_hash, payload)``.
+
+    Returns:
+        Constructed immutable ``SymbolNode``.
+    """
+    decl_range, selection_range, start_line, end_line = spans
+    signature, doc_summary, content_hash, semantic_hash, payload = metadata
+    return SymbolNode(
+        id=node_id,
+        repo_id=file_record.repo_id,
+        file_id=file_record.id,
+        language=Language.PYTHON,
+        kind=placement.kind,
+        name=name,
+        qualified_name=placement.qualified_name,
+        uri=file_record.uri,
+        decl_range=decl_range,
+        selection_range=selection_range,
+        start_line=start_line,
+        end_line=end_line,
+        signature=signature,
+        parent_id=placement.parent_id,
+        visibility_hint=compute_visibility_hint(name, placement.scope),
+        doc_summary=doc_summary,
+        content_hash=content_hash,
+        semantic_hash=semantic_hash,
+        source="python-ast",
+        confidence=1.0,
+        scope=placement.scope,
+        lexical_parent_id=placement.lexical_parent_id,
+        payload=payload,
+        last_indexed_at=file_record.last_indexed_at,
+    )
+
+
 __all__ = [
-    "build_assignment_node_id",
-    "build_callable_node_id",
-    "build_callable_qualified_name",
-    "build_class_node_id",
-    "build_class_qualified_name",
-    "build_module_node_id",
-    "build_module_qualified_name",
     "build_nested_qualified_name",
+    "build_symbol_node",
+    "compute_semantic_digest",
     "make_structural_edge_id",
+    "resolve_symbol_placement",
 ]

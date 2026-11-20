@@ -145,10 +145,7 @@ class ResolutionState(MutableModel):
                 return 1, 0
             return 0, 0
 
-        if (
-            not current_to.startswith(UNRESOLVED_TARGET_PREFIXES)
-            and current_to != placeholder_id
-        ):
+        if not current_to.startswith(UNRESOLVED_TARGET_PREFIXES) and current_to != placeholder_id:
             self.updates.append(
                 EdgeTargetUpdate(
                     edge_id=edge.id,
@@ -171,6 +168,7 @@ class LinkResolutionReport(FrozenModel):
     calls_resolved: int = 0
     total_resolved: int = 0
     edges_reset: int = 0
+    dangling_lsp_deleted: int = 0
     updates: list[EdgeTargetUpdate] = Field(default_factory=list)
 
 

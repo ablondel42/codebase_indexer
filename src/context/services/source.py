@@ -3,16 +3,17 @@
 from collections.abc import Sequence
 from pathlib import Path
 
-from context.models.source import SnippetOptions, SourceSlice, SymbolSnippet
+from context.models.source import SnippetOptions, SourceSlice, SourceWindow, SymbolSnippet
 from context.utils.formatting import resolve_symbol_line_bounds, slice_source_window
 from core.models.config import AppConfig
-from core.models.exceptions import DatabaseError, SymbolNotFoundError, ValidationError
+from core.models.exceptions import DatabaseError, SymbolNotFoundError
 from core.models.file import FileRecord, VerifiedFileText
 from core.models.node import SymbolNode, SymbolSummary
 from core.models.repo import RepoRecord
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.file_io import format_line_span, read_verified_file_text
 from core.utils.logging import get_logger
+from graph.utils.predicates import load_verified_summaries_by_ids
 
 logger = get_logger("context.services.source")
 
@@ -29,58 +30,12 @@ class SourceReader:
         self._config = config if config is not None else AppConfig()
 
     @staticmethod
-    def _validate_line_bounds(start_line: int, end_line: int) -> None:
-        """Validate 1-based inclusive ``start_line`` and ``end_line`` invariants.
-
-        Args:
-            start_line: One-based inclusive start line.
-            end_line: One-based inclusive end line.
-
-        Raises:
-            ValidationError: If ``start_line < 1`` or ``end_line < start_line``.
-        """
-        if start_line < 1:
-            raise ValidationError("start_line must be >= 1", context={"start_line": start_line})
-        if end_line < start_line:
-            raise ValidationError(
-                "end_line must be >= start_line",
-                context={"start_line": start_line, "end_line": end_line},
-            )
-
-    def read_file_snippet(
-        self,
-        repo_root: Path | str,
+    def _build_source_slice(
         file_path: str,
-        start_line: int,
-        end_line: int,
-        options: SnippetOptions | None = None,
+        window: SourceWindow,
+        verified: VerifiedFileText,
     ) -> SourceSlice:
-        """Read a confined, hash-verified source slice from ``file_path`` under ``repo_root``.
-
-        Args:
-            repo_root: Repository root directory path.
-            file_path: Repository-relative POSIX file path.
-            start_line: One-based inclusive start line.
-            end_line: One-based inclusive end line.
-            options: Optional pagination, padding, and content-hash settings.
-
-        Returns:
-            ``SourceSlice`` containing both ``raw_source`` and ``numbered_source``.
-
-        Raises:
-            ValidationError: If ``start_line`` or ``end_line`` is invalid.
-            PathSecurityError: If ``file_path`` escapes ``repo_root`` or traverses symlinks.
-            ParseError: If reading fails or the file exceeds ``max_file_size_bytes``.
-        """
-        self._validate_line_bounds(start_line, end_line)
-        opts = options if options is not None else SnippetOptions()
-        verified = read_verified_file_text(
-            repo_root,
-            file_path,
-            expected_content_hash=opts.expected_content_hash,
-            max_file_size_bytes=self._config.max_file_size_bytes,
-        )
-        window = slice_source_window(verified.lines, start_line, end_line, opts)
+        """Assemble a ``SourceSlice`` from a sliced ``SourceWindow`` and ``VerifiedFileText``."""
         return SourceSlice(
             file_path=file_path,
             start_line=window.start_line,
@@ -96,6 +51,25 @@ class SourceReader:
             is_fresh=verified.is_fresh,
             stale_reason=verified.stale_reason,
         )
+
+    def read_file_snippet(
+        self,
+        repo_root: Path | str,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        options: SnippetOptions | None = None,
+    ) -> SourceSlice:
+        """Read a confined, hash-verified source slice from ``file_path`` under ``repo_root``."""
+        opts = options if options is not None else SnippetOptions()
+        verified = read_verified_file_text(
+            repo_root,
+            file_path,
+            expected_content_hash=opts.expected_content_hash,
+            max_file_size_bytes=self._config.max_file_size_bytes,
+        )
+        window = slice_source_window(verified.lines, start_line, end_line, opts)
+        return self._build_source_slice(file_path, window, verified)
 
     @staticmethod
     def _assemble_symbol_snippet(
@@ -291,13 +265,7 @@ class SourceReader:
             SymbolNotFoundError: If any requested symbol ID is missing.
             DatabaseError: If any referenced file or repository record is missing.
         """
-        summaries_by_id = uow.nodes.get_summaries_by_ids(ordered_ids)
-        missing = [sid for sid in ordered_ids if sid not in summaries_by_id]
-        if missing:
-            raise SymbolNotFoundError(
-                f"Symbol not found: {missing[0]}",
-                context={"symbol_id": missing[0], "missing_symbol_ids": missing},
-            )
+        _, summaries_by_id = load_verified_summaries_by_ids(uow.nodes, ordered_ids)
 
         files_by_id = uow.files.get_by_ids([summaries_by_id[sid].file_id for sid in ordered_ids])
         repos_by_id: dict[str, RepoRecord] = {}
@@ -340,21 +308,7 @@ class SourceReader:
         """
         start_line, end_line = resolve_symbol_line_bounds(summary)
         window = slice_source_window(verified.lines, start_line, end_line, options)
-        source_slice = SourceSlice(
-            file_path=file_record.file_path,
-            start_line=window.start_line,
-            end_line=window.end_line,
-            window_start_line=window.window_start_line,
-            window_end_line=window.window_end_line,
-            raw_source=window.raw_source,
-            numbered_source=window.numbered_source,
-            truncated=window.truncated,
-            total_lines=window.total_lines,
-            returned_lines=window.returned_lines,
-            next_offset=window.next_offset,
-            is_fresh=verified.is_fresh,
-            stale_reason=verified.stale_reason,
-        )
+        source_slice = SourceReader._build_source_slice(file_record.file_path, window, verified)
         return SourceReader._assemble_symbol_snippet(summary, file_record, source_slice)
 
     def read_symbol_snippets(

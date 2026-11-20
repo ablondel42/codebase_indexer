@@ -5,31 +5,27 @@ from types import MappingProxyType
 
 from graph.models.risk import RiskDecision, RiskFacts, RiskIssueCode
 
-ISSUE_WEIGHTS: Mapping[str, int] = MappingProxyType(
-    {
-        RiskIssueCode.STALE_CONTEXT.value: 20,
-        RiskIssueCode.LOW_CONFIDENCE_MATCH.value: 20,
-        RiskIssueCode.REFERENCE_DATA_UNAVAILABLE.value: 15,
-        RiskIssueCode.HIGH_REFERENCE_COUNT.value: 30,
-        RiskIssueCode.MODERATE_REFERENCE_COUNT.value: 15,
-        RiskIssueCode.CROSS_FILE_IMPACT.value: 20,
-        RiskIssueCode.CROSS_MODULE_IMPACT.value: 25,
-        RiskIssueCode.PUBLIC_SURFACE_CHANGE.value: 20,
-        RiskIssueCode.INHERITANCE_RISK.value: 15,
-        RiskIssueCode.MULTI_FILE_CHANGE.value: 15,
-        RiskIssueCode.MULTI_MODULE_CHANGE.value: 20,
-    }
-)
+ISSUE_WEIGHTS: Mapping[str, int] = MappingProxyType({
+    RiskIssueCode.STALE_CONTEXT.value: 20,
+    RiskIssueCode.LOW_CONFIDENCE_MATCH.value: 20,
+    RiskIssueCode.REFERENCE_DATA_UNAVAILABLE.value: 15,
+    RiskIssueCode.HIGH_REFERENCE_COUNT.value: 30,
+    RiskIssueCode.MODERATE_REFERENCE_COUNT.value: 15,
+    RiskIssueCode.CROSS_FILE_IMPACT.value: 20,
+    RiskIssueCode.CROSS_MODULE_IMPACT.value: 25,
+    RiskIssueCode.PUBLIC_SURFACE_CHANGE.value: 20,
+    RiskIssueCode.INHERITANCE_RISK.value: 15,
+    RiskIssueCode.MULTI_FILE_CHANGE.value: 15,
+    RiskIssueCode.MULTI_MODULE_CHANGE.value: 20,
+})
 
 LOCAL_SCOPE_MITIGATION: int = -10
 
-_SIGNIFICANT_UNAVAILABLE_ISSUES: frozenset[str] = frozenset(
-    {
-        RiskIssueCode.PUBLIC_SURFACE_CHANGE.value,
-        RiskIssueCode.CROSS_MODULE_IMPACT.value,
-        RiskIssueCode.INHERITANCE_RISK.value,
-    }
-)
+_SIGNIFICANT_UNAVAILABLE_ISSUES: frozenset[str] = frozenset({
+    RiskIssueCode.PUBLIC_SURFACE_CHANGE.value,
+    RiskIssueCode.CROSS_MODULE_IMPACT.value,
+    RiskIssueCode.INHERITANCE_RISK.value,
+})
 
 
 def _detect_reference_volume_issue(facts: RiskFacts) -> str | None:
@@ -129,27 +125,8 @@ def _requires_review_override(issues: Sequence[str]) -> bool:
     )
 
 
-def decide_risk(issues: Sequence[str], facts: RiskFacts, risk_score: int) -> RiskDecision:
-    """Determine the final ``RiskDecision`` from ``issues``, ``facts``, and ``risk_score``.
-
-    Base score thresholds:
-    - ``0..29``: ``RiskDecision.SAFE_ENOUGH``
-    - ``30..69``: ``RiskDecision.REVIEW_REQUIRED``
-    - ``70..100``: ``RiskDecision.HIGH_RISK``
-
-    Override rules elevate ``SAFE_ENOUGH`` to ``REVIEW_REQUIRED`` when context is stale,
-    low-confidence matches combine with another issue, or LSP references are unavailable
-    alongside public-surface, cross-module, or inheritance impact.
-
-    Args:
-        issues: Sequence of triggered issue code strings.
-        facts: Extracted ``RiskFacts`` model.
-        risk_score: Clamped ``0..100`` score returned by ``score_risk``.
-
-    Returns:
-        Recommended ``RiskDecision`` enum member.
-    """
-    _ = facts
+def decide_risk(issues: Sequence[str], risk_score: int) -> RiskDecision:
+    """Determine the final ``RiskDecision`` from ``issues`` and ``risk_score``."""
     if risk_score >= 70:
         return RiskDecision.HIGH_RISK
     if risk_score >= 30 or _requires_review_override(issues):

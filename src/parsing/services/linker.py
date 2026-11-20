@@ -36,13 +36,9 @@ class SymbolLinker:
             import_resolver if import_resolver is not None else ImportLinkResolver()
         )
         self._inheritance_resolver = (
-            inheritance_resolver
-            if inheritance_resolver is not None
-            else InheritanceLinkResolver()
+            inheritance_resolver if inheritance_resolver is not None else InheritanceLinkResolver()
         )
-        self._call_resolver = (
-            call_resolver if call_resolver is not None else CallLinkResolver()
-        )
+        self._call_resolver = call_resolver if call_resolver is not None else CallLinkResolver()
 
     def resolve(
         self,
@@ -80,9 +76,7 @@ class SymbolLinker:
         self._inheritance_resolver.resolve(index, state, inherit_edges)
         self._call_resolver.resolve(index, state, call_edges)
 
-        total_resolved = (
-            state.imports_resolved + state.inherits_resolved + state.calls_resolved
-        )
+        total_resolved = state.imports_resolved + state.inherits_resolved + state.calls_resolved
         logger.debug(
             "Linked repo %s (checked=%d, resolved=%d, reset=%d)",
             repo_id,

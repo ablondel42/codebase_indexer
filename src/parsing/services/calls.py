@@ -2,7 +2,7 @@
 
 import ast
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from core.models.edge import Edge
 from core.models.enums import CALLABLE_KINDS, PREFIX_EDGE, EdgeKind, SymbolKind
@@ -25,24 +25,21 @@ class _CallVisitor(ast.NodeVisitor):
         module_node_id: str,
         nodes: Sequence[SymbolNode],
         lines: Sequence[str] | None = None,
+        *,
+        symbols_by_ast_id: Mapping[int, SymbolNode] | None = None,
     ) -> None:
-        """Initialize the per-file call visitor.
-
-        Args:
-            file_record: Tracked ``FileRecord`` of the source module.
-            module_node_id: Root module ``SymbolNode`` identifier.
-            nodes: Extracted ``SymbolNode`` sequence for the file.
-            lines: Optional pre-split source lines for UTF-8 call ranges.
-        """
+        """Initialize the per-file call visitor."""
         self._file_record = file_record
         self._lines = lines
         self.edges: list[Edge] = []
         self._scope_stack: list[str] = [module_node_id]
         self._name_chain: list[str] = []
         self._seen_edge_keys: dict[tuple[str, str, int, int], int] = {}
+        self._symbols_by_ast_id = symbols_by_ast_id
         self._by_exact: dict[tuple[bool, str, int], str] = {}
         self._by_qname: dict[tuple[bool, str], deque[str]] = defaultdict(deque)
-        self._index_nodes(nodes)
+        if symbols_by_ast_id is None:
+            self._index_nodes(nodes)
 
     def _index_nodes(self, nodes: Sequence[SymbolNode]) -> None:
         """Index class and callable ``SymbolNode`` IDs by ``(is_class, qname, start_line)``."""
@@ -59,15 +56,7 @@ class _CallVisitor(ast.NodeVisitor):
 
     @staticmethod
     def _classify_call_target(func_expr: ast.AST) -> tuple[str, str | None]:
-        """Classify a call callee expression into ``(target_hint, qualifier)``.
-
-        Args:
-            func_expr: ``node.func`` expression of an ``ast.Call``.
-
-        Returns:
-            Tuple ``(target_hint, qualifier)`` where ``qualifier`` is ``"self"``,
-            ``"cls"``, ``"module"``, or ``None``.
-        """
+        """Classify a call callee expression into ``(target_hint, qualifier)``."""
         if isinstance(func_expr, ast.Name):
             return func_expr.id, None
 
@@ -81,6 +70,10 @@ class _CallVisitor(ast.NodeVisitor):
 
     def _lookup_symbol_id(self, *, is_class: bool, node: ast.AST, name: str) -> str:
         """Resolve the ``SymbolNode`` ID for an ``ast.ClassDef`` or function definition."""
+        if self._symbols_by_ast_id is not None:
+            direct = self._symbols_by_ast_id.get(id(node))
+            return direct.id if direct is not None else self._scope_stack[-1]
+
         qname = build_nested_qualified_name(
             self._file_record.module_path,
             self._name_chain,
@@ -92,8 +85,7 @@ class _CallVisitor(ast.NodeVisitor):
             return sym_id
 
         has_exact_for_qname = any(
-            k_cls == is_class and k_qname == qname
-            for (k_cls, k_qname, _) in self._by_exact
+            k_cls == is_class and k_qname == qname for (k_cls, k_qname, _) in self._by_exact
         )
         if not has_exact_for_qname:
             queue = self._by_qname.get((is_class, qname))
@@ -109,20 +101,18 @@ class _CallVisitor(ast.NodeVisitor):
     ) -> None:
         """Push ``(sym_id, name)`` around visiting ``body`` statements."""
         self._scope_stack.append(sym_id)
-        self._name_chain.append(name)
+        if self._symbols_by_ast_id is None:
+            self._name_chain.append(name)
         try:
             for stmt in body:
                 self.visit(stmt)
         finally:
-            self._name_chain.pop()
+            if self._symbols_by_ast_id is None:
+                self._name_chain.pop()
             self._scope_stack.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        """Visit class decorators/bases in outer scope and body in class scope.
-
-        Args:
-            node: ``ast.ClassDef`` node.
-        """
+        """Visit class decorators/bases in outer scope and body in class scope."""
         for dec in node.decorator_list:
             self.visit(dec)
         for base in node.bases:
@@ -149,27 +139,15 @@ class _CallVisitor(ast.NodeVisitor):
         self._visit_scoped_body(sym_id, node.name, node.body)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        """Visit a synchronous function definition.
-
-        Args:
-            node: ``ast.FunctionDef`` node.
-        """
+        """Visit a synchronous function definition."""
         self._visit_function(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Visit an asynchronous function definition.
-
-        Args:
-            node: ``ast.AsyncFunctionDef`` node.
-        """
+        """Visit an asynchronous function definition."""
         self._visit_function(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Emit a ``calls`` ``Edge`` for ``node`` and recurse into child expressions.
-
-        Args:
-            node: ``ast.Call`` expression node.
-        """
+        """Emit a ``calls`` ``Edge`` for ``node`` and recurse into child expressions."""
         from_id = self._scope_stack[-1]
         target, qualifier = self._classify_call_target(node.func)
         placeholder_id = f"unresolved_call:{target}"
@@ -223,24 +201,15 @@ class CallExtractor:
         tree: ast.Module,
         *,
         lines: Sequence[str] | None = None,
+        symbols_by_ast_id: Mapping[int, SymbolNode] | None = None,
     ) -> list[Edge]:
-        """Extract all ``calls`` ``Edge`` items inside ``tree``.
-
-        Args:
-            file_record: Tracked ``FileRecord`` of the source module.
-            module_node_id: Root module ``SymbolNode`` identifier.
-            nodes: Extracted ``SymbolNode`` declarations for ``file_record``.
-            tree: Parsed ``ast.Module`` root node.
-            lines: Optional pre-split source lines for UTF-8 call ranges.
-
-        Returns:
-            Ordered list of ``calls`` ``Edge`` instances.
-        """
+        """Extract all ``calls`` ``Edge`` items inside ``tree``."""
         visitor = _CallVisitor(
             file_record=file_record,
             module_node_id=module_node_id,
             nodes=nodes,
             lines=lines,
+            symbols_by_ast_id=symbols_by_ast_id,
         )
         visitor.visit(tree)
         return visitor.edges

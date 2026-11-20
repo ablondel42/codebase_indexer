@@ -66,15 +66,13 @@ class TestRepoRecordIdValidation:
     def test_reject_none_id(self) -> None:
         """Test that None ID is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord.model_validate(
-                {
-                    "id": None,
-                    "root_path": "/path/to/repo",
-                    "name": "test-repo",
-                    "default_language": Language.PYTHON,
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            )
+            RepoRecord.model_validate({
+                "id": None,
+                "root_path": "/path/to/repo",
+                "name": "test-repo",
+                "default_language": Language.PYTHON,
+                "created_at": "2026-01-01T00:00:00Z",
+            })
 
 
 class TestRepoRecordRootPathValidation:
@@ -105,15 +103,13 @@ class TestRepoRecordRootPathValidation:
     def test_reject_none_root_path(self) -> None:
         """Test that None root_path is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord.model_validate(
-                {
-                    "id": "project:test",
-                    "root_path": None,
-                    "name": "test-repo",
-                    "default_language": Language.PYTHON,
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            )
+            RepoRecord.model_validate({
+                "id": "project:test",
+                "root_path": None,
+                "name": "test-repo",
+                "default_language": Language.PYTHON,
+                "created_at": "2026-01-01T00:00:00Z",
+            })
 
 
 class TestRepoRecordNameValidation:
@@ -159,29 +155,25 @@ class TestRepoRecordLanguageValidation:
     def test_reject_unsupported_language(self) -> None:
         """Test that unsupported language is rejected."""
         with pytest.raises(PydanticValidationError) as exc_info:
-            RepoRecord.model_validate(
-                {
-                    "id": "project:test",
-                    "root_path": "/path/to/repo",
-                    "name": "test-repo",
-                    "default_language": "cobol",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            )
+            RepoRecord.model_validate({
+                "id": "project:test",
+                "root_path": "/path/to/repo",
+                "name": "test-repo",
+                "default_language": "cobol",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
         assert "python" in str(exc_info.value).lower()
 
     def test_reject_empty_language(self) -> None:
         """Test that empty language is rejected."""
         with pytest.raises(PydanticValidationError):
-            RepoRecord.model_validate(
-                {
-                    "id": "project:test",
-                    "root_path": "/path/to/repo",
-                    "name": "test-repo",
-                    "default_language": "",
-                    "created_at": "2026-01-01T00:00:00Z",
-                }
-            )
+            RepoRecord.model_validate({
+                "id": "project:test",
+                "root_path": "/path/to/repo",
+                "name": "test-repo",
+                "default_language": "",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
 
 
 class TestRepoRecordTimestampValidation:

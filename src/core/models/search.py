@@ -31,18 +31,9 @@ class TextDocumentMeta(FrozenModel):
     is_test: bool = False
 
 
-class TextDocumentRecord(FrozenModel):
+class TextDocumentRecord(TextDocumentMeta, FrozenModel):
     """Canonical UTF-8 repository text document stored in ``text_files`` and ``text_fts``."""
 
-    id: str = Field(..., min_length=1, pattern="^file:.+")
-    repo_id: str = Field(..., min_length=1, pattern="^project:.+")
-    file_path: str = Field(..., min_length=1)
-    language: str = "text"
-    content_hash: str = Field(..., pattern="^sha256:.+")
-    size_bytes: int = Field(..., ge=0)
-    line_count: int = Field(default=0, ge=0)
-    mtime_ns: int = Field(default=0, ge=0)
-    is_test: bool = False
     content: str
 
 

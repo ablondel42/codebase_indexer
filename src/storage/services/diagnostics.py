@@ -1,11 +1,9 @@
 """SQLAlchemy Core adapter implementing ``DiagnosticsRepositoryProtocol``."""
 
-import sqlite3
 from pathlib import Path
 
 from sqlalchemy import MetaData, Table, case, func, inspect, select
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import SQLAlchemyError
 
 from core.models.diagnostics import (
     DatabaseStatusReport,
@@ -17,7 +15,7 @@ from core.models.diagnostics import (
     TableListReport,
 )
 from core.models.enums import CALLABLE_KINDS, LOCAL_CALLABLE_KINDS, EdgeKind, SymbolKind
-from core.models.exceptions import DatabaseError, IndexerError
+from core.models.exceptions import DatabaseError
 from core.models.repo import RepoRecord
 from core.utils.logging import get_logger
 from storage.models.options import SchemaStatusMetrics
@@ -31,7 +29,7 @@ from storage.utils.schema import (
     nodes_table,
     reference_refresh_table,
 )
-from storage.utils.sql_helpers import db_error_message
+from storage.utils.sql_helpers import db_operation
 
 logger = get_logger("storage.services.diagnostics")
 
@@ -49,29 +47,18 @@ class SqlDiagnosticsRepository:
     """SQLite repository adapter for graph statistics and database health inspection."""
 
     def __init__(self, conn: Connection) -> None:
-        """Initialize the repository over an active SQLAlchemy ``Connection``.
-
-        Args:
-            conn: Active SQLAlchemy ``Connection``.
-        """
+        """Initialize the repository over an active SQLAlchemy ``Connection``."""
         self._conn = conn
         self._migrator = SchemaMigrator()
         self._repos = SqlRepoRepository(conn)
         self._runs = SqlIndexRunRepository(conn)
 
     def get_repo_graph_stats(self, repo_id: str) -> RepoGraphStats:
-        """Aggregate file, line, symbol-kind, and edge-kind statistics for ``repo_id``.
-
-        Args:
-            repo_id: Target repository identifier.
-
-        Returns:
-            Populated ``RepoGraphStats`` summary.
-
-        Raises:
-            DatabaseError: If SQLite execution fails.
-        """
-        try:
+        """Aggregate file, line, symbol-kind, and edge-kind statistics for ``repo_id``."""
+        with db_operation(
+            f"Failed to query graph statistics for {repo_id}",
+            context={"repo_id": repo_id},
+        ):
             kind_rows = (
                 self._conn
                 .execute(
@@ -109,13 +96,6 @@ class SqlDiagnosticsRepository:
                 .mappings()
                 .first()
             )
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed querying graph stats for %s: %s", repo_id, msg)
-            raise DatabaseError(
-                f"Failed to query graph statistics for {repo_id}: {msg}",
-                context={"repo_id": repo_id},
-            ) from exc
 
         kind_counts = {str(r["kind"]): int(r["count"]) for r in kind_rows}
         edge_kind_counts = {str(r["kind"]): int(r["count"]) for r in edge_rows}
@@ -139,17 +119,7 @@ class SqlDiagnosticsRepository:
 
     @staticmethod
     def _read_db_size_bytes(db_path: Path) -> int:
-        """Read the on-disk size of ``db_path`` in bytes (``0`` for ``:memory:``).
-
-        Args:
-            db_path: Path to the SQLite database file.
-
-        Returns:
-            File size in bytes.
-
-        Raises:
-            DatabaseError: If ``stat()`` fails on a file-backed database.
-        """
+        """Read the on-disk size of ``db_path`` in bytes (``0`` for ``:memory:``)."""
         if str(db_path) == ":memory:":
             return 0
         try:
@@ -162,16 +132,8 @@ class SqlDiagnosticsRepository:
             ) from exc
 
     def _list_table_counts(self) -> list[TableCountEntry]:
-        """Return exact row counts for all user tables and the root FTS virtual table.
-
-        Returns:
-            Ordered list of ``TableCountEntry`` models.
-
-        Raises:
-            DatabaseError: If table inspection or row counting fails.
-        """
-        current_table: str | None = None
-        try:
+        """Return exact row counts for all user tables and the root FTS virtual table."""
+        with db_operation("Failed to read table row counts"):
             table_names = [
                 name
                 for name in sorted(inspect(self._conn).get_table_names())
@@ -180,32 +142,16 @@ class SqlDiagnosticsRepository:
             temp_meta = MetaData()
             entries: list[TableCountEntry] = []
             for name in table_names:
-                current_table = name
                 tbl = Table(name, temp_meta)
                 row_count = int(
                     self._conn.execute(select(func.count()).select_from(tbl)).scalar_one()
                 )
                 entries.append(TableCountEntry(table=name, row_count=row_count))
             return entries
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed reading table row counts (table=%s): %s", current_table, msg)
-            raise DatabaseError(
-                f"Failed to read table row counts: {msg}",
-                context={"table": current_table},
-            ) from exc
 
     @staticmethod
     def _has_compatible_schema(user_version: int, tables: list[TableCountEntry]) -> bool:
-        """Return ``True`` when ``user_version == SCHEMA_VERSION`` and core tables exist.
-
-        Args:
-            user_version: Reported SQLite ``PRAGMA user_version``.
-            tables: Collected table row-count entries.
-
-        Returns:
-            ``True`` if schema v2 metrics can be safely queried.
-        """
+        """Return ``True`` when ``user_version == SCHEMA_VERSION`` and core tables exist."""
         table_names = {entry.table for entry in tables}
         missing = sorted(_REQUIRED_STATUS_TABLES - table_names)
         if user_version != SCHEMA_VERSION or missing:
@@ -223,14 +169,7 @@ class SqlDiagnosticsRepository:
         self,
         repo_selector: str | None,
     ) -> tuple[list[RepoRecord], RepoRecord | None]:
-        """Load all indexed repositories and resolve the selected repository if unambiguous.
-
-        Args:
-            repo_selector: Optional repository ID, short name, or root path.
-
-        Returns:
-            Tuple of ``(all_repos, selected_repo_or_none)``.
-        """
+        """Load all indexed repositories and resolve the selected repository if unambiguous."""
         all_repos = self._repos.list_all()
         if repo_selector:
             resolved_id = self._repos.resolve_id(repo_selector)
@@ -240,14 +179,7 @@ class SqlDiagnosticsRepository:
         return all_repos, None
 
     def _fetch_edge_counts_by_kind(self, repo_id: str | None) -> dict[str, int]:
-        """Query edge counts grouped by ``kind``, optionally scoped to ``repo_id``.
-
-        Args:
-            repo_id: Optional repository scope filter.
-
-        Returns:
-            Dictionary mapping ``kind`` to count ordered descending by count.
-        """
+        """Query edge counts grouped by ``kind``, optionally scoped to ``repo_id``."""
         cnt_col = func.count().label("cnt")
         stmt = select(edges_table.c.kind, cnt_col)
         if repo_id is not None:
@@ -257,14 +189,7 @@ class SqlDiagnosticsRepository:
         return {str(r["kind"]): int(r["cnt"]) for r in rows}
 
     def _fetch_lsp_coverage(self, repo_id: str | None) -> LspCoverageMetrics:
-        """Compute non-module symbol LSP refresh coverage, optionally scoped to ``repo_id``.
-
-        Args:
-            repo_id: Optional repository scope filter.
-
-        Returns:
-            Populated ``LspCoverageMetrics`` model.
-        """
+        """Compute non-module symbol LSP refresh coverage, optionally scoped to ``repo_id``."""
         sym_stmt = (
             select(func.count())
             .select_from(nodes_table)
@@ -310,19 +235,11 @@ class SqlDiagnosticsRepository:
         )
 
     def _collect_schema_metrics(self, repo_selector: str | None) -> SchemaStatusMetrics:
-        """Collect v2 repository, edge, LSP coverage, and latest-run status metrics.
-
-        Args:
-            repo_selector: Optional repository selector string.
-
-        Returns:
-            Populated ``SchemaStatusMetrics`` instance.
-
-        Raises:
-            IndexerError: Re-raised when repository resolution fails cleanly.
-            DatabaseError: If SQLite execution fails.
-        """
-        try:
+        """Collect v2 repository, edge, LSP coverage, and latest-run status metrics."""
+        with db_operation(
+            "Failed to collect database status metrics",
+            context={"repo_selector": repo_selector},
+        ):
             all_repos, selected_repo = self._resolve_status_repo(repo_selector)
             repo_id = selected_repo.id if selected_repo is not None else None
             recent_runs = self._runs.list_recent(repo_id, limit=1)
@@ -333,33 +250,13 @@ class SqlDiagnosticsRepository:
                 lsp_coverage=self._fetch_lsp_coverage(repo_id),
                 latest_run=recent_runs[0] if recent_runs else None,
             )
-        except IndexerError:
-            raise
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed collecting status metrics (repo=%r): %s", repo_selector, msg)
-            raise DatabaseError(
-                f"Failed to collect database status metrics: {msg}",
-                context={"repo_selector": repo_selector},
-            ) from exc
 
     def get_status_report(
         self,
         db_path: Path,
         repo_selector: str | None = None,
     ) -> DatabaseStatusReport:
-        """Build a full database health, schema version, table count, and LSP report.
-
-        Args:
-            db_path: Path to the SQLite database file on disk.
-            repo_selector: Optional repository ID or short name to scope metrics.
-
-        Returns:
-            Populated ``DatabaseStatusReport`` model.
-
-        Raises:
-            DatabaseError: If reading file metadata or SQLite status fails.
-        """
+        """Build a full database health, schema version, table count, and LSP report."""
         size_bytes = self._read_db_size_bytes(db_path)
         user_version = self._migrator.read_user_version(self._conn)
         tables = self._list_table_counts()
@@ -393,14 +290,7 @@ class SqlDiagnosticsRepository:
         )
 
     def _count_by_repo(self, table: Table) -> dict[str, int]:
-        """Count rows in ``table`` grouped by ``repo_id``.
-
-        Args:
-            table: SQLAlchemy ``Table`` containing a ``repo_id`` column.
-
-        Returns:
-            Mapping from ``repo_id`` to row count.
-        """
+        """Count rows in ``table`` grouped by ``repo_id``."""
         rows = (
             self._conn
             .execute(select(table.c.repo_id, func.count().label("cnt")).group_by(table.c.repo_id))
@@ -410,26 +300,13 @@ class SqlDiagnosticsRepository:
         return {str(r["repo_id"]): int(r["cnt"]) for r in rows}
 
     def list_repo_summaries(self) -> list[RepoStorageSummary]:
-        """List per-repository file, node, and edge counts across the database.
-
-        Returns:
-            Ordered list of ``RepoStorageSummary`` items.
-
-        Raises:
-            DatabaseError: If schema verification or SQLite execution fails.
-        """
+        """List per-repository file, node, and edge counts across the database."""
         self._migrator.initialize(self._conn)
-        try:
+        with db_operation("Failed to query repository summaries"):
             repos = self._repos.list_all()
             file_counts = self._count_by_repo(files_table)
             node_counts = self._count_by_repo(nodes_table)
             edge_counts = self._count_by_repo(edges_table)
-        except IndexerError:
-            raise
-        except (SQLAlchemyError, sqlite3.Error) as exc:
-            msg = db_error_message(exc)
-            logger.error("Failed collecting repository summaries: %s", msg)
-            raise DatabaseError(f"Failed to query repository summaries: {msg}") from exc
 
         return [
             RepoStorageSummary(
@@ -447,17 +324,7 @@ class SqlDiagnosticsRepository:
         ]
 
     def get_table_list_report(self, db_path: Path) -> TableListReport:
-        """Inspect ``PRAGMA user_version`` and exact user-table row counts.
-
-        Args:
-            db_path: Path to the SQLite database file on disk.
-
-        Returns:
-            Populated ``TableListReport`` model.
-
-        Raises:
-            DatabaseError: If SQLite inspection fails.
-        """
+        """Inspect ``PRAGMA user_version`` and exact user-table row counts."""
         user_version = self._migrator.read_user_version(self._conn)
         tables = self._list_table_counts()
         return TableListReport(

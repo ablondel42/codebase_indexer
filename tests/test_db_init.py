@@ -172,9 +172,7 @@ def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v3(temp_db_path: Path) -
     try:
         migrator.initialize(conn)
         assert migrator.read_user_version(conn) == 3
-        cols = {
-            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(files)").fetchall()
-        }
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(files)").fetchall()}
         assert {"line_count", "is_test"}.issubset(cols)
     finally:
         factory.close(conn)

@@ -17,6 +17,8 @@ from parsing.utils.naming import make_structural_edge_id
 
 logger = get_logger("parsing.services.walker")
 
+_AstMaps = tuple[dict[int, SymbolNode], dict[str, ast.ClassDef]]
+
 
 class DeclarationWalker:
     """Traverses module, class, and function bodies to build symbols and structural edges."""
@@ -27,72 +29,44 @@ class DeclarationWalker:
         callable_extractor: CallableExtractor | None = None,
         assignment_extractor: AssignmentExtractor | None = None,
     ) -> None:
-        """Initialize the walker with leaf extractors.
-
-        Args:
-            class_extractor: Optional injected ``ClassExtractor``.
-            callable_extractor: Optional injected ``CallableExtractor``.
-            assignment_extractor: Optional injected ``AssignmentExtractor``.
-        """
-        self._class_extractor = (
-            class_extractor if class_extractor is not None else ClassExtractor()
-        )
+        """Initialize the walker with leaf extractors."""
+        self._class_extractor = class_extractor if class_extractor is not None else ClassExtractor()
         self._callable_extractor = (
             callable_extractor if callable_extractor is not None else CallableExtractor()
         )
         self._assignment_extractor = (
-            assignment_extractor
-            if assignment_extractor is not None
-            else AssignmentExtractor()
+            assignment_extractor if assignment_extractor is not None else AssignmentExtractor()
         )
 
     def _walk_scope_body(
         self,
         session: FileExtractionSession,
         target: ScopeTarget,
-        scope_name: str,
-        scope_kind: SymbolScope,
+        scope_info: tuple[str, SymbolScope],
         body: Sequence[ast.stmt],
+        ast_maps: _AstMaps,
     ) -> list[SymbolNode]:
-        """Walk nested classes and callables inside ``body`` under an active scope frame.
-
-        Args:
-            session: Active per-file extraction session.
-            target: ``ScopeTarget`` representing the enclosing class or callable.
-            scope_name: Simple declared name of the enclosing symbol.
-            scope_kind: Enclosing ``SymbolScope`` (``CLASS`` or ``FUNCTION``).
-            body: AST statements inside the enclosing declaration body.
-
-        Returns:
-            Ordered list of descendant ``SymbolNode`` declarations.
-        """
+        """Walk nested classes and callables inside ``body`` under an active scope frame."""
+        scope_name, scope_kind = scope_info
         children: list[SymbolNode] = []
         with session.scope_tracker.scope_context(target.parent_id, scope_name, scope_kind):
             for stmt in body:
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    children.extend(self._walk_callable_def(session, target, stmt))
+                    children.extend(self._walk_callable_def(session, target, stmt, ast_maps))
                 elif isinstance(stmt, ast.ClassDef):
-                    children.extend(self._walk_class_def(session, stmt, None, target))
+                    children.extend(self._walk_class_def(session, stmt, (None, target), ast_maps))
         return children
 
     def _walk_class_def(
         self,
         session: FileExtractionSession,
         node: ast.ClassDef,
-        module_node_id: str | None,
-        target: ScopeTarget | None,
+        enclosing: tuple[str | None, ScopeTarget | None],
+        ast_maps: _AstMaps,
     ) -> list[SymbolNode]:
-        """Extract one ``ast.ClassDef`` and all nested methods/classes in canonical order.
-
-        Args:
-            session: Active per-file extraction session.
-            node: ``ast.ClassDef`` node to extract.
-            module_node_id: Module node ID for top-level classes, else ``None``.
-            target: Optional enclosing ``ScopeTarget`` for nested/local classes.
-
-        Returns:
-            Ordered list starting with the class ``SymbolNode`` followed by descendants.
-        """
+        """Extract one ``ast.ClassDef`` and all nested methods/classes in canonical order."""
+        module_node_id, target = enclosing
+        symbols_by_ast_id, class_ast_by_symbol_id = ast_maps
         placement = self._class_extractor.resolve_placement(
             session,
             node.name,
@@ -112,9 +86,9 @@ class DeclarationWalker:
         child_nodes = self._walk_scope_body(
             session,
             class_target,
-            node.name,
-            SymbolScope.CLASS,
+            (node.name, SymbolScope.CLASS),
             node.body,
+            ast_maps,
         )
         method_ids = [
             child.id
@@ -129,6 +103,8 @@ class DeclarationWalker:
             placement,
             method_ids=method_ids,
         )
+        symbols_by_ast_id[id(node)] = cls_node
+        class_ast_by_symbol_id[cls_node.id] = node
         return [cls_node, *child_nodes]
 
     def _walk_callable_def(
@@ -136,18 +112,12 @@ class DeclarationWalker:
         session: FileExtractionSession,
         target: ScopeTarget,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
+        ast_maps: _AstMaps,
     ) -> list[SymbolNode]:
-        """Extract one callable node and all nested local callables/classes in its body.
-
-        Args:
-            session: Active per-file extraction session.
-            target: Enclosing ``ScopeTarget`` metadata.
-            node: ``ast.FunctionDef`` or ``ast.AsyncFunctionDef`` node.
-
-        Returns:
-            Ordered list starting with the callable ``SymbolNode`` followed by nested items.
-        """
+        """Extract one callable node and all nested local callables/classes in its body."""
+        symbols_by_ast_id, _ = ast_maps
         callable_node = self._callable_extractor.extract(session, target, node)
+        symbols_by_ast_id[id(node)] = callable_node
         func_target = ScopeTarget(
             parent_id=callable_node.id,
             parent_qualified_name=callable_node.qualified_name,
@@ -157,9 +127,9 @@ class DeclarationWalker:
         nested = self._walk_scope_body(
             session,
             func_target,
-            node.name,
-            SymbolScope.FUNCTION,
+            (node.name, SymbolScope.FUNCTION),
             node.body,
+            ast_maps,
         )
         return [callable_node, *nested]
 
@@ -239,22 +209,16 @@ class DeclarationWalker:
         module_node: SymbolNode,
         tree: ast.Module,
     ) -> DeclarationWalkResult:
-        """Walk ``tree`` in canonical order and build symbol nodes and structural edges.
+        """Walk ``tree`` in canonical order and build symbol nodes and structural edges."""
+        symbols_by_ast_id: dict[int, SymbolNode] = {id(tree): module_node}
+        class_ast_by_symbol_id: dict[str, ast.ClassDef] = {}
+        ast_maps: _AstMaps = (symbols_by_ast_id, class_ast_by_symbol_id)
 
-        Args:
-            session: Active per-file extraction session.
-            module_node: Root ``SymbolKind.MODULE`` node for ``tree``.
-            tree: Parsed ``ast.Module`` root node.
-
-        Returns:
-            ``DeclarationWalkResult`` containing ordered nodes, class nodes, and
-            structural ``contains`` / ``scope_parent`` edges.
-        """
         class_tree_nodes: list[SymbolNode] = []
         for stmt in tree.body:
             if isinstance(stmt, ast.ClassDef):
                 class_tree_nodes.extend(
-                    self._walk_class_def(session, stmt, module_node.id, None)
+                    self._walk_class_def(session, stmt, (module_node.id, None), ast_maps)
                 )
 
         module_target = ScopeTarget(
@@ -266,7 +230,7 @@ class DeclarationWalker:
         for stmt in tree.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 top_level_callables.extend(
-                    self._walk_callable_def(session, module_target, stmt)
+                    self._walk_callable_def(session, module_target, stmt, ast_maps)
                 )
 
         all_class_nodes = [
@@ -279,6 +243,7 @@ class DeclarationWalker:
             module_node.id,
             tree,
             class_nodes=all_class_nodes,
+            class_ast_by_symbol_id=class_ast_by_symbol_id,
         )
         nodes = [module_node, *class_tree_nodes, *top_level_callables, *assignment_nodes]
         structural_edges = self._build_structural_edges(
@@ -290,6 +255,8 @@ class DeclarationWalker:
             nodes=nodes,
             class_nodes=all_class_nodes,
             structural_edges=structural_edges,
+            symbols_by_ast_id=symbols_by_ast_id,
+            class_ast_by_symbol_id=class_ast_by_symbol_id,
         )
 
 

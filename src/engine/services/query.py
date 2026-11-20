@@ -1,7 +1,6 @@
 """Side-effect-free read query engine over repository graphs and diagnostics."""
 
 from collections.abc import Sequence
-from typing import Any
 
 from context.models.outline import FileOutline
 from context.models.source import SnippetOptions, SymbolSnippet
@@ -20,9 +19,12 @@ from core.models.file import (
     TrackedFileSummary,
 )
 from core.models.node import SymbolPageQuery, SymbolSearchQuery, SymbolSummary
+from core.models.repo import RepoRecord
 from core.models.search import CodeSearchQuery, CodeSearchReport
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 from core.utils.logging import get_logger
+from core.utils.pathing import normalize_rel_path_prefix
+from engine.models.collaborators import QueryCollaborators
 from engine.models.queries import (
     ContextQuery,
     ListFilesQuery,
@@ -49,8 +51,6 @@ from engine.utils.formatting import (
     aggregate_top_directories,
     format_cli_freshness_label,
     matches_file_pattern,
-    normalize_path_prefix,
-    normalize_repo_file_filter,
     relativize_if_under_root,
 )
 from graph.models.references import ReferenceQueryOptions, SymbolReferencesReport
@@ -61,16 +61,6 @@ from graph.services.references import ReferenceAnalyzer
 from graph.services.risk import RiskAnalyzer
 
 logger = get_logger("engine.services.query")
-
-_ALLOWED_COLLABORATOR_KEYS: frozenset[str] = frozenset({
-    "navigator",
-    "reference_analyzer",
-    "risk_analyzer",
-    "source_reader",
-    "outline_builder",
-    "context_builder",
-    "code_search",
-})
 
 
 class QueryEngine:
@@ -83,78 +73,38 @@ class QueryEngine:
         *,
         resolver: SymbolTargetResolver | None = None,
         command_engine: CommandEngine | None = None,
-        **collaborators: Any,
+        collaborators: QueryCollaborators | None = None,
     ) -> None:
-        """Initialize the query engine with read-side domain collaborators.
-
-        Args:
-            config: Immutable runtime ``AppConfig``.
-            uow_factory: ``UnitOfWorkFactoryProtocol`` bound to the target database.
-            resolver: Optional ``SymbolTargetResolver`` collaborator.
-            command_engine: Optional ``CommandEngine`` invoked solely when
-                ``SymbolReferencesQuery.refresh_lsp`` is ``True``.
-            **collaborators: Optional read-domain service overrides (``navigator``,
-                ``reference_analyzer``, ``risk_analyzer``, ``source_reader``,
-                ``outline_builder``, ``context_builder``).
-
-        Raises:
-            TypeError: If unexpected keyword arguments are supplied in ``collaborators``.
-        """
-        unknown = sorted(set(collaborators) - _ALLOWED_COLLABORATOR_KEYS)
-        if unknown:
-            raise TypeError(
-                f"Unexpected keyword argument(s) for QueryEngine: {', '.join(unknown)}"
-            )
-
+        """Initialize the query engine with read-side domain collaborators."""
+        deps = collaborators if collaborators is not None else QueryCollaborators()
         self._config = config
         self._uow_factory = uow_factory
         self._resolver = resolver if resolver is not None else SymbolTargetResolver()
         self._command_engine = command_engine
-        self._bind_domain_services(config, collaborators)
+        self._bind_domain_services(config, deps)
 
-    def _bind_domain_services(
-        self,
-        config: AppConfig,
-        collaborators: dict[str, Any],
-    ) -> None:
-        """Wire injected or default read-domain services onto ``self``.
-
-        Args:
-            config: Active ``AppConfig``.
-            collaborators: Validated dictionary of optional collaborator overrides.
-        """
-        nav: GraphNavigator | None = collaborators.get("navigator")
-        self._navigator = nav if nav is not None else GraphNavigator(config)
-
-        ref_analyzer: ReferenceAnalyzer | None = collaborators.get("reference_analyzer")
+    def _bind_domain_services(self, config: AppConfig, deps: QueryCollaborators) -> None:
+        """Wire injected or default read-domain services onto ``self``."""
+        self._navigator = deps.navigator if deps.navigator is not None else GraphNavigator(config)
         self._reference_analyzer = (
-            ref_analyzer if ref_analyzer is not None else ReferenceAnalyzer(config)
+            deps.reference_analyzer
+            if deps.reference_analyzer is not None
+            else ReferenceAnalyzer(config)
         )
-
-        risk_analyzer: RiskAnalyzer | None = collaborators.get("risk_analyzer")
-        self._risk_analyzer = risk_analyzer if risk_analyzer is not None else RiskAnalyzer(config)
-        self._bind_context_services(config, collaborators)
-
-    def _bind_context_services(
-        self,
-        config: AppConfig,
-        collaborators: dict[str, Any],
-    ) -> None:
-        """Wire source, outline, symbol-context, and code-search services onto ``self``."""
-        reader: SourceReader | None = collaborators.get("source_reader")
-        self._source_reader = reader if reader is not None else SourceReader(config)
-
-        outline: OutlineBuilder | None = collaborators.get("outline_builder")
+        self._risk_analyzer = (
+            deps.risk_analyzer if deps.risk_analyzer is not None else RiskAnalyzer(config)
+        )
+        self._source_reader = (
+            deps.source_reader if deps.source_reader is not None else SourceReader(config)
+        )
         self._outline_builder = (
-            outline
-            if outline is not None
+            deps.outline_builder
+            if deps.outline_builder is not None
             else OutlineBuilder(config, navigator=self._navigator)
         )
-
-        ctx_builder: SymbolContextBuilder | None = collaborators.get("context_builder")
         self._context_builder = (
-            ctx_builder
-            if ctx_builder is not None
+            deps.context_builder
+            if deps.context_builder is not None
             else SymbolContextBuilder(
                 config,
                 navigator=self._navigator,
@@ -162,9 +112,22 @@ class QueryEngine:
                 reference_analyzer=self._reference_analyzer,
             )
         )
+        self._code_search = (
+            deps.code_search if deps.code_search is not None else CodeSearchService(config)
+        )
 
-        search_svc: CodeSearchService | None = collaborators.get("code_search")
-        self._code_search = search_svc if search_svc is not None else CodeSearchService(config)
+    @staticmethod
+    def _require_repo(uow: UnitOfWorkProtocol, repo: str | None) -> RepoRecord:
+        """Resolve ``repo`` and return its ``RepoRecord``, raising ``DatabaseError`` if absent."""
+        repo_id = uow.repos.resolve_id(repo)
+        repo_record = uow.repos.get_by_id(repo_id)
+        if repo_record is None:
+            raise DatabaseError(
+                f"Repository not found: {repo_id}",
+                error_code="repo_not_found",
+                context={"repo_id": repo_id},
+            )
+        return repo_record
 
     @staticmethod
     def _record_to_file_summary(
@@ -301,14 +264,8 @@ class QueryEngine:
             DatabaseError: If repository resolution or statistics queries fail.
         """
         with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
-            repo_id = uow.repos.resolve_id(repo)
-            repo_record = uow.repos.get_by_id(repo_id)
-            if repo_record is None:
-                raise DatabaseError(
-                    f"Repository not found: {repo_id}",
-                    error_code="repo_not_found",
-                    context={"repo_id": repo_id},
-                )
+            repo_record = self._require_repo(uow, repo)
+            repo_id = repo_record.id
             stats = uow.diagnostics.get_repo_graph_stats(repo_id)
             non_test_files = uow.files.list_for_repo(repo_id, include_tests=False)
             top_dirs = aggregate_top_directories(non_test_files, limit=15)
@@ -335,9 +292,7 @@ class QueryEngine:
             DatabaseError: If repository resolution or file queries fail.
         """
         clean_prefix = (
-            normalize_path_prefix(query.path_prefix)
-            if query.path_prefix is not None
-            else None
+            normalize_rel_path_prefix(query.path_prefix) if query.path_prefix is not None else None
         )
         with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
             repo_id = uow.repos.resolve_id(query.repo)
@@ -430,9 +385,7 @@ class QueryEngine:
             DatabaseError: If repository resolution or symbol search fails.
         """
         clean_file = (
-            normalize_repo_file_filter(query.file_path)
-            if query.file_path is not None
-            else None
+            normalize_rel_path_prefix(query.file_path) if query.file_path is not None else None
         )
         with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
             repo_id = uow.repos.resolve_id(query.repo)
@@ -468,14 +421,7 @@ class QueryEngine:
             DatabaseError: If repository resolution or text search queries fail.
         """
         with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
-            repo_id = uow.repos.resolve_id(query.repo)
-            repo_record = uow.repos.get_by_id(repo_id)
-            if repo_record is None:
-                raise DatabaseError(
-                    f"Repository not found: {repo_id}",
-                    error_code="repo_not_found",
-                    context={"repo_id": repo_id},
-                )
+            repo_record = self._require_repo(uow, query.repo)
             normalized_prefix = (
                 relativize_if_under_root(query.path_prefix, repo_record.root_path)
                 if query.path_prefix is not None
@@ -503,9 +449,7 @@ class QueryEngine:
             DatabaseError: If repository resolution or symbol listing fails.
         """
         clean_file = (
-            normalize_repo_file_filter(query.file_path)
-            if query.file_path is not None
-            else None
+            normalize_rel_path_prefix(query.file_path) if query.file_path is not None else None
         )
         with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
             repo_id = uow.repos.resolve_id(query.repo)

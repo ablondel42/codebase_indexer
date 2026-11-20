@@ -1,6 +1,7 @@
 """Single-symbol and full-repository LSP reference enrichment coordinator."""
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from core.models.config import AppConfig
@@ -28,17 +29,26 @@ class RepoLspCoordinator:
         config: AppConfig | None = None,
         enricher: ReferenceEnricher | None = None,
     ) -> None:
-        """Initialize the LSP coordinator with configuration and ``ReferenceEnricher``.
-
-        Args:
-            config: Optional ``AppConfig`` supplying timeout and file-size bounds.
-            enricher: Optional injected ``ReferenceEnricher`` instance.
-        """
+        """Initialize the LSP coordinator with configuration and ``ReferenceEnricher``."""
         resolved_config = config if config is not None else AppConfig()
         self._config = resolved_config
         self._enricher = (
             enricher if enricher is not None else ReferenceEnricher(config=resolved_config)
         )
+
+    @staticmethod
+    @contextmanager
+    def _pooled_client(
+        lsp_pool: LspPoolProtocol,
+        repo_root: Path,
+    ) -> Generator[LspClientProtocol, None, None]:
+        """Acquire a pooled LSP session for ``repo_root`` and evict on server termination."""
+        client = lsp_pool.acquire(repo_root)
+        try:
+            yield client
+        finally:
+            if not client.is_running:
+                lsp_pool.evict(repo_root)
 
     def enrich_symbol(
         self,
@@ -48,25 +58,7 @@ class RepoLspCoordinator:
         *,
         open_all_files: bool = False,
     ) -> SymbolEnrichmentResult:
-        """Refresh LSP references for ``symbol`` using a warm pooled session.
-
-        Evicts the cached session for ``repo.root_path`` if the language server
-        terminates during the enrichment call.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol`` providing repository ports.
-            lsp_pool: ``LspPoolProtocol`` managing warm per-repository LSP sessions.
-            symbol: Target ``SymbolSummary`` or ``SymbolNode`` to enrich.
-            open_all_files: Whether to synchronize all auxiliary ``.py`` files beforehand.
-
-        Returns:
-            ``SymbolEnrichmentResult`` with updated reference counts and status.
-
-        Raises:
-            DatabaseError: If repository metadata for ``symbol.repo_id`` is missing.
-            PathSecurityError: If the target file escapes ``repo.root_path`` or is a symlink.
-            LspError: If acquiring the LSP client or querying references fails.
-        """
+        """Refresh LSP references for ``symbol`` using a warm pooled session."""
         repo = uow.repos.get_by_id(symbol.repo_id)
         if repo is None or not repo.root_path:
             raise DatabaseError(
@@ -76,8 +68,7 @@ class RepoLspCoordinator:
             )
 
         repo_root = Path(repo.root_path)
-        client = lsp_pool.acquire(repo_root)
-        try:
+        with self._pooled_client(lsp_pool, repo_root) as client:
             return self._enricher.enrich_symbol(
                 uow,
                 client,
@@ -85,9 +76,6 @@ class RepoLspCoordinator:
                 open_all_files=open_all_files,
                 raise_on_error=True,
             )
-        finally:
-            if not client.is_running:
-                lsp_pool.evict(repo_root)
 
     def _enrich_one_repo_symbol(
         self,
@@ -96,17 +84,7 @@ class RepoLspCoordinator:
         node: SymbolNode,
         file_rec: FileRecord | None,
     ) -> int | None:
-        """Enrich one repository symbol, returning its reference count or ``None`` on error.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            client: Active ``LspClientProtocol`` session.
-            node: Non-module ``SymbolNode`` to enrich.
-            file_rec: Containing ``FileRecord`` if present in ``files_by_id``.
-
-        Returns:
-            Persisted reference count on success, or ``None`` if enrichment was skipped.
-        """
+        """Enrich one repository symbol, returning its reference count or ``None`` on error."""
         if file_rec is None:
             logger.warning(
                 "Skipping LSP enrichment for %s: missing file record %s",
@@ -141,17 +119,7 @@ class RepoLspCoordinator:
         symbols: Sequence[SymbolNode],
         files_by_id: dict[str, FileRecord],
     ) -> LspBatchSummary:
-        """Iterate over ``symbols`` with an active LSP client and aggregate counters.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            client: Started ``LspClientProtocol`` session.
-            symbols: Non-module ``SymbolNode`` declarations in the repository.
-            files_by_id: Lookup table of ``FileRecord`` entities keyed by ``file_id``.
-
-        Returns:
-            Aggregated ``LspBatchSummary`` with ``available=True``.
-        """
+        """Iterate over ``symbols`` with an active LSP client and aggregate counters."""
         refreshed = 0
         errors = 0
         total_refs = 0
@@ -178,61 +146,20 @@ class RepoLspCoordinator:
             error=None,
         )
 
-    def _enrich_with_pool(
-        self,
-        uow: UnitOfWorkProtocol,
-        lsp_pool: LspPoolProtocol,
-        repo_root: Path,
-        symbols: Sequence[SymbolNode],
-        files_by_id: dict[str, FileRecord],
-    ) -> LspBatchSummary:
-        """Run batch LSP enrichment using a session from ``lsp_pool``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            lsp_pool: Warm ``LspPoolProtocol`` session pool.
-            repo_root: Repository root directory path.
-            symbols: Non-module symbols to enrich.
-            files_by_id: Tracked files keyed by ``file_id``.
-
-        Returns:
-            ``LspBatchSummary`` capturing availability, counts, and any startup error.
-        """
-        try:
-            client = lsp_pool.acquire(repo_root)
-        except LspError as exc:
-            logger.warning("LSP pool session unavailable for %s: %s", repo_root, exc)
-            return LspBatchSummary(
-                available=False,
-                symbols_attempted=len(symbols),
-                error=str(exc),
-            )
-
-        try:
-            return self._enrich_symbols_with_client(uow, client, symbols, files_by_id)
-        finally:
-            if not client.is_running:
-                lsp_pool.evict(repo_root)
-
-    def _enrich_with_ephemeral_client(
+    def _run_batch_enrichment(
         self,
         uow: UnitOfWorkProtocol,
         repo_root: Path,
         symbols: Sequence[SymbolNode],
         files_by_id: dict[str, FileRecord],
+        *,
+        lsp_pool: LspPoolProtocol | None,
     ) -> LspBatchSummary:
-        """Run batch LSP enrichment inside a scoped ``PyrightLspClient`` context.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol``.
-            repo_root: Repository root directory path.
-            symbols: Non-module symbols to enrich.
-            files_by_id: Tracked files keyed by ``file_id``.
-
-        Returns:
-            ``LspBatchSummary`` capturing availability, counts, and any startup error.
-        """
+        """Execute batch LSP enrichment via ``lsp_pool`` or a scoped ``PyrightLspClient``."""
         try:
+            if lsp_pool is not None:
+                with self._pooled_client(lsp_pool, repo_root) as client:
+                    return self._enrich_symbols_with_client(uow, client, symbols, files_by_id)
             with PyrightLspClient(config=self._config) as client:
                 client.start(repo_root)
                 return self._enrich_symbols_with_client(uow, client, symbols, files_by_id)
@@ -251,33 +178,21 @@ class RepoLspCoordinator:
         *,
         lsp_pool: LspPoolProtocol | None = None,
     ) -> LspBatchSummary:
-        """Enrich LSP references for all non-module symbols in ``repo``.
-
-        Args:
-            uow: Active ``UnitOfWorkProtocol`` providing repository ports.
-            repo: Target ``RepoRecord`` to enrich.
-            lsp_pool: Optional ``LspPoolProtocol``; when omitted, spawns a scoped
-                ``PyrightLspClient`` closed on completion.
-
-        Returns:
-            ``LspBatchSummary`` reporting refreshed symbol and reference counts.
-        """
-        files_by_id = {
-            rec.id: rec
-            for rec in uow.files.list_for_repo(repo.id, include_tests=True)
-        }
+        """Enrich LSP references for all non-module symbols in ``repo``."""
+        files_by_id = {rec.id: rec for rec in uow.files.list_for_repo(repo.id, include_tests=True)}
         symbols = [
-            node
-            for node in uow.nodes.list_for_repo(repo.id)
-            if node.kind != SymbolKind.MODULE
+            node for node in uow.nodes.list_for_repo(repo.id) if node.kind != SymbolKind.MODULE
         ]
         if not symbols:
             return LspBatchSummary(available=True, symbols_attempted=0)
 
-        repo_root = Path(repo.root_path)
-        if lsp_pool is not None:
-            return self._enrich_with_pool(uow, lsp_pool, repo_root, symbols, files_by_id)
-        return self._enrich_with_ephemeral_client(uow, repo_root, symbols, files_by_id)
+        return self._run_batch_enrichment(
+            uow,
+            Path(repo.root_path),
+            symbols,
+            files_by_id,
+            lsp_pool=lsp_pool,
+        )
 
 
 __all__ = [

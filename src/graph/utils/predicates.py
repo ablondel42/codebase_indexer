@@ -1,11 +1,14 @@
 """Pure stateless graph predicates, line-range derivation, and edge peer formatting."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from core.models.edge import Edge
 from core.models.enums import SymbolScope
+from core.models.exceptions import SymbolNotFoundError, ValidationError
 from core.models.node import SymbolNode, SymbolSummary
 from core.models.range import Range
+from core.ports.repositories import NodeRepositoryProtocol
 from graph.models.risk import RiskTarget
 
 UNRESOLVED_ENDPOINT_PREFIXES: tuple[str, ...] = (
@@ -196,6 +199,30 @@ def format_site_location(file_path: str | None, line: int | None) -> str | None:
     return None
 
 
+def load_verified_summaries_by_ids(
+    nodes_repo: NodeRepositoryProtocol,
+    symbol_ids: Sequence[str],
+    *,
+    empty_error: str | None = None,
+    empty_context: Mapping[str, Any] | None = None,
+) -> tuple[list[str], dict[str, SymbolSummary]]:
+    """Strip/deduplicate ``symbol_ids``, batch-load summaries, and reject missing IDs."""
+    ordered_ids = list(dict.fromkeys(sid.strip() for sid in symbol_ids if sid and sid.strip()))
+    if not ordered_ids:
+        if empty_error is not None:
+            raise ValidationError(empty_error, context=dict(empty_context or {}))
+        return [], {}
+
+    summaries_by_id = nodes_repo.get_summaries_by_ids(ordered_ids)
+    missing = [sid for sid in ordered_ids if sid not in summaries_by_id]
+    if missing:
+        raise SymbolNotFoundError(
+            f"Symbol not found: {missing[0]}",
+            context={"symbol_id": missing[0], "missing_symbol_ids": missing},
+        )
+    return ordered_ids, summaries_by_id
+
+
 __all__ = [
     "UNRESOLVED_ENDPOINT_PREFIXES",
     "classify_edge_peer",
@@ -203,6 +230,7 @@ __all__ = [
     "extract_edge_line",
     "format_site_location",
     "is_public_like",
+    "load_verified_summaries_by_ids",
     "resolve_endpoint_name",
     "resolve_peer_label",
 ]

@@ -178,9 +178,7 @@ def test_node_upsert_read_summaries_fts_and_delete(uow_factory: SqlUnitOfWorkFac
         assert fetched.end_line == 10
         assert fetched.payload == {"test": "data"}
         assert (
-            uow.nodes.get_by_qualified_name(
-                "project:test:12345678", "test.OrderService"
-            )
+            uow.nodes.get_by_qualified_name("project:test:12345678", "test.OrderService")
             is not None
         )
 
@@ -255,21 +253,19 @@ def test_edge_upsert_single_json_encoding_updates_and_file_delete(
     )
     with uow_factory.open() as uow:
         uow.files.upsert_many([other_file])
-        uow.nodes.upsert_many(
-            [
-                _node("node:a", SymbolKind.FUNCTION, "test.a"),
-                _node("node:b", SymbolKind.FUNCTION, "other.b", file_id=other_file.id),
-            ]
-        )
+        uow.nodes.upsert_many([
+            _node("node:a", SymbolKind.FUNCTION, "test.a"),
+            _node("node:b", SymbolKind.FUNCTION, "other.b", file_id=other_file.id),
+        ])
 
         e1 = _edge("edge:1", EdgeKind.CALLS, "node:a", "unresolved:other.b")
         e2 = _edge("edge:2", EdgeKind.SCOPE_PARENT, "node:b", "node:a", file_id=other_file.id)
         uow.edges.upsert(e1)
         uow.edges.upsert_many([e2])
 
-        updated = uow.edges.update_resolved_targets(
-            [EdgeTargetUpdate(edge_id="edge:1", to_id="node:b", confidence=0.95)]
-        )
+        updated = uow.edges.update_resolved_targets([
+            EdgeTargetUpdate(edge_id="edge:1", to_id="node:b", confidence=0.95)
+        ])
         assert updated == 1
         resolved_e1 = uow.edges.get_by_id("edge:1")
         assert resolved_e1 is not None
@@ -417,14 +413,12 @@ def test_repos_runs_refresh_and_diagnostics(
         assert runs[0].status == "completed"
         assert runs[0].nodes_extracted == 4
 
-        uow.nodes.upsert_many(
-            [
-                _node("node:m", SymbolKind.MODULE, "test"),
-                _node("node:c", SymbolKind.CLASS, "test.C"),
-                _node("node:f", SymbolKind.FUNCTION, "test.f"),
-                _node("node:lf", SymbolKind.LOCAL_FUNCTION, "test.f.g", scope=SymbolScope.FUNCTION),
-            ]
-        )
+        uow.nodes.upsert_many([
+            _node("node:m", SymbolKind.MODULE, "test"),
+            _node("node:c", SymbolKind.CLASS, "test.C"),
+            _node("node:f", SymbolKind.FUNCTION, "test.f"),
+            _node("node:lf", SymbolKind.LOCAL_FUNCTION, "test.f.g", scope=SymbolScope.FUNCTION),
+        ])
         uow.refresh.upsert(
             ReferenceRefreshState(
                 target_symbol_id="node:f",

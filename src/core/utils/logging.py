@@ -7,16 +7,14 @@ from types import MappingProxyType
 
 ROOT_LOGGER_NAME = "indexer"
 
-_VALID_LOG_LEVELS = MappingProxyType(
-    {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "WARN": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL,
-    }
-)
+_VALID_LOG_LEVELS = MappingProxyType({
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+})
 
 
 def _resolve_log_level(level: str) -> int:

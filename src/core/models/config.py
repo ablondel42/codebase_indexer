@@ -7,7 +7,7 @@ from pydantic import field_validator
 
 from core.models.base import FrozenModel
 
-DEFAULT_IGNORED_DIRS: tuple[str, ...] = (
+IGNORED_DIRS: tuple[str, ...] = (
     # Version control
     ".git",
     ".hg",
@@ -26,15 +26,18 @@ DEFAULT_IGNORED_DIRS: tuple[str, ...] = (
     ".nox",
     ".eggs",
     "*.egg-info",
-    # Build artifacts
+    ".hypothesis",
+    "htmlcov",
+    # Build artifacts & package managers
     "build",
     "dist",
+    "site",
     "node_modules",
+    ".pixi",
     # IDE
     ".idea",
     ".vscode",
-    ".agents",
-    ".agent",
+    ".cursor",
 )
 
 
@@ -48,7 +51,7 @@ class AppConfig(FrozenModel):
     max_file_size_bytes: int = 2 * 1024 * 1024
     lsp_timeout_seconds: float = 15.0
     max_lsp_payload_bytes: int = 16 * 1024 * 1024
-    ignored_dirs: tuple[str, ...] = DEFAULT_IGNORED_DIRS
+    ignored_dirs: tuple[str, ...] = IGNORED_DIRS
     test_dir_names: tuple[str, ...] = ("tests", "test")
     supported_extensions: tuple[str, ...] = (".py",)
 

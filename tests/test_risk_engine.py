@@ -420,19 +420,15 @@ def test_scoring_and_decision_rules() -> None:
 
     local_facts = RiskFacts(touches_local_scope_only=True, touches_public_surface=False)
     assert score_risk([RiskIssueCode.STALE_CONTEXT.value], local_facts) == 10
-    assert (
-        decide_risk([RiskIssueCode.STALE_CONTEXT.value], local_facts, 10)
-        == RiskDecision.REVIEW_REQUIRED
-    )
-    assert decide_risk([], RiskFacts(), 10) == RiskDecision.SAFE_ENOUGH
-    assert decide_risk([], RiskFacts(), 80) == RiskDecision.HIGH_RISK
+    assert decide_risk([RiskIssueCode.STALE_CONTEXT.value], 10) == RiskDecision.REVIEW_REQUIRED
+    assert decide_risk([], 10) == RiskDecision.SAFE_ENOUGH
+    assert decide_risk([], 80) == RiskDecision.HIGH_RISK
     assert (
         decide_risk(
             [
                 RiskIssueCode.REFERENCE_DATA_UNAVAILABLE.value,
                 RiskIssueCode.PUBLIC_SURFACE_CHANGE.value,
             ],
-            RiskFacts(),
             20,
         )
         == RiskDecision.REVIEW_REQUIRED
