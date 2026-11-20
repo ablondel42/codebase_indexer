@@ -1,6 +1,7 @@
-"""Scope-aware Python AST ``calls`` edge extractor service."""
+"""Scope-aware Python AST ``calls`` edge extractor service with linkable filtering."""
 
 import ast
+import builtins
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 
@@ -9,26 +10,33 @@ from core.models.enums import CALLABLE_KINDS, PREFIX_EDGE, EdgeKind, SymbolKind
 from core.models.file import FileRecord
 from core.models.node import SymbolNode
 from core.utils.logging import get_logger
-from parsing.utils.ast_helpers import cap_signature, extract_dotted_parts, safe_unparse
+from parsing.models.extraction import ImportExtractionResult
+from parsing.utils.ast_helpers import extract_dotted_parts
 from parsing.utils.naming import build_nested_qualified_name
 from parsing.utils.ranges import make_declaration_lines, make_range
 
 logger = get_logger("parsing.services.calls")
 
+_PYTHON_BUILTINS: frozenset[str] = frozenset(dir(builtins))
+
 
 class _CallVisitor(ast.NodeVisitor):
-    """AST visitor tracking enclosing declaration symbol IDs for every ``ast.Call``."""
+    """AST visitor emitting linkable ``calls`` edges scoped to enclosing declarations."""
 
     def __init__(
         self,
         file_record: FileRecord,
         module_node_id: str,
         nodes: Sequence[SymbolNode],
-        lines: Sequence[str] | None = None,
         *,
-        symbols_by_ast_id: Mapping[int, SymbolNode] | None = None,
+        context: tuple[
+            Sequence[str] | None,
+            Mapping[int, SymbolNode] | None,
+            ImportExtractionResult | None,
+        ] = (None, None, None),
     ) -> None:
         """Initialize the per-file call visitor."""
+        lines, symbols_by_ast_id, import_result = context
         self._file_record = file_record
         self._lines = lines
         self.edges: list[Edge] = []
@@ -36,6 +44,17 @@ class _CallVisitor(ast.NodeVisitor):
         self._name_chain: list[str] = []
         self._seen_edge_keys: dict[tuple[str, str, int, int], int] = {}
         self._symbols_by_ast_id = symbols_by_ast_id
+        self._declared_names: frozenset[str] = frozenset(
+            node.name
+            for node in nodes
+            if node.kind == SymbolKind.CLASS or node.kind in CALLABLE_KINDS
+        )
+        self._bound_imports: frozenset[str] | None = (
+            import_result.bound_names if import_result is not None else None
+        )
+        self._has_star_import: bool = (
+            import_result.has_star_import if import_result is not None else False
+        )
         self._by_exact: dict[tuple[bool, str, int], str] = {}
         self._by_qname: dict[tuple[bool, str], deque[str]] = defaultdict(deque)
         if symbols_by_ast_id is None:
@@ -54,19 +73,52 @@ class _CallVisitor(ast.NodeVisitor):
                 self._by_exact[(is_cls, node.qualified_name, node.start_line)] = node.id
             self._by_qname[(is_cls, node.qualified_name)].append(node.id)
 
-    @staticmethod
-    def _classify_call_target(func_expr: ast.AST) -> tuple[str, str | None]:
-        """Classify a call callee expression into ``(target_hint, qualifier)``."""
+    def _classify_name_target(self, func_expr: ast.Name) -> tuple[str, str | None] | None:
+        """Classify a bare ``name()`` call, skipping unresolvable builtins/locals."""
+        name = func_expr.id
+        if self._bound_imports is not None and not self._has_star_import:
+            if name in self._declared_names or name in self._bound_imports:
+                return name, None
+            return None
+        if name in _PYTHON_BUILTINS and name not in self._declared_names:
+            return None
+        return name, None
+
+    def _classify_attr_target(
+        self,
+        func_expr: ast.Attribute,
+    ) -> tuple[str, str | None] | None:
+        """Classify a dotted or ``super().method()`` call, pruning non-linkable receivers."""
+        if (
+            isinstance(func_expr.value, ast.Call)
+            and isinstance(func_expr.value.func, ast.Name)
+            and func_expr.value.func.id == "super"
+        ):
+            return f"super().{func_expr.attr}", None
+
+        parts = extract_dotted_parts(func_expr)
+        if parts is None or len(parts) < 2:
+            return None
+
+        root = parts[0]
+        if root in ("self", "cls"):
+            return (".".join(parts), root) if len(parts) == 2 else None
+        if root == "logger" or (
+            self._bound_imports is not None
+            and not self._has_star_import
+            and root not in self._bound_imports
+            and root not in self._declared_names
+        ):
+            return None
+        return ".".join(parts), "module"
+
+    def _classify_call_target(self, func_expr: ast.AST) -> tuple[str, str | None] | None:
+        """Classify a call callee expression or return ``None`` if non-linkable."""
         if isinstance(func_expr, ast.Name):
-            return func_expr.id, None
-
+            return self._classify_name_target(func_expr)
         if isinstance(func_expr, ast.Attribute):
-            parts = extract_dotted_parts(func_expr)
-            if parts is not None and len(parts) >= 2:
-                qualifier = parts[0] if parts[0] in ("self", "cls") else "module"
-                return ".".join(parts), qualifier
-
-        return cap_signature(safe_unparse(func_expr), max_length=200), None
+            return self._classify_attr_target(func_expr)
+        return None
 
     def _lookup_symbol_id(self, *, is_class: bool, node: ast.AST, name: str) -> str:
         """Resolve the ``SymbolNode`` ID for an ``ast.ClassDef`` or function definition."""
@@ -147,9 +199,14 @@ class _CallVisitor(ast.NodeVisitor):
         self._visit_function(node)
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Emit a ``calls`` ``Edge`` for ``node`` and recurse into child expressions."""
+        """Emit a linkable ``calls`` ``Edge`` for ``node`` and recurse into child expressions."""
+        classified = self._classify_call_target(node.func)
+        if classified is None:
+            self.generic_visit(node)
+            return
+
         from_id = self._scope_stack[-1]
-        target, qualifier = self._classify_call_target(node.func)
+        target, qualifier = classified
         placeholder_id = f"unresolved_call:{target}"
 
         lineno = getattr(node, "lineno", 0)
@@ -191,7 +248,7 @@ class _CallVisitor(ast.NodeVisitor):
 
 
 class CallExtractor:
-    """Walks AST call sites and emits scope-aware ``calls`` ``Edge`` instances."""
+    """Walks AST call sites and emits linkable scope-aware ``calls`` ``Edge`` instances."""
 
     def extract(
         self,
@@ -200,16 +257,18 @@ class CallExtractor:
         nodes: Sequence[SymbolNode],
         tree: ast.Module,
         *,
-        lines: Sequence[str] | None = None,
-        symbols_by_ast_id: Mapping[int, SymbolNode] | None = None,
+        context: tuple[
+            Sequence[str] | None,
+            Mapping[int, SymbolNode] | None,
+            ImportExtractionResult | None,
+        ] = (None, None, None),
     ) -> list[Edge]:
-        """Extract all ``calls`` ``Edge`` items inside ``tree``."""
+        """Extract all linkable ``calls`` ``Edge`` items inside ``tree``."""
         visitor = _CallVisitor(
             file_record=file_record,
             module_node_id=module_node_id,
             nodes=nodes,
-            lines=lines,
-            symbols_by_ast_id=symbols_by_ast_id,
+            context=context,
         )
         visitor.visit(tree)
         return visitor.edges

@@ -26,7 +26,6 @@ LOW_CONFIDENCE_THRESHOLD: float = 0.8
 _CLASS_MEMBER_INHERITANCE_KINDS: frozenset[SymbolKind] = frozenset({
     SymbolKind.METHOD,
     SymbolKind.ASYNC_METHOD,
-    SymbolKind.ATTRIBUTE,
 })
 
 

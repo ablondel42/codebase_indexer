@@ -160,7 +160,28 @@ class ImportExtractor:
         return entries
 
     @staticmethod
-    def _aggregate_entries(entries: Sequence[ImportEntry]) -> ImportExtractionResult:
+    def _extract_bound_info(entries: Sequence[ImportEntry]) -> tuple[frozenset[str], bool]:
+        """Collect file-level bound identifier names and detect wildcard imports."""
+        bound: set[str] = set()
+        has_star = False
+        for entry in entries:
+            payload = entry.edge.payload
+            alias = payload.get("alias")
+            if payload.get("import_type") == "import":
+                if isinstance(alias, str) and alias:
+                    bound.add(alias)
+                elif entry.module_name:
+                    bound.add(entry.module_name.split(".")[0])
+            elif entry.symbol_name == "*":
+                has_star = True
+            elif isinstance(alias, str) and alias:
+                bound.add(alias)
+            elif entry.symbol_name:
+                bound.add(entry.symbol_name)
+        return frozenset(bound), has_star
+
+    @classmethod
+    def _aggregate_entries(cls, entries: Sequence[ImportEntry]) -> ImportExtractionResult:
         """Aggregate ``ImportEntry`` items into deduplicated ``ImportExtractionResult``."""
         edges: list[Edge] = []
         imported_modules: list[str] = []
@@ -177,10 +198,13 @@ class ImportExtractor:
                 seen_symbols.add(entry.symbol_name)
                 imported_symbols.append(entry.symbol_name)
 
+        bound_names, has_star_import = cls._extract_bound_info(entries)
         return ImportExtractionResult(
             edges=edges,
             imported_modules=imported_modules,
             imported_symbols=imported_symbols,
+            bound_names=bound_names,
+            has_star_import=has_star_import,
         )
 
     def extract(

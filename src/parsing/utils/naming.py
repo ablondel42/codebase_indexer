@@ -5,9 +5,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from core.models.enums import (
-    PREFIX_EDGE,
     PREFIX_SHA256,
-    EdgeKind,
     Language,
     SymbolKind,
     SymbolScope,
@@ -38,27 +36,6 @@ def build_nested_qualified_name(
     parts.extend(lexical_chain)
     parts.append(name)
     return ".".join(parts)
-
-
-def make_structural_edge_id(
-    repo_id: str,
-    kind: EdgeKind | str,
-    from_id: str,
-    to_id: str,
-) -> str:
-    """Build a deterministic edge ID for structural ``contains`` or ``scope_parent`` edges.
-
-    Args:
-        repo_id: Owning repository identifier.
-        kind: Structural ``EdgeKind`` (``contains`` or ``scope_parent``).
-        from_id: Source symbol node identifier.
-        to_id: Target symbol node identifier.
-
-    Returns:
-        Canonical ``edge:<repo_id>:<kind>:<from_id>-><to_id>`` identifier.
-    """
-    kind_val = kind.value if isinstance(kind, EdgeKind) else str(kind)
-    return f"{PREFIX_EDGE}{repo_id}:{kind_val}:{from_id}->{to_id}"
 
 
 def compute_semantic_digest(parts: Sequence[str]) -> str:
@@ -190,6 +167,5 @@ __all__ = [
     "build_nested_qualified_name",
     "build_symbol_node",
     "compute_semantic_digest",
-    "make_structural_edge_id",
     "resolve_symbol_placement",
 ]

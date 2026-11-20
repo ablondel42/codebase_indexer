@@ -82,9 +82,6 @@ class AstExtractionPipeline:
             class_count=class_count,
             callable_count=callable_count,
             method_count=method_count,
-            constant_count=sum(1 for node in nodes if node.kind == SymbolKind.CONSTANT),
-            attribute_count=sum(1 for node in nodes if node.kind == SymbolKind.ATTRIBUTE),
-            type_alias_count=sum(1 for node in nodes if node.kind == SymbolKind.TYPE_ALIAS),
             call_edge_count=call_edge_count,
         )
 
@@ -115,8 +112,7 @@ class AstExtractionPipeline:
             initial_module.id,
             walk_result.nodes,
             tree,
-            lines=session.lines,
-            symbols_by_ast_id=walk_result.symbols_by_ast_id,
+            context=(session.lines, walk_result.symbols_by_ast_id, import_result),
         )
         enriched_module = self._enrich_module_node(
             initial_module,
@@ -126,7 +122,6 @@ class AstExtractionPipeline:
         )
         all_edges = [
             *import_result.edges,
-            *walk_result.structural_edges,
             *inheritance_edges,
             *call_edges,
         ]

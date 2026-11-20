@@ -26,6 +26,13 @@ _SEMANTIC_EDGE_ORDER: Mapping[EdgeKind, int] = MappingProxyType({
 })
 
 
+def is_unresolved_edge(edge: Edge | ContextEdge) -> bool:
+    """Return ``True`` when either endpoint of ``edge`` carries a placeholder prefix."""
+    return edge.from_id.startswith(PLACEHOLDER_PREFIXES) or edge.to_id.startswith(
+        PLACEHOLDER_PREFIXES
+    )
+
+
 def edges_have_placeholder_targets(edges: Sequence[Edge | ContextEdge]) -> bool:
     """Return ``True`` if any endpoint in ``edges`` begins with a placeholder prefix.
 
@@ -35,12 +42,7 @@ def edges_have_placeholder_targets(edges: Sequence[Edge | ContextEdge]) -> bool:
     Returns:
         ``True`` when at least one ``from_id`` or ``to_id`` is an unresolved placeholder.
     """
-    for edge in edges:
-        if edge.from_id.startswith(PLACEHOLDER_PREFIXES) or edge.to_id.startswith(
-            PLACEHOLDER_PREFIXES
-        ):
-            return True
-    return False
+    return any(is_unresolved_edge(edge) for edge in edges)
 
 
 def is_lsp_enriched(
@@ -315,6 +317,7 @@ __all__ = [
     "is_lsp_enriched",
     "is_nested_lexical_declaration",
     "is_private_symbol",
+    "is_unresolved_edge",
     "resolve_symbol_line_bounds",
     "select_balanced_edges",
     "slice_source_window",

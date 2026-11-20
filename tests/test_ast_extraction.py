@@ -65,12 +65,11 @@ def _persist_single_file(
 
 
 def test_contains_hierarchy_and_no_module_to_method_edges() -> None:
-    """Module contains only top-level symbols; classes contain their direct methods."""
+    """Nodes encode parent_id/lexical_parent_id directly without redundant structural edges."""
     extraction = _extract_single_file(FIXTURES_DIR / "simple_package", "services.py")
     nodes = extraction.nodes
     edges = extraction.edges
 
-    by_id = {n.id: n for n in nodes}
     module_node = next(n for n in nodes if n.kind == SymbolKind.MODULE)
     auth_cls = next(n for n in nodes if n.name == "AuthService")
     login_method = next(n for n in nodes if n.name == "login")
@@ -83,16 +82,7 @@ def test_contains_hierarchy_and_no_module_to_method_edges() -> None:
     assert login_method.scope == SymbolScope.CLASS
     assert create_fn.parent_id == module_node.id
 
-    contains = [e for e in edges if e.kind == EdgeKind.CONTAINS]
-    pairs = {(e.from_id, e.to_id) for e in contains}
-    assert (module_node.id, auth_cls.id) in pairs
-    assert (module_node.id, create_fn.id) in pairs
-    assert (auth_cls.id, login_method.id) in pairs
-
-    # Strictly zero module -> method contains edges
-    for src, dst in pairs:
-        if by_id[src].kind == SymbolKind.MODULE:
-            assert by_id[dst].kind not in (SymbolKind.METHOD, SymbolKind.ASYNC_METHOD)
+    assert all(e.kind in (EdgeKind.IMPORTS, EdgeKind.INHERITS, EdgeKind.CALLS) for e in edges)
 
 
 def test_selection_range_for_class_def_async_def_and_utf8_columns(tmp_path: Path) -> None:
@@ -111,7 +101,8 @@ def test_selection_range_for_class_def_async_def_and_utf8_columns(tmp_path: Path
         "async def sync() -> None:\n"
         "    return None\n"
         "\n"
-        'héllo = "😀"; café = 2\n',
+        "def café() -> int:\n"
+        "    return 2\n",
         encoding="utf-8",
     )
     extraction = _extract_single_file(repo, "mod.py")
@@ -167,15 +158,13 @@ def test_nested_classes_and_local_classes_without_doubled_name(tmp_path: Path) -
 
     outer = next(n for n in nodes if n.name == "Outer")
     inner = next(n for n in nodes if n.name == "Inner")
-    inner_val = next(n for n in nodes if n.name == "VALUE")
     ping = next(n for n in nodes if n.name == "ping")
 
+    assert [n.name for n in nodes] == ["nested", "Outer", "Inner", "ping"]
     assert inner.qualified_name == "nested.Outer.Inner"
     assert inner.parent_id == outer.id
     assert inner.lexical_parent_id is None
     assert inner.scope == SymbolScope.CLASS
-    assert inner_val.kind == SymbolKind.ATTRIBUTE
-    assert inner_val.parent_id == inner.id
     assert ping.parent_id == inner.id
     assert ping.qualified_name == "nested.Outer.Inner.ping"
 
@@ -192,40 +181,35 @@ def test_nested_classes_and_local_classes_without_doubled_name(tmp_path: Path) -
     assert local_method.parent_id == local_cls.id
     assert local_method.lexical_parent_id is None
     assert local_method.scope == SymbolScope.CLASS
-    assert any(
-        e.kind == EdgeKind.SCOPE_PARENT and e.from_id == local_cls.id and e.to_id == factory.id
-        for e in local_ext.edges
-    )
 
 
-def test_assignments_constants_attributes_and_type_aliases(tmp_path: Path) -> None:
-    """Extracts module constants, class attributes, and PEP 695/typing type_alias symbols."""
+def test_variables_and_non_linkable_calls_are_pruned_while_nested_arg_calls_survive(
+    tmp_path: Path,
+) -> None:
+    """Assignments are omitted and builtin/logger/local-var calls are pruned cleanly."""
     repo = tmp_path / "assign_repo"
     repo.mkdir()
     (repo / "defs.py").write_text(
-        "from typing import TypeAlias\n"
+        "import logging\n"
+        "from pkg.mod import helper\n\n"
+        "logger = logging.getLogger(__name__)\n"
         "MAX_SIZE: int = 100\n"
-        "UserId: TypeAlias = int\n"
         "type AliasList = list[str]\n"
         "A, B = 1, 2\n"
         "class Config:\n"
         "    timeout: float = 5.0\n"
-        "    RETRIES = 3\n",
+        "    RETRIES = 3\n\n"
+        "    def run(self, items: list[int]) -> list[int]:\n"
+        "        items.append(1)\n"
+        "        logger.debug('x')\n"
+        "        self._db.execute()\n"
+        "        return sorted(helper(len(items)))\n",
         encoding="utf-8",
     )
     extraction = _extract_single_file(repo, "defs.py")
-    by_name = {n.name: n for n in extraction.nodes}
-
-    assert by_name["MAX_SIZE"].kind == SymbolKind.CONSTANT
-    assert by_name["A"].kind == SymbolKind.CONSTANT
-    assert by_name["B"].kind == SymbolKind.CONSTANT
-    assert by_name["UserId"].kind == SymbolKind.TYPE_ALIAS
-    assert by_name["AliasList"].kind == SymbolKind.TYPE_ALIAS
-    assert by_name["timeout"].kind == SymbolKind.ATTRIBUTE
-    assert by_name["RETRIES"].kind == SymbolKind.ATTRIBUTE
-    assert extraction.metrics.constant_count == 3
-    assert extraction.metrics.attribute_count == 2
-    assert extraction.metrics.type_alias_count == 2
+    assert [n.name for n in extraction.nodes] == ["defs", "Config", "run"]
+    call_targets = [e.payload.get("target") for e in extraction.edges if e.kind == EdgeKind.CALLS]
+    assert call_targets == ["logging.getLogger", "helper"]
 
 
 def test_relative_imports_calls_linker_resolution_and_broken_target_reset(

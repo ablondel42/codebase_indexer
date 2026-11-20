@@ -20,11 +20,12 @@ from context.utils.formatting import (
     edge_sort_key,
     is_lsp_enriched,
     is_nested_lexical_declaration,
+    is_unresolved_edge,
     select_balanced_edges,
 )
 from core.models.config import AppConfig
 from core.models.edge import Edge
-from core.models.enums import EdgeKind, SymbolScope
+from core.models.enums import SymbolScope
 from core.models.exceptions import (
     ParseError,
     PathSecurityError,
@@ -46,11 +47,6 @@ from graph.utils.predicates import (
 )
 
 logger = get_logger("context.services.builder")
-
-_STRUCTURAL_EDGE_KINDS: frozenset[EdgeKind] = frozenset({
-    EdgeKind.CONTAINS,
-    EdgeKind.SCOPE_PARENT,
-})
 
 
 class SymbolContextBuilder:
@@ -150,11 +146,11 @@ class SymbolContextBuilder:
         incoming_raw = self._navigator.list_incoming_edges(uow, symbol_id)
         outgoing_raw = self._navigator.list_outgoing_edges(uow, symbol_id)
         incoming_semantic = sorted(
-            (edge for edge in incoming_raw if edge.kind not in _STRUCTURAL_EDGE_KINDS),
+            (edge for edge in incoming_raw if not is_unresolved_edge(edge)),
             key=edge_sort_key,
         )
         outgoing_semantic = sorted(
-            (edge for edge in outgoing_raw if edge.kind not in _STRUCTURAL_EDGE_KINDS),
+            (edge for edge in outgoing_raw if not is_unresolved_edge(edge)),
             key=edge_sort_key,
         )
         return SymbolEdgeBundle(

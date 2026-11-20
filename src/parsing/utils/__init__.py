@@ -26,7 +26,6 @@ from parsing.utils.naming import (
     build_nested_qualified_name,
     build_symbol_node,
     compute_semantic_digest,
-    make_structural_edge_id,
     resolve_symbol_placement,
 )
 from parsing.utils.ranges import (
@@ -60,7 +59,6 @@ __all__ = [
     "make_name_selection_range",
     "make_position",
     "make_range",
-    "make_structural_edge_id",
     "parse_python_ast",
     "resolve_relative_module",
     "resolve_symbol_placement",

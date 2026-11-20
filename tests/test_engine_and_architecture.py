@@ -233,12 +233,12 @@ class TestHeadlessIndexerEngineQueries:
         all_cls_members = engine.queries.get_symbol_members(
             SymbolMembersQuery(symbol="pkg.models.UserEntity", include_private=True)
         )
-        assert [m.name for m in all_cls_members] == ["role", "display", "_audit"]
+        assert [m.name for m in all_cls_members] == ["display", "_audit"]
 
         public_cls_members = engine.queries.get_symbol_members(
             SymbolMembersQuery(symbol="pkg.models.UserEntity", include_private=False)
         )
-        assert [m.name for m in public_cls_members] == ["role", "display"]
+        assert [m.name for m in public_cls_members] == ["display"]
 
         all_mod_members = engine.queries.get_symbol_members(
             SymbolMembersQuery(symbol="pkg.models", include_private=True)

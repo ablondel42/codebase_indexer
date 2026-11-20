@@ -1,7 +1,6 @@
 """Public re-exports for ``parsing.models``."""
 
 from parsing.models.extraction import (
-    AssignmentSpec,
     DeclarationPlacement,
     DeclarationWalkResult,
     ExtractionMetrics,
@@ -22,7 +21,6 @@ from parsing.models.linking import (
 from parsing.models.scan import ScannedFile, ScanOptions, ScanReport
 
 __all__ = [
-    "AssignmentSpec",
     "DeclarationPlacement",
     "DeclarationWalkResult",
     "ExtractionMetrics",

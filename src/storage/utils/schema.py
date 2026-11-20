@@ -1,4 +1,4 @@
-"""SQLAlchemy Core table, index, and ``JsonText`` definitions for SQLite schema v2."""
+"""SQLAlchemy Core table, index, and ``JsonText`` definitions for SQLite schema v4."""
 
 import json
 from typing import Any
@@ -24,7 +24,7 @@ from core.utils.logging import get_logger
 
 logger = get_logger("storage.utils.schema")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class JsonText(TypeDecorator[Any]):

@@ -1,19 +1,15 @@
-"""Recursive AST declaration walker eliminating extractor circular dependencies."""
+"""Recursive AST declaration walker without redundant structural edge emission."""
 
 import ast
 from collections.abc import Sequence
 
-from core.models.edge import Edge
-from core.models.enums import EdgeKind, SymbolKind, SymbolScope
-from core.models.file import FileRecord
+from core.models.enums import SymbolKind, SymbolScope
 from core.models.node import SymbolNode
 from core.utils.logging import get_logger
 from parsing.models.extraction import DeclarationWalkResult, ScopeTarget
-from parsing.services.assignments import AssignmentExtractor
 from parsing.services.callables import CallableExtractor
 from parsing.services.classes import ClassExtractor
 from parsing.services.scope import FileExtractionSession
-from parsing.utils.naming import make_structural_edge_id
 
 logger = get_logger("parsing.services.walker")
 
@@ -21,21 +17,17 @@ _AstMaps = tuple[dict[int, SymbolNode], dict[str, ast.ClassDef]]
 
 
 class DeclarationWalker:
-    """Traverses module, class, and function bodies to build symbols and structural edges."""
+    """Traverses module, class, and function bodies to build declaration ``SymbolNode``s."""
 
     def __init__(
         self,
         class_extractor: ClassExtractor | None = None,
         callable_extractor: CallableExtractor | None = None,
-        assignment_extractor: AssignmentExtractor | None = None,
     ) -> None:
-        """Initialize the walker with leaf extractors."""
+        """Initialize the walker with leaf class and callable extractors."""
         self._class_extractor = class_extractor if class_extractor is not None else ClassExtractor()
         self._callable_extractor = (
             callable_extractor if callable_extractor is not None else CallableExtractor()
-        )
-        self._assignment_extractor = (
-            assignment_extractor if assignment_extractor is not None else AssignmentExtractor()
         )
 
     def _walk_scope_body(
@@ -133,83 +125,13 @@ class DeclarationWalker:
         )
         return [callable_node, *nested]
 
-    @staticmethod
-    def _make_contains_edge(
-        repo_id: str,
-        from_id: str,
-        child_node: SymbolNode,
-        file_record: FileRecord,
-    ) -> Edge:
-        """Create a direct structural ``contains`` edge from ``from_id`` to ``child_node``."""
-        return Edge(
-            id=make_structural_edge_id(repo_id, EdgeKind.CONTAINS, from_id, child_node.id),
-            repo_id=repo_id,
-            kind=EdgeKind.CONTAINS,
-            from_id=from_id,
-            to_id=child_node.id,
-            source="python-ast",
-            confidence=1.0,
-            evidence_file_id=file_record.id,
-            evidence_uri=file_record.uri,
-            evidence_range=child_node.decl_range,
-            payload={},
-            last_indexed_at=file_record.last_indexed_at,
-        )
-
-    @staticmethod
-    def _make_scope_parent_edge(
-        repo_id: str,
-        from_id: str,
-        to_id: str,
-        file_record: FileRecord,
-    ) -> Edge:
-        """Create a ``scope_parent`` edge for function-local lexical nesting."""
-        return Edge(
-            id=make_structural_edge_id(repo_id, EdgeKind.SCOPE_PARENT, from_id, to_id),
-            repo_id=repo_id,
-            kind=EdgeKind.SCOPE_PARENT,
-            from_id=from_id,
-            to_id=to_id,
-            source="python-ast",
-            confidence=1.0,
-            evidence_file_id=file_record.id,
-            evidence_uri=file_record.uri,
-            evidence_range=None,
-            payload={},
-            last_indexed_at=file_record.last_indexed_at,
-        )
-
-    def _build_structural_edges(
-        self,
-        repo_id: str,
-        file_record: FileRecord,
-        nodes: Sequence[SymbolNode],
-    ) -> list[Edge]:
-        """Build direct ``contains`` and function-local ``scope_parent`` edges."""
-        structural_edges: list[Edge] = []
-        for node in nodes[1:]:
-            if node.parent_id is not None:
-                structural_edges.append(
-                    self._make_contains_edge(repo_id, node.parent_id, node, file_record)
-                )
-            if node.lexical_parent_id is not None:
-                structural_edges.append(
-                    self._make_scope_parent_edge(
-                        repo_id,
-                        node.id,
-                        node.lexical_parent_id,
-                        file_record,
-                    )
-                )
-        return structural_edges
-
     def walk(
         self,
         session: FileExtractionSession,
         module_node: SymbolNode,
         tree: ast.Module,
     ) -> DeclarationWalkResult:
-        """Walk ``tree`` in canonical order and build symbol nodes and structural edges."""
+        """Walk ``tree`` in canonical order and build symbol nodes plus AST-ID maps."""
         symbols_by_ast_id: dict[int, SymbolNode] = {id(tree): module_node}
         class_ast_by_symbol_id: dict[str, ast.ClassDef] = {}
         ast_maps: _AstMaps = (symbols_by_ast_id, class_ast_by_symbol_id)
@@ -233,28 +155,11 @@ class DeclarationWalker:
                     self._walk_callable_def(session, module_target, stmt, ast_maps)
                 )
 
-        all_class_nodes = [
-            node
-            for node in [*class_tree_nodes, *top_level_callables]
-            if node.kind == SymbolKind.CLASS
-        ]
-        assignment_nodes = self._assignment_extractor.extract_all(
-            session,
-            module_node.id,
-            tree,
-            class_nodes=all_class_nodes,
-            class_ast_by_symbol_id=class_ast_by_symbol_id,
-        )
-        nodes = [module_node, *class_tree_nodes, *top_level_callables, *assignment_nodes]
-        structural_edges = self._build_structural_edges(
-            session.repo_id,
-            session.file_record,
-            nodes,
-        )
+        nodes = [module_node, *class_tree_nodes, *top_level_callables]
+        all_class_nodes = [node for node in nodes[1:] if node.kind == SymbolKind.CLASS]
         return DeclarationWalkResult(
             nodes=nodes,
             class_nodes=all_class_nodes,
-            structural_edges=structural_edges,
             symbols_by_ast_id=symbols_by_ast_id,
             class_ast_by_symbol_id=class_ast_by_symbol_id,
         )

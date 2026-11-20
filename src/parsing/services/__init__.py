@@ -1,6 +1,5 @@
 """Public re-exports for ``parsing.services``."""
 
-from parsing.services.assignments import AssignmentExtractor
 from parsing.services.call_resolver import CallLinkResolver
 from parsing.services.callables import CallableExtractor
 from parsing.services.calls import CallExtractor
@@ -22,7 +21,6 @@ from parsing.services.symbol_index import RepoSymbolIndex
 from parsing.services.walker import DeclarationWalker
 
 __all__ = [
-    "AssignmentExtractor",
     "AstExtractionPipeline",
     "CallExtractor",
     "CallLinkResolver",

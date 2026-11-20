@@ -10,7 +10,6 @@ from core.models.edge import Edge
 from core.models.enums import SymbolKind, SymbolScope
 from core.models.file import FileRecord
 from core.models.node import SymbolNode
-from core.models.range import Range
 
 
 class ScopeFrame(FrozenModel):
@@ -64,21 +63,6 @@ class ParameterSpec(FrozenModel):
         return data
 
 
-class AssignmentSpec(FrozenModel):
-    """Extracted metadata for a single constant, class attribute, or type alias."""
-
-    kind: SymbolKind
-    name: str
-    signature: str
-    start_line: int
-    end_line: int
-    decl_range: Range | None = None
-    selection_range: Range | None = None
-    content_hash: str = ""
-    annotation: str | None = None
-    value_hint: str | None = None
-
-
 class ImportEntry(FrozenModel):
     """Single extracted import alias entry pairing its ``Edge`` with module/symbol names."""
 
@@ -88,21 +72,22 @@ class ImportEntry(FrozenModel):
 
 
 class ImportExtractionResult(FrozenModel):
-    """Aggregated ``imports`` edges and deduplicated module/symbol lists for one file."""
+    """Aggregated ``imports`` edges, module/symbol lists, and local bindings for one file."""
 
     edges: list[Edge]
     imported_modules: list[str]
     imported_symbols: list[str]
+    bound_names: frozenset[str] = Field(default_factory=frozenset)
+    has_star_import: bool = False
 
 
 class DeclarationWalkResult(FrozenModel):
-    """Ordered symbol declarations, extracted class nodes, and structural edges."""
+    """Ordered symbol declarations, extracted class nodes, and AST-ID lookup maps."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
     nodes: list[SymbolNode]
     class_nodes: list[SymbolNode]
-    structural_edges: list[Edge]
     symbols_by_ast_id: dict[int, SymbolNode] = Field(default_factory=dict)
     class_ast_by_symbol_id: dict[str, ast.ClassDef] = Field(default_factory=dict)
 
@@ -118,9 +103,6 @@ class ExtractionMetrics(FrozenModel):
     class_count: int = 0
     callable_count: int = 0
     method_count: int = 0
-    constant_count: int = 0
-    attribute_count: int = 0
-    type_alias_count: int = 0
     call_edge_count: int = 0
 
 
@@ -134,7 +116,6 @@ class FileGraphExtraction(FrozenModel):
 
 
 __all__ = [
-    "AssignmentSpec",
     "DeclarationPlacement",
     "DeclarationWalkResult",
     "ExtractionMetrics",

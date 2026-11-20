@@ -1,4 +1,4 @@
-"""SQLite schema v3 initializer and v1/v2-to-v3 migrator."""
+"""SQLite schema v4 initializer and v1/v2/v3-to-v4 migrator."""
 
 import sqlite3
 
@@ -11,6 +11,9 @@ from storage.utils.schema import SCHEMA_VERSION, metadata
 from storage.utils.sql_helpers import db_error_message
 
 logger = get_logger("storage.services.migrator")
+
+_LEGACY_VARIABLE_KINDS_SQL = "('constant', 'attribute', 'type_alias')"
+_LEGACY_STRUCTURAL_EDGES_SQL = "('contains', 'scope_parent')"
 
 _DROP_LEGACY_FTS_DDL: tuple[str, ...] = (
     "DROP TRIGGER IF EXISTS nodes_fts_ai",
@@ -161,7 +164,7 @@ class SchemaMigrator:
 
     @staticmethod
     def _create_v2_schema(conn: Connection) -> None:
-        """Create schema v2 core tables, FTS5 virtual table, and sync triggers.
+        """Create schema v4 core tables, FTS5 virtual tables, and sync triggers.
 
         Args:
             conn: Writable SQLAlchemy ``Connection``.
@@ -169,21 +172,43 @@ class SchemaMigrator:
         metadata.create_all(conn)
         for ddl in _CREATE_FTS_DDL:
             conn.exec_driver_sql(ddl)
+
+    @staticmethod
+    def _prune_legacy_v3_graph_rows(conn: Connection) -> None:
+        """Remove legacy variable nodes, their refresh state, and structural edges."""
+        legacy_node_subq = f"SELECT id FROM nodes WHERE kind IN {_LEGACY_VARIABLE_KINDS_SQL}"
+        statements = (
+            f"DELETE FROM reference_refresh WHERE target_symbol_id IN ({legacy_node_subq})",
+            f"DELETE FROM edges WHERE kind IN {_LEGACY_STRUCTURAL_EDGES_SQL}",
+            f"DELETE FROM edges WHERE from_id IN ({legacy_node_subq}) "
+            f"OR to_id IN ({legacy_node_subq})",
+            f"DELETE FROM nodes WHERE kind IN {_LEGACY_VARIABLE_KINDS_SQL}",
+        )
+        for stmt in statements:
+            conn.exec_driver_sql(stmt)
+
+    def _apply_upgrade(self, conn: Connection, current_version: int) -> None:
+        """Apply DDL creation and versioned legacy cleanup before setting user_version."""
+        if current_version < 2:
+            self._drop_legacy_v1_tables(conn)
+        self._create_v2_schema(conn)
+        if 2 <= current_version < SCHEMA_VERSION:
+            self._prune_legacy_v3_graph_rows(conn)
         conn.exec_driver_sql(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+        logger.info(
+            "Initialized SQLite schema v%d (previous user_version=%d)",
+            SCHEMA_VERSION,
+            current_version,
+        )
 
     def initialize(self, conn: Connection) -> None:
-        """Initialize or upgrade ``conn`` to SQLite schema v2.
+        """Initialize or upgrade ``conn`` to SQLite schema v4.
 
-        No-ops when ``PRAGMA user_version == 2``. Upgrades ``0 <= user_version < 2``
-        by dropping legacy v1 objects and creating v2 tables/FTS5 triggers. Rejects
-        mismatched read-only connections and unsupported future schema versions.
-
-        Args:
-            conn: Active SQLAlchemy ``Connection``.
-
-        Raises:
-            DatabaseError: If ``conn`` is read-only with a mismatched schema version,
-                uses an unsupported future ``user_version``, or DDL execution fails.
+        No-ops when ``PRAGMA user_version == 4``. Upgrades ``current_version < 2``
+        by dropping legacy v1 objects, upgrades ``2 <= current_version < 4``
+        non-destructively while pruning legacy variable nodes and structural edges,
+        and rejects mismatched read-only connections or unsupported future versions.
         """
         current_version = self.read_user_version(conn)
         if current_version == SCHEMA_VERSION:
@@ -213,15 +238,7 @@ class SchemaMigrator:
             )
 
         try:
-            if current_version < 2:
-                self._drop_legacy_v1_tables(conn)
-            self._create_v2_schema(conn)
-            conn.commit()
-            logger.info(
-                "Initialized SQLite schema v%d (previous user_version=%d)",
-                SCHEMA_VERSION,
-                current_version,
-            )
+            self._apply_upgrade(conn, current_version)
         except OperationalError as exc:
             if "readonly" in str(exc).lower():
                 logger.warning("Read-only operational error during schema migration: %s", exc)

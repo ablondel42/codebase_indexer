@@ -107,9 +107,6 @@ def test_repo_and_file_record_v2_fields() -> None:
 @pytest.mark.parametrize(
     "kind",
     [
-        SymbolKind.CONSTANT,
-        SymbolKind.ATTRIBUTE,
-        SymbolKind.TYPE_ALIAS,
         SymbolKind.MODULE,
         SymbolKind.CLASS,
         SymbolKind.FUNCTION,
@@ -168,37 +165,49 @@ def test_symbol_node_supports_all_v2_kinds_and_structured_ranges(kind: SymbolKin
 
 
 def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> None:
-    """SymbolNode forbids legacy *_json fields, invalid payload types, and name > 1024."""
+    """SymbolNode forbids legacy *_json fields, removed kinds, bad payload types, & long names."""
     with pytest.raises(PydanticValidationError):
         SymbolNode.model_validate({
-            "id": "node:project:test:constant:app.X",
+            "id": "node:project:test:function:app.fn",
             "repo_id": "project:test:1234abcd",
             "file_id": "file:project:test:1234abcd:app/service.py",
-            "kind": "constant",
-            "name": "X",
-            "qualified_name": "app.X",
+            "kind": "function",
+            "name": "fn",
+            "qualified_name": "app.fn",
             "uri": "file:///path/to/repo/app/service.py",
             "payload_json": '{"legacy": true}',
         })
 
     with pytest.raises(PydanticValidationError):
         SymbolNode.model_validate({
-            "id": "node:project:test:constant:app.X",
+            "id": "node:project:test:function:app.fn",
             "repo_id": "project:test:1234abcd",
             "file_id": "file:project:test:1234abcd:app/service.py",
-            "kind": "constant",
-            "name": "X",
-            "qualified_name": "app.X",
+            "kind": "function",
+            "name": "fn",
+            "qualified_name": "app.fn",
             "uri": "file:///path/to/repo/app/service.py",
             "payload": "not-a-dict",
         })
 
+    for removed_kind in ("constant", "attribute", "type_alias"):
+        with pytest.raises(PydanticValidationError):
+            SymbolNode.model_validate({
+                "id": f"node:project:test:{removed_kind}:app.X",
+                "repo_id": "project:test:1234abcd",
+                "file_id": "file:project:test:1234abcd:app/service.py",
+                "kind": removed_kind,
+                "name": "X",
+                "qualified_name": "app.X",
+                "uri": "file:///path/to/repo/app/service.py",
+            })
+
     with pytest.raises(PydanticValidationError):
         SymbolNode(
-            id="node:project:test:constant:app.X",
+            id="node:project:test:function:app.X",
             repo_id="project:test:1234abcd",
             file_id="file:project:test:1234abcd:app/service.py",
-            kind=SymbolKind.CONSTANT,
+            kind=SymbolKind.FUNCTION,
             name="X" * 1025,
             qualified_name="app.X",
             uri="file:///path/to/repo/app/service.py",
@@ -208,16 +217,14 @@ def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> No
 @pytest.mark.parametrize(
     "kind",
     [
-        EdgeKind.CONTAINS,
         EdgeKind.IMPORTS,
         EdgeKind.INHERITS,
-        EdgeKind.SCOPE_PARENT,
         EdgeKind.CALLS,
         EdgeKind.REFERENCES,
     ],
 )
 def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKind) -> None:
-    """Edge accepts normalized v2 kinds and structured evidence_range, rejecting bad inputs."""
+    """Edge accepts normalized kinds and structured evidence_range, rejecting bad inputs."""
     edge = Edge.model_validate({
         "id": f"edge:project:test:{kind.value}:a->b",
         "repo_id": "project:test:1234abcd",
@@ -245,14 +252,15 @@ def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKin
             "evidence_range_json": "[legacy",
         })
 
-    with pytest.raises(PydanticValidationError):
-        Edge.model_validate({
-            "id": "edge:legacy_kind",
-            "repo_id": "project:test:1234abcd",
-            "kind": "SCOPE_PARENT",
-            "from_id": "node:a",
-            "to_id": "node:b",
-        })
+    for removed_kind in ("contains", "scope_parent", "SCOPE_PARENT"):
+        with pytest.raises(PydanticValidationError):
+            Edge.model_validate({
+                "id": "edge:legacy_kind",
+                "repo_id": "project:test:1234abcd",
+                "kind": removed_kind,
+                "from_id": "node:a",
+                "to_id": "node:b",
+            })
 
 
 def test_symbol_context_and_risk_assessment_frozen_and_independent_defaults() -> None:

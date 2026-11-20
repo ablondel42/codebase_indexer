@@ -15,6 +15,8 @@ from context import (
 from core.models import (
     AST_DEPENDENCY_EDGE_KINDS,
     AppConfig,
+    Edge,
+    EdgeKind,
     IndexerError,
     PathSecurityError,
     SymbolKind,
@@ -251,3 +253,33 @@ def test_read_symbol_source_pagination_batch_staleness_and_path_security(
         stale_src = reader.read_symbol_snippet(uow, run_id)
         assert stale_src.is_fresh is False
         assert stale_src.stale_reason == "content_hash_mismatch"
+
+
+def test_build_symbol_context_filters_unresolved_placeholders(
+    indexed_context_repo: tuple[SqlUnitOfWorkFactory, Path, str],
+) -> None:
+    """Unresolved placeholder edges stay hidden from context edges while flagged in confidence."""
+    factory, _, repo_id = indexed_context_repo
+    helper_id = _find_node_id(factory, repo_id, "helper", SymbolKind.FUNCTION)
+    builder = SymbolContextBuilder()
+
+    with factory.open() as uow:
+        helper_node = uow.nodes.get_by_id(helper_id)
+        assert helper_node is not None
+        uow.edges.upsert(
+            Edge(
+                id="edge:unres:ext",
+                repo_id=repo_id,
+                kind=EdgeKind.CALLS,
+                from_id=helper_id,
+                to_id="unresolved_call:ext_fn",
+                confidence=0.7,
+                evidence_file_id=helper_node.file_id,
+                evidence_uri=helper_node.uri,
+            )
+        )
+        ctx = builder.build_context(uow, helper_id)
+
+    assert all(not e.to_id.startswith("unresolved_call:") for e in ctx.outgoing_edges)
+    assert ctx.structural_summary.relationship_counts.callees == 0
+    assert ctx.confidence.contains_placeholder_targets is True

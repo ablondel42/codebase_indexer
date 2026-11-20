@@ -45,15 +45,15 @@ def writable_conn(temp_db_path: Path) -> Iterator[Connection]:
         factory.close(conn)
 
 
-def test_schema_version_is_3(writable_conn: Connection) -> None:
-    """Initialized DB sets PRAGMA user_version == 3 and enables WAL + FK pragmas."""
+def test_schema_version_is_4(writable_conn: Connection) -> None:
+    """Initialized DB sets PRAGMA user_version == 4 and enables WAL + FK pragmas."""
     version = int(writable_conn.exec_driver_sql("PRAGMA user_version").scalar_one())
     fk = int(writable_conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one())
     journal = str(writable_conn.exec_driver_sql("PRAGMA journal_mode").scalar_one()).lower()
     busy_timeout = int(writable_conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one())
 
-    assert SCHEMA_VERSION == 3
-    assert version == 3
+    assert SCHEMA_VERSION == 4
+    assert version == 4
     assert fk == 1
     assert journal == "wal"
     assert busy_timeout == 5000
@@ -123,10 +123,10 @@ def test_initialize_database_creates_v3_tables_fts_and_triggers(
 def test_initialize_database_is_idempotent_and_rejects_future_version(
     writable_conn: Connection,
 ) -> None:
-    """SchemaMigrator.initialize is idempotent on v3 and rejects future versions."""
+    """SchemaMigrator.initialize is idempotent on v4 and rejects future versions."""
     migrator = SchemaMigrator()
     migrator.initialize(writable_conn)
-    assert migrator.read_user_version(writable_conn) == 3
+    assert migrator.read_user_version(writable_conn) == 4
 
     writable_conn.exec_driver_sql("PRAGMA user_version = 99")
     writable_conn.commit()
@@ -153,8 +153,8 @@ def test_foreign_key_constraints_enforced(temp_db_path: Path) -> None:
         uow.nodes.upsert(orphan_node)
 
 
-def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v3(temp_db_path: Path) -> None:
-    """Upgrading a v1 database cleanly replaces legacy tables with v3 schema."""
+def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v4(temp_db_path: Path) -> None:
+    """Upgrading a v1 database cleanly replaces legacy tables with v4 schema."""
     raw = sqlite3.connect(temp_db_path)
     try:
         raw.execute(
@@ -171,7 +171,7 @@ def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v3(temp_db_path: Path) -
     conn = factory.open_path(temp_db_path)
     try:
         migrator.initialize(conn)
-        assert migrator.read_user_version(conn) == 3
+        assert migrator.read_user_version(conn) == 4
         cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(files)").fetchall()}
         assert {"line_count", "is_test"}.issubset(cols)
     finally:
@@ -198,13 +198,79 @@ def test_v2_upgrade_is_non_destructive_and_adds_text_fts(temp_db_path: Path) -> 
         conn.commit()
 
         migrator.initialize(conn)
-        assert migrator.read_user_version(conn) == 3
+        assert migrator.read_user_version(conn) == 4
         kept = conn.exec_driver_sql("SELECT id FROM repos WHERE id = 'project:keep'").scalar_one()
         assert kept == "project:keep"
         tables = set(
             conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars()
         )
         assert {"text_files", "text_fts"}.issubset(tables)
+    finally:
+        factory.close(conn)
+
+
+def test_v3_upgrade_prunes_legacy_variable_nodes_and_structural_edges(
+    temp_db_path: Path,
+) -> None:
+    """Upgrading a v3 database prunes variable nodes, refresh rows, and structural edges."""
+    factory = ConnectionFactory()
+    migrator = SchemaMigrator()
+    conn = factory.open_path(temp_db_path)
+    try:
+        migrator.initialize(conn)
+        conn.exec_driver_sql(
+            "INSERT INTO repos (id, root_path, name, default_language, created_at) "
+            "VALUES ('project:v3', '/v3', 'v3', 'python', '2026-01-01T00:00:00Z')"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO files (id, repo_id, file_path, uri, module_path, language, "
+            "content_hash, size_bytes, last_modified_at) "
+            "VALUES ('file:v3:m.py', 'project:v3', 'm.py', 'file:///v3/m.py', 'm', 'python', "
+            "'sha256:f', 10, '2026-01-01T00:00:00Z')"
+        )
+        for nid, kind, name in (
+            ("node:fn", "function", "run_fn"),
+            ("node:callee", "function", "helper_fn"),
+            ("node:const", "constant", "LEGACY_CONST"),
+            ("node:attr", "attribute", "legacy_attr"),
+        ):
+            conn.exec_driver_sql(
+                f"INSERT INTO nodes (id, repo_id, file_id, language, kind, name, qualified_name, "
+                f"uri, content_hash, semantic_hash, source, confidence, payload_json) "
+                f"VALUES ('{nid}', 'project:v3', 'file:v3:m.py', 'python', '{kind}', '{name}', "
+                f"'m.{name}', 'file:///v3/m.py', 'sha256:c', 'sha256:s', 'python-ast', 1.0, '{{}}')"
+            )
+        conn.exec_driver_sql(
+            "INSERT INTO reference_refresh (target_symbol_id, available) VALUES ('node:attr', 1)"
+        )
+        for eid, kind, fid, tid in (
+            ("edge:contains", "contains", "node:fn", "node:callee"),
+            ("edge:scope", "scope_parent", "node:callee", "node:fn"),
+            ("edge:ref_attr", "references", "node:fn", "node:attr"),
+            ("edge:call", "calls", "node:fn", "node:callee"),
+        ):
+            conn.exec_driver_sql(
+                f"INSERT INTO edges (id, repo_id, kind, from_id, to_id, source, confidence, "
+                f"evidence_file_id, payload_json) VALUES ('{eid}', 'project:v3', '{kind}', "
+                f"'{fid}', '{tid}', 'python-ast', 0.9, 'file:v3:m.py', '{{}}')"
+            )
+        conn.exec_driver_sql("PRAGMA user_version = 3")
+        conn.commit()
+
+        migrator.initialize(conn)
+        assert migrator.read_user_version(conn) == 4
+
+        node_ids = set(conn.exec_driver_sql("SELECT id FROM nodes").scalars())
+        edge_ids = set(conn.exec_driver_sql("SELECT id FROM edges").scalars())
+        refresh_ids = set(
+            conn.exec_driver_sql("SELECT target_symbol_id FROM reference_refresh").scalars()
+        )
+        fts_names = set(conn.exec_driver_sql("SELECT name FROM nodes_fts").scalars())
+
+        assert node_ids == {"node:fn", "node:callee"}
+        assert edge_ids == {"edge:call"}
+        assert refresh_ids == set()
+        assert fts_names == {"run_fn", "helper_fn"}
     finally:
         factory.close(conn)
 
@@ -305,7 +371,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
     sql_conn = conn_factory.open_readonly_sql(temp_db_path)
     try:
         assert sql_conn.exec_driver_sql("SELECT 1 AS one").mappings().one()["one"] == 1
-        assert int(sql_conn.exec_driver_sql("PRAGMA user_version").scalar_one()) == 3
+        assert int(sql_conn.exec_driver_sql("PRAGMA user_version").scalar_one()) == 4
         with pytest.raises(SADatabaseError):
             sql_conn.exec_driver_sql("DELETE FROM repos")
     finally:

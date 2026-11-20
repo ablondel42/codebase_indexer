@@ -36,12 +36,12 @@ Innermost Core (Zero Sibling Dependencies)
    - Immutable Pydantic v2 entities (`FrozenModel` / `MutableModel` with `extra="forbid"`), structured `Range` and `payload` fields on `SymbolNode` and `Edge`, `IndexerError` exception hierarchy, `"indexer"` stderr-only logging, and Hexagonal `UnitOfWorkProtocol` / repository / LSP ports.
 
 2. **Persistence Adapter (`src/storage/`)**
-   - Isolates **100%** of SQLAlchemy 2.x Core and `sqlite3` operations (`SqlUnitOfWorkFactory`, `SqlUnitOfWork`, `ConnectionFactory`, `SchemaMigrator`) over SQLite schema `user_version = 2` (`repos`, `files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, and FTS5 `nodes_fts`).
+   - Isolates **100%** of SQLAlchemy 2.x Core and `sqlite3` operations (`SqlUnitOfWorkFactory`, `SqlUnitOfWork`, `ConnectionFactory`, `SchemaMigrator`) over SQLite schema `user_version = 4` (`repos`, `files`, `text_files`, `nodes`, `edges`, `index_runs`, `reference_refresh`, FTS5 `nodes_fts`, and trigram FTS5 `text_fts`).
    - Enforces WAL mode, `foreign_keys = ON`, `busy_timeout = 5000`, read-only `query_only = ON` sessions, and SQLite's `SELECT`-only authorizer for `cbi db sql`.
 
 3. **Static Analysis & Intra-Repo Linker (`src/parsing/`)**
    - `RepoScanner` walks repositories safely (`followlinks=False`, symlink/escape rejection, `ignored_dirs` globs, `--include-tests`, 2 MiB file cap).
-   - `AstExtractionPipeline` and `DeclarationWalker` extract modules, classes, functions/methods (sync & async, nested/local), constants, class attributes, and `TypeAlias`es, plus `contains`, `scope_parent`, `imports`, `inherits`, and `calls` edges.
+   - `AstExtractionPipeline` and `DeclarationWalker` extract modules, classes, and functions/methods (sync & async, nested/local), plus `imports`, `inherits`, and linkable `calls` edges.
    - `SymbolLinker` resolves imports (`__init__.py` re-exports, `src.` layouts), base-class hierarchies, and calls in memory, resetting broken targets back to unresolved placeholders when files are deleted or refactored.
 
 4. **Graph, Risk, Outlines & Snippets (`src/graph/`, `src/context/`)**

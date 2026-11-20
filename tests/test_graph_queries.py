@@ -174,24 +174,6 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
     ]
     edges = [
         Edge(
-            id="edge:contains",
-            repo_id=repo_id,
-            kind=EdgeKind.CONTAINS,
-            from_id="node:mod1",
-            to_id="node:cls1",
-            evidence_file_id=f1.id,
-            evidence_uri=f1.uri,
-        ),
-        Edge(
-            id="edge:scope",
-            repo_id=repo_id,
-            kind=EdgeKind.SCOPE_PARENT,
-            from_id="node:inner",
-            to_id="node:func_pct",
-            evidence_file_id=f1.id,
-            evidence_uri=f1.uri,
-        ),
-        Edge(
             id="edge:imp",
             repo_id=repo_id,
             kind=EdgeKind.IMPORTS,
@@ -298,8 +280,8 @@ def test_directed_edge_queries_subgraph_and_reference_report(
     ref_analyzer = ReferenceAnalyzer()
 
     with factory.open(read_only=True) as uow:
-        assert len(navigator.list_outgoing_edges(uow, "node:mod1")) == 1
-        assert len(navigator.list_incoming_edges(uow, "node:func_pct")) == 2  # scope_parent + calls
+        assert len(navigator.list_outgoing_edges(uow, "node:mod1")) == 0
+        assert len(navigator.list_incoming_edges(uow, "node:func_pct")) == 1
 
         assert len(navigator.list_incoming_edges(uow, "node:func_pct", EdgeKind.CALLS)) == 1
         assert len(navigator.list_outgoing_edges(uow, "node:sub", EdgeKind.CALLS)) == 1
@@ -314,7 +296,7 @@ def test_directed_edge_queries_subgraph_and_reference_report(
             SubgraphOptions(depth=1, max_nodes=10),
         )
         node_ids = {n.id for n in subgraph.nodes}
-        assert {"node:cls1", "node:mod1", "node:mod2", "node:sub"}.issubset(node_ids)
+        assert {"node:cls1", "node:mod2", "node:sub"}.issubset(node_ids)
         assert subgraph.truncated is False
 
         trunc_sub = navigator.build_subgraph(

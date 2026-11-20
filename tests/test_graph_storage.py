@@ -259,7 +259,7 @@ def test_edge_upsert_single_json_encoding_updates_and_file_delete(
         ])
 
         e1 = _edge("edge:1", EdgeKind.CALLS, "node:a", "unresolved:other.b")
-        e2 = _edge("edge:2", EdgeKind.SCOPE_PARENT, "node:b", "node:a", file_id=other_file.id)
+        e2 = _edge("edge:2", EdgeKind.IMPORTS, "node:b", "node:a", file_id=other_file.id)
         uow.edges.upsert(e1)
         uow.edges.upsert_many([e2])
 
@@ -275,7 +275,7 @@ def test_edge_upsert_single_json_encoding_updates_and_file_delete(
         assert len(uow.edges.list_for_repo("project:test:12345678")) == 2
         assert len(uow.edges.list_outgoing("node:a", EdgeKind.CALLS)) == 1
         assert len(uow.edges.list_incoming("node:b", EdgeKind.CALLS)) == 1
-        assert len(uow.edges.list_for_target_and_kinds("node:a", [EdgeKind.SCOPE_PARENT])) == 1
+        assert len(uow.edges.list_for_target_and_kinds("node:a", [EdgeKind.IMPORTS])) == 1
         assert len(uow.edges.list_for_file("file:project:test:12345678:test.py")) == 1
         assert (
             uow.edges.count_directed(
@@ -442,4 +442,4 @@ def test_repos_runs_refresh_and_diagnostics(
         assert status_report.schema_ok is True
         assert status_report.repo_count == 2
         assert len(uow.diagnostics.list_repo_summaries()) == 2
-        assert uow.diagnostics.get_table_list_report(uow_factory.db_path).user_version == 3
+        assert uow.diagnostics.get_table_list_report(uow_factory.db_path).user_version == 4

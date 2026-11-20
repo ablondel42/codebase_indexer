@@ -22,9 +22,6 @@ class SymbolKind(StrEnum):
     ASYNC_METHOD = "async_method"
     LOCAL_FUNCTION = "local_function"
     LOCAL_ASYNC_FUNCTION = "local_async_function"
-    CONSTANT = "constant"
-    ATTRIBUTE = "attribute"
-    TYPE_ALIAS = "type_alias"
 
 
 class SymbolScope(StrEnum):
@@ -38,10 +35,8 @@ class SymbolScope(StrEnum):
 class EdgeKind(StrEnum):
     """Canonical relationship kinds between symbol nodes."""
 
-    CONTAINS = "contains"
     IMPORTS = "imports"
     INHERITS = "inherits"
-    SCOPE_PARENT = "scope_parent"
     CALLS = "calls"
     REFERENCES = "references"
 
