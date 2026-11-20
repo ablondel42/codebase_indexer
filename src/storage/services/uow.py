@@ -25,6 +25,7 @@ from core.ports.repositories import (
     NodeRepositoryProtocol,
     ReferenceRefreshRepositoryProtocol,
     RepoRepositoryProtocol,
+    TextSearchRepositoryProtocol,
 )
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.logging import get_logger
@@ -38,6 +39,7 @@ from storage.services.nodes import SqlNodeRepository
 from storage.services.refresh import SqlReferenceRefreshRepository
 from storage.services.repos import SqlRepoRepository
 from storage.services.runs import SqlIndexRunRepository
+from storage.services.text_search import SqlTextSearchRepository
 from storage.utils.schema import nodes_table
 from storage.utils.sql_helpers import chunked_sequence, db_error_message
 
@@ -65,6 +67,7 @@ class SqlUnitOfWork:
         self._refresh = SqlReferenceRefreshRepository(conn)
         self._runs = SqlIndexRunRepository(conn)
         self._diagnostics = SqlDiagnosticsRepository(conn)
+        self._text_search = SqlTextSearchRepository(conn)
 
     @property
     def repos(self) -> RepoRepositoryProtocol:
@@ -100,6 +103,11 @@ class SqlUnitOfWork:
     def diagnostics(self) -> DiagnosticsRepositoryProtocol:
         """Repository port for database health and graph statistics."""
         return self._diagnostics
+
+    @property
+    def text_search(self) -> TextSearchRepositoryProtocol:
+        """Repository port for full-codebase UTF-8 ``text_files`` + trigram ``text_fts``."""
+        return self._text_search
 
     def __enter__(self) -> Self:
         """Enter the Unit of Work context.

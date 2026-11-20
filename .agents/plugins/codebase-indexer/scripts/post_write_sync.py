@@ -7,6 +7,7 @@ from typing import Any
 
 from core.models.config import AppConfig
 from core.models.exceptions import IndexerError
+from core.utils.text_files import is_ignored_text_rel_path
 from engine.services.facade import IndexerEngine
 from indexing.models.events import FileChangeEvent, FileEventType
 
@@ -26,7 +27,7 @@ def _parse_payload() -> dict[str, Any] | None:
 
 
 def _resolve_target_path(payload: dict[str, Any], raw_path: str) -> tuple[Path, str] | None:
-    """Resolve ``raw_path`` inside ``REPO_ROOT`` if it is a tracked Python file."""
+    """Resolve ``raw_path`` inside ``REPO_ROOT`` if it is an indexable repo file."""
     path_obj = Path(raw_path)
     if not path_obj.is_absolute():
         base_dir = payload.get("cwd")
@@ -40,15 +41,15 @@ def _resolve_target_path(payload: dict[str, Any], raw_path: str) -> tuple[Path, 
         sys.stderr.write(f"post_write_sync: skipping non-repo path {raw_path!r}: {exc}\n")
         return None
 
-    if resolved.suffix != ".py" or not resolved.is_file():
+    if not resolved.is_file() or is_ignored_text_rel_path(repo_rel):
         return None
-    in_src = repo_rel.startswith("src/")
-    in_tests = repo_rel.startswith("tests/") and not repo_rel.startswith("tests/fixtures/")
-    return (resolved, repo_rel) if (in_src or in_tests) else None
+    if repo_rel.startswith("tests/fixtures/"):
+        return None
+    return resolved, repo_rel
 
 
-def _extract_repo_python_path(payload: dict[str, Any]) -> tuple[Path, str] | None:
-    """Return ``(resolved_path, repo_relative_posix)`` if target is an indexed repo ``.py``."""
+def _extract_repo_target(payload: dict[str, Any]) -> tuple[Path, str] | None:
+    """Return ``(resolved_path, repo_relative_posix)`` if target is an indexable repo file."""
     tool_call = payload.get("toolCall")
     if not isinstance(tool_call, dict):
         return None
@@ -73,12 +74,12 @@ def _sync_file(db_path: Path, resolved: Path, repo_rel: str) -> None:
 
 
 def main() -> int:
-    """Incrementally reindex the modified repository Python file and emit ``{}``."""
+    """Incrementally reindex the modified repository file and emit ``{}``."""
     try:
         payload = _parse_payload()
         db_path = REPO_ROOT / "codebase_indexer.db"
         target_info = (
-            _extract_repo_python_path(payload)
+            _extract_repo_target(payload)
             if payload is not None and db_path.is_file()
             else None
         )

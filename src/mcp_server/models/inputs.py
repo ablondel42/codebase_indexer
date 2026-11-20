@@ -1,4 +1,4 @@
-"""Strict Pydantic v2 input schemas for all 8 token-lean MCP tools."""
+"""Strict Pydantic v2 input schemas for all 9 token-lean MCP tools."""
 
 from pathlib import Path
 from typing import Any
@@ -360,6 +360,52 @@ class AnalyzeRiskInput(FrozenModel):
         return _validate_optional_non_empty(value, "db_path")
 
 
+class SearchCodeInput(FrozenModel):
+    """Validated input parameters for the ``search_code`` MCP tool."""
+
+    query: str = Field(..., min_length=1)
+    repo_id: str | None = None
+    regex: bool = False
+    case_sensitive: bool = False
+    path_prefix: str | None = None
+    language: str | None = None
+    include_tests: bool = True
+    context_lines: int = Field(default=0, ge=0, le=5)
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    db_path: str | None = None
+
+    @field_validator("db_path", mode="before")
+    @classmethod
+    def _coerce_db_path(cls, value: Any) -> Any:
+        """Convert ``Path`` objects to ``str`` before string validation."""
+        return _coerce_db_path_input(value)
+
+    @field_validator("repo_id")
+    @classmethod
+    def _validate_repo_id(cls, value: str | None) -> str | None:
+        """Reject whitespace-only ``repo_id`` values."""
+        return _validate_optional_non_empty(value, "repo_id")
+
+    @field_validator("path_prefix")
+    @classmethod
+    def _validate_path_prefix(cls, value: str | None) -> str | None:
+        """Reject whitespace-only ``path_prefix`` values."""
+        return _validate_optional_non_empty(value, "path_prefix")
+
+    @field_validator("language")
+    @classmethod
+    def _validate_language(cls, value: str | None) -> str | None:
+        """Reject whitespace-only ``language`` values."""
+        return _validate_optional_non_empty(value, "language")
+
+    @field_validator("db_path")
+    @classmethod
+    def _validate_db_path(cls, value: str | None) -> str | None:
+        """Reject whitespace-only ``db_path`` values."""
+        return _validate_optional_non_empty(value, "db_path")
+
+
 __all__ = [
     "AnalyzeRiskInput",
     "GetFileOutlineInput",
@@ -368,5 +414,6 @@ __all__ = [
     "GetSymbolReferencesInput",
     "GetSymbolSourceInput",
     "ListFilesInput",
+    "SearchCodeInput",
     "SearchSymbolsInput",
 ]

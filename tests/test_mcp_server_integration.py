@@ -192,6 +192,7 @@ def test_cli_mcp_call_all_8_tools_and_missing_db_safety(
         ("list_files", "{}"),
         ("get_file_outline", '{"file_path": "alpha.py"}'),
         ("search_symbols", '{"query": "compute"}'),
+        ("search_code", '{"query": "compute"}'),
         ("get_symbol_source", '{"symbol": "alpha.compute"}'),
         ("get_symbol_context", '{"symbol": "alpha.compute"}'),
         ("get_symbol_references", '{"symbol": "alpha.compute"}'),

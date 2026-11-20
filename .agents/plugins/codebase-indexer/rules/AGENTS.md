@@ -1,8 +1,9 @@
 # Workspace Token-Saving Protocol (`codebase-indexer`)
 
 ## 1. Task-Aware Exploration: `codebase-indexer_mcp` vs. `read_file`
-Use `call_mcp_tool(ServerName="codebase-indexer_mcp", ToolName=..., Arguments={...})` directly (no need to inspect MCP schema JSON files first) whenever doing **structural navigation, symbol lookup, call/reference tracing, or change-risk analysis** (use whichever `codebase-indexer*` name appears in `<mcp_servers>`):
+Use `call_mcp_tool(ServerName="codebase-indexer_mcp", ToolName=..., Arguments={...})` directly (no need to inspect MCP schema JSON files first) whenever doing **full-codebase text/regex search, structural navigation, symbol lookup, call/reference tracing, or change-risk analysis** (use whichever `codebase-indexer*` name appears in `<mcp_servers>`):
 
+- `search_code(query, regex=false, case_sensitive=false, path_prefix?, language?, include_tests=true, context_lines=0, limit=50, offset=0)` — hybrid FTS5 trigram + live-disk search across **all UTF-8 repository text files** (`.py` bodies/strings/comments, `.md`, `.toml`, `.json`, `.yaml`, `.sh`, `cbi`, `.agents/**`, `.github/**`), returning global `file_counts` across all matching files + paginated `matches` with enclosing Python symbol spans
 - `get_repo_overview(repo_id?)` — repo stats and top directories
 - `list_files(path_prefix?, include_tests=false, limit=100, offset=0)` — indexed `.py` paths
 - `get_file_outline(file_path, include_private=true, max_depth=3)` — imports + hierarchical symbol skeleton
@@ -12,9 +13,9 @@ Use `call_mcp_tool(ServerName="codebase-indexer_mcp", ToolName=..., Arguments={.
 - `get_symbol_references(symbol, direction="incoming", refresh_lsp=false, limit=30, offset=0)` — `direction`: `incoming|outgoing|both`
 - `analyze_risk(symbols)` — blast radius & risk score for `1..50` symbols
 
-**Avoid graph blind spots (`read_file` & text search)**: `nodes_fts` and outlines index symbol names, signatures, and docstrings—not function bodies, inline string literals, comments, SQL/regex strings, or module-level dict/constant values. Use `read_file` or targeted `rg` freely whenever a task depends on body literals/comments, module-level data structures, multi-region edits in one file, full-module reviews, files under 100 lines, or non-Python files. On large `.py` files when target line spans are known, pass `StartLine` and `EndLine` to `read_file`.
+**When to use `read_file` (`StartLine..EndLine`)**: Prefer `search_code` + `get_symbol_source` for codebase discovery, rename sweeps, config/literal/comment searches, and pinpointing line spans. Use `read_file` with tight `StartLine` and `EndLine` bounds right before editing exact file slices, for full-module deep reviews, or for external files outside the indexed repository.
 
-**Plan hand-offs**: When writing an implementation or Orchestrator execution plan after MCP exploration, include the target `file_path` and `StartLine..EndLine` spans from MCP so execution reads tight slices instead of whole files blind.
+**Plan hand-offs**: When writing an implementation or Orchestrator execution plan after MCP exploration, include the target `file_path` and `StartLine..EndLine` spans from `search_code` / `get_symbol_source` so execution reads tight slices instead of whole files blind.
 
 ## 2. Manual-First Test & Verification Policy
 - Do **not** run `pytest` or `./cbi tests` autonomously after routine edits unless explicitly asked by the user or required by an approved implementation plan; tell the user they can run `./cbi check` (or `./cbi tests`) once finished.

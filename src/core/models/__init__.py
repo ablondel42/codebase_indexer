@@ -73,12 +73,27 @@ from core.models.node import (
 from core.models.range import LineSpan, Position, Range
 from core.models.repo import RepoRecord
 from core.models.runs import IndexRunMetrics, IndexRunRecord, ReferenceRefreshState
+from core.models.search import (
+    CodeMatchItem,
+    CodeSearchQuery,
+    CodeSearchReport,
+    CodeSearchStats,
+    FileMatchCount,
+    TextCandidateQuery,
+    TextDocumentMeta,
+    TextDocumentRecord,
+    TextFileStat,
+)
 
 __all__ = [
     "APP_VERSION",
     "AST_DEPENDENCY_EDGE_KINDS",
     "AppConfig",
     "CALLABLE_KINDS",
+    "CodeMatchItem",
+    "CodeSearchQuery",
+    "CodeSearchReport",
+    "CodeSearchStats",
     "DEFAULT_CONFIDENCE",
     "DEFAULT_IGNORED_DIRS",
     "DEFAULT_LANGUAGE",
@@ -91,6 +106,7 @@ __all__ = [
     "EdgeBucketStats",
     "EdgeKind",
     "EdgeTargetUpdate",
+    "FileMatchCount",
     "FilePageQuery",
     "FilePageResult",
     "FileRecord",
@@ -139,6 +155,10 @@ __all__ = [
     "SymbolSummary",
     "TableCountEntry",
     "TableListReport",
+    "TextCandidateQuery",
+    "TextDocumentMeta",
+    "TextDocumentRecord",
+    "TextFileStat",
     "TrackedFileSummary",
     "ValidationError",
     "VerifiedFileText",

@@ -4,6 +4,7 @@ import argparse
 
 from cli.utils.output import (
     emit_json,
+    format_code_search_for_cli,
     format_files_for_cli,
     format_outline_for_cli,
     format_source_for_cli,
@@ -14,6 +15,7 @@ from cli.utils.output import (
 )
 from core.models.enums import SymbolKind
 from core.models.exceptions import ValidationError
+from core.models.search import CodeSearchQuery
 from core.utils.logging import get_logger
 from engine.models.queries import (
     ContextQuery,
@@ -252,6 +254,37 @@ class SymbolCliCommands:
             )
         )
         emit_json(format_source_for_cli(snippet))
+        return 0
+
+    def run_code_search(self, args: argparse.Namespace) -> int:
+        """Search all UTF-8 repository text files via ``cbi search``."""
+        db_path = resolve_cli_db_path(args, self._engine.db_path)
+        limit = int(getattr(args, "limit", 50))
+        offset = int(getattr(args, "offset", 0))
+        ctx = int(getattr(args, "context_lines", 0))
+        if limit < 1 or limit > 200:
+            raise ValidationError("--limit must be between 1 and 200", context={"limit": limit})
+        if offset < 0:
+            raise ValidationError("--offset must be >= 0", context={"offset": offset})
+        if ctx < 0 or ctx > 5:
+            raise ValidationError("--context must be between 0 and 5", context={"context": ctx})
+
+        report = self._engine.for_db(db_path).queries.search_code(
+            CodeSearchQuery(
+                query=args.query,
+                repo=getattr(args, "repo", None),
+                regex=bool(getattr(args, "regex", False)),
+                case_sensitive=bool(getattr(args, "case_sensitive", False)),
+                path_prefix=getattr(args, "path_prefix", None),
+                language=getattr(args, "language", None),
+                include_tests=not bool(getattr(args, "no_tests", False)),
+                verify_disk=True,
+                context_lines=ctx,
+                limit=limit,
+                offset=offset,
+            )
+        )
+        emit_json(format_code_search_for_cli(report))
         return 0
 
 

@@ -579,6 +579,39 @@ class CliParserBuilder:
         mcp_call_parser.add_argument("--repo", type=str, default=None, help="Repository selector")
         self._bind_handler(mcp_call_parser, "mcp-call")
 
+    def _add_search_parser(
+        self,
+        subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+        sub_common: argparse.ArgumentParser,
+    ) -> None:
+        """Register top-level ``cbi search`` full-codebase text/regex search subcommand."""
+        p = subparsers.add_parser(
+            "search",
+            parents=[sub_common],
+            help="Search all UTF-8 repository text files (literal or regex) with trigram pruning",
+        )
+        p.add_argument("query", type=str, help="Literal substring or Python regex pattern")
+        p.add_argument("--repo", type=str, default=None, help="Repository ID, name, or root path")
+        p.add_argument("--regex", action="store_true", default=False, help="Treat query as regex")
+        p.add_argument(
+            "--case-sensitive",
+            action="store_true",
+            default=False,
+            help="Match case-sensitively (default: case-insensitive)",
+        )
+        p.add_argument("--path", dest="path_prefix", type=str, default=None, help="Path prefix")
+        p.add_argument("--lang", dest="language", type=str, default=None, help="Language filter")
+        p.add_argument(
+            "--no-tests",
+            action="store_true",
+            default=False,
+            help="Exclude test files from search results",
+        )
+        p.add_argument("-C", "--context", dest="context_lines", type=int, default=0, help="Context")
+        p.add_argument("--limit", type=int, default=50, help="Maximum matches per page (1..200)")
+        p.add_argument("--offset", type=int, default=0, help="Match offset (>= 0)")
+        self._bind_handler(p, "search")
+
     def build(self) -> argparse.ArgumentParser:
         """Construct the complete ``cbi`` CLI ``ArgumentParser``.
 
@@ -618,6 +651,7 @@ class CliParserBuilder:
         self._add_index_parser(subparsers, sub_common)
         self._add_db_parser(subparsers, sub_common)
         self._add_symbols_parser(subparsers, sub_common)
+        self._add_search_parser(subparsers, sub_common)
         self._add_file_parsers(subparsers, sub_common)
         self._add_analysis_parsers(subparsers, sub_common)
         self._add_daemon_parsers(subparsers, sub_common)

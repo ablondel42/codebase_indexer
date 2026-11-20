@@ -441,4 +441,4 @@ def test_repos_runs_refresh_and_diagnostics(
         assert status_report.schema_ok is True
         assert status_report.repo_count == 2
         assert len(uow.diagnostics.list_repo_summaries()) == 2
-        assert uow.diagnostics.get_table_list_report(uow_factory.db_path).user_version == 2
+        assert uow.diagnostics.get_table_list_report(uow_factory.db_path).user_version == 3

@@ -1,4 +1,4 @@
-"""SQLite schema v2 initializer and v1-to-v2 migrator."""
+"""SQLite schema v3 initializer and v1/v2-to-v3 migrator."""
 
 import sqlite3
 
@@ -17,6 +17,10 @@ _DROP_LEGACY_FTS_DDL: tuple[str, ...] = (
     "DROP TRIGGER IF EXISTS nodes_fts_au",
     "DROP TRIGGER IF EXISTS nodes_fts_ad",
     "DROP TABLE IF EXISTS nodes_fts",
+    "DROP TRIGGER IF EXISTS text_files_ai",
+    "DROP TRIGGER IF EXISTS text_files_au",
+    "DROP TRIGGER IF EXISTS text_files_ad",
+    "DROP TABLE IF EXISTS text_fts",
 )
 
 _CREATE_FTS_DDL: tuple[str, ...] = (
@@ -63,6 +67,36 @@ _CREATE_FTS_DDL: tuple[str, ...] = (
     """
     CREATE TRIGGER IF NOT EXISTS nodes_fts_ad AFTER DELETE ON nodes BEGIN
         DELETE FROM nodes_fts WHERE rowid = old.rowid;
+    END
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS text_fts USING fts5(
+        repo_id UNINDEXED,
+        file_path UNINDEXED,
+        content,
+        content='text_files',
+        content_rowid='rowid',
+        tokenize='trigram'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS text_files_ai AFTER INSERT ON text_files BEGIN
+        INSERT INTO text_fts(rowid, repo_id, file_path, content)
+        VALUES (new.rowid, new.repo_id, new.file_path, new.content);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS text_files_ad AFTER DELETE ON text_files BEGIN
+        INSERT INTO text_fts(text_fts, rowid, repo_id, file_path, content)
+        VALUES ('delete', old.rowid, old.repo_id, old.file_path, old.content);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS text_files_au AFTER UPDATE ON text_files BEGIN
+        INSERT INTO text_fts(text_fts, rowid, repo_id, file_path, content)
+        VALUES ('delete', old.rowid, old.repo_id, old.file_path, old.content);
+        INSERT INTO text_fts(rowid, repo_id, file_path, content)
+        VALUES (new.rowid, new.repo_id, new.file_path, new.content);
     END
     """,
 )
@@ -179,7 +213,8 @@ class SchemaMigrator:
             )
 
         try:
-            self._drop_legacy_v1_tables(conn)
+            if current_version < 2:
+                self._drop_legacy_v1_tables(conn)
             self._create_v2_schema(conn)
             conn.commit()
             logger.info(

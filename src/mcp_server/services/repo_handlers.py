@@ -2,6 +2,7 @@
 
 import asyncio
 
+from core.models.search import CodeSearchQuery
 from core.utils.logging import get_logger
 from engine.models.queries import ListFilesQuery, OutlineQuery, SearchSymbolsQuery
 from engine.services.facade import IndexerEngine
@@ -9,9 +10,11 @@ from mcp_server.models.inputs import (
     GetFileOutlineInput,
     GetRepoOverviewInput,
     ListFilesInput,
+    SearchCodeInput,
     SearchSymbolsInput,
 )
 from mcp_server.utils.compact import (
+    adapt_code_search,
     adapt_file_list,
     adapt_outline,
     adapt_repo_overview,
@@ -110,6 +113,26 @@ class RepoMcpHandlers:
         )
         return serialize_mcp_json(success_result(adapt_symbol_search(page)))
 
+    def _run_search_code(self, inp: SearchCodeInput) -> str:
+        """Execute ``search_code`` synchronously on a worker thread."""
+        scoped = self._engine.for_db(inp.db_path)
+        report = scoped.queries.search_code(
+            CodeSearchQuery(
+                query=inp.query,
+                repo=inp.repo_id,
+                regex=inp.regex,
+                case_sensitive=inp.case_sensitive,
+                path_prefix=inp.path_prefix,
+                language=inp.language,
+                include_tests=inp.include_tests,
+                verify_disk=True,
+                context_lines=inp.context_lines,
+                limit=inp.limit,
+                offset=inp.offset,
+            )
+        )
+        return serialize_mcp_json(success_result(adapt_code_search(report)))
+
     async def get_repo_overview(self, inp: GetRepoOverviewInput) -> str:
         """Return compact repository metadata, graph statistics, and top directories.
 
@@ -157,6 +180,11 @@ class RepoMcpHandlers:
         """
         logger.debug("Executing MCP search_symbols (query=%r)", inp.query)
         return await asyncio.to_thread(self._run_search_symbols, inp)
+
+    async def search_code(self, inp: SearchCodeInput) -> str:
+        """Search all UTF-8 repository text files with trigram pruning and live-disk overlay."""
+        logger.debug("Executing MCP search_code (query=%r, regex=%s)", inp.query, inp.regex)
+        return await asyncio.to_thread(self._run_search_code, inp)
 
 
 __all__ = [

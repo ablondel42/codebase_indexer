@@ -19,6 +19,7 @@ KNOWN_COMMANDS: frozenset[str] = frozenset(
         "files",
         "outline",
         "symbols",
+        "search",
         "source",
         "refs",
         "risk",
@@ -30,7 +31,7 @@ KNOWN_COMMANDS: frozenset[str] = frozenset(
 )
 
 _REPO_SCOPED_ROOT: frozenset[str] = frozenset(
-    {"files", "outline", "source", "refs", "risk", "mcp-call"}
+    {"files", "outline", "search", "source", "refs", "risk", "mcp-call"}
 )
 _REPO_SCOPED_SUBS: frozenset[tuple[str, str]] = frozenset(
     {
@@ -47,6 +48,7 @@ _PRIMARY_ARG_BY_TOOL: Mapping[str, str] = MappingProxyType(
         "list_files": "path_prefix",
         "get_file_outline": "file_path",
         "search_symbols": "query",
+        "search_code": "query",
         "get_symbol_source": "symbol",
         "get_symbol_context": "symbol",
         "get_symbol_references": "symbol",

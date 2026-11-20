@@ -7,6 +7,7 @@ from context.models.outline import FileOutline
 from context.models.source import SnippetOptions, SymbolSnippet
 from context.models.symbol_context import ContextBuildOptions, SymbolContext
 from context.services.builder import SymbolContextBuilder
+from context.services.code_search import CodeSearchService
 from context.services.outline import OutlineBuilder
 from context.services.source import SourceReader
 from core.models.config import AppConfig
@@ -19,6 +20,7 @@ from core.models.file import (
     TrackedFileSummary,
 )
 from core.models.node import SymbolPageQuery, SymbolSearchQuery, SymbolSummary
+from core.models.search import CodeSearchQuery, CodeSearchReport
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 from core.utils.logging import get_logger
 from engine.models.queries import (
@@ -67,6 +69,7 @@ _ALLOWED_COLLABORATOR_KEYS: frozenset[str] = frozenset({
     "source_reader",
     "outline_builder",
     "context_builder",
+    "code_search",
 })
 
 
@@ -130,7 +133,14 @@ class QueryEngine:
 
         risk_analyzer: RiskAnalyzer | None = collaborators.get("risk_analyzer")
         self._risk_analyzer = risk_analyzer if risk_analyzer is not None else RiskAnalyzer(config)
+        self._bind_context_services(config, collaborators)
 
+    def _bind_context_services(
+        self,
+        config: AppConfig,
+        collaborators: dict[str, Any],
+    ) -> None:
+        """Wire source, outline, symbol-context, and code-search services onto ``self``."""
         reader: SourceReader | None = collaborators.get("source_reader")
         self._source_reader = reader if reader is not None else SourceReader(config)
 
@@ -152,6 +162,9 @@ class QueryEngine:
                 reference_analyzer=self._reference_analyzer,
             )
         )
+
+        search_svc: CodeSearchService | None = collaborators.get("code_search")
+        self._code_search = search_svc if search_svc is not None else CodeSearchService(config)
 
     @staticmethod
     def _record_to_file_summary(
@@ -438,6 +451,42 @@ class QueryEngine:
                 count=len(items),
                 symbols=items,
             )
+
+    def search_code(self, query: CodeSearchQuery) -> CodeSearchReport:
+        """Search all UTF-8 repository text files via FTS5 trigram pruning + live-disk overlay.
+
+        Args:
+            query: ``CodeSearchQuery`` specifying pattern, regex/case flags, path/language
+                filters, context lines, and pagination.
+
+        Returns:
+            Populated ``CodeSearchReport`` with global ``file_counts`` and paginated matches.
+
+        Raises:
+            DatabaseNotFoundError: If the database file does not exist.
+            ValidationError: If ``query.query`` is invalid regex when ``regex=True``.
+            DatabaseError: If repository resolution or text search queries fail.
+        """
+        with self._uow_factory.open(read_only=True, must_exist=True, initialize=True) as uow:
+            repo_id = uow.repos.resolve_id(query.repo)
+            repo_record = uow.repos.get_by_id(repo_id)
+            if repo_record is None:
+                raise DatabaseError(
+                    f"Repository not found: {repo_id}",
+                    error_code="repo_not_found",
+                    context={"repo_id": repo_id},
+                )
+            normalized_prefix = (
+                relativize_if_under_root(query.path_prefix, repo_record.root_path)
+                if query.path_prefix is not None
+                else None
+            )
+            effective_query = (
+                query.model_copy(update={"path_prefix": normalized_prefix})
+                if normalized_prefix != query.path_prefix
+                else query
+            )
+            return self._code_search.search(uow, repo_record, effective_query)
 
     def list_symbols(self, query: ListSymbolsQuery) -> SymbolListPage:
         """List repository symbols with optional ``kind``/``file_path`` filters and pagination.

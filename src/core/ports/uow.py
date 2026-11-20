@@ -18,6 +18,7 @@ from core.ports.repositories import (
     NodeRepositoryProtocol,
     ReferenceRefreshRepositoryProtocol,
     RepoRepositoryProtocol,
+    TextSearchRepositoryProtocol,
 )
 
 
@@ -58,6 +59,11 @@ class UnitOfWorkProtocol(Protocol):
     @property
     def diagnostics(self) -> DiagnosticsRepositoryProtocol:
         """Repository port for database health and graph statistics."""
+        ...
+
+    @property
+    def text_search(self) -> TextSearchRepositoryProtocol:
+        """Repository port for full-codebase UTF-8 ``text_files`` + trigram ``text_fts``."""
         ...
 
     def __enter__(self) -> Self:

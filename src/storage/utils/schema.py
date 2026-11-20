@@ -23,7 +23,7 @@ from core.utils.logging import get_logger
 
 logger = get_logger("storage.utils.schema")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class JsonText(TypeDecorator[Any]):
@@ -195,6 +195,28 @@ reference_refresh_table = Table(
     Column("error_code", Text, nullable=True),
 )
 
+text_files_table = Table(
+    "text_files",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("repo_id", Text, ForeignKey("repos.id", ondelete="CASCADE"), nullable=False),
+    Column("file_path", Text, nullable=False),
+    Column("language", Text, nullable=False, default="text", server_default=text("'text'")),
+    Column("content_hash", Text, nullable=False),
+    Column("size_bytes", Integer, nullable=False),
+    Column("line_count", Integer, nullable=False, default=0, server_default=text("0")),
+    Column("mtime_ns", Integer, nullable=False, default=0, server_default=text("0")),
+    Column(
+        "is_test",
+        Boolean(create_constraint=False),
+        nullable=False,
+        default=False,
+        server_default=text("0"),
+    ),
+    Column("content", Text, nullable=False),
+    UniqueConstraint("repo_id", "file_path", name="uq_text_files_repo_path"),
+)
+
 Index("idx_files_repo_id", files_table.c.repo_id)
 Index("idx_files_uri", files_table.c.uri)
 
@@ -220,8 +242,10 @@ Index("idx_edges_evfile_kind", edges_table.c.evidence_file_id, edges_table.c.kin
 Index("idx_index_runs_repo_id", index_runs_table.c.repo_id)
 Index("idx_index_runs_status", index_runs_table.c.status)
 Index("idx_reference_refresh_available", reference_refresh_table.c.available)
+Index("idx_text_files_repo_id", text_files_table.c.repo_id)
+Index("idx_text_files_repo_lang", text_files_table.c.repo_id, text_files_table.c.language)
 
-# Unmanaged FTS5 virtual table descriptor for SQLAlchemy Core SELECT/JOIN queries
+# Unmanaged FTS5 virtual table descriptors for SQLAlchemy Core SELECT/JOIN queries
 nodes_fts_table = Table(
     "nodes_fts",
     _fts_metadata,
@@ -232,4 +256,13 @@ nodes_fts_table = Table(
     Column("qualified_name", Text),
     Column("signature", Text),
     Column("doc_summary", Text),
+)
+
+text_fts_table = Table(
+    "text_fts",
+    _fts_metadata,
+    Column("rowid", Integer),
+    Column("repo_id", Text),
+    Column("file_path", Text),
+    Column("content", Text),
 )

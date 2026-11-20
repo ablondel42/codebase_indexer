@@ -8,10 +8,12 @@ from core.models.exceptions import ParseError, PathSecurityError
 from core.models.file import FileRecord
 from core.models.repo import RepoRecord
 from core.models.runs import IndexRunMetrics
+from core.models.search import TextDocumentRecord
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 from core.utils.logging import get_logger
 from core.utils.pathing import normalize_repo_root
+from core.utils.text_files import read_text_document, walk_repo_text_stats
 from core.utils.timestamps import utc_now_iso
 from indexing.models.results import (
     BatchExtractionSummary,
@@ -207,6 +209,54 @@ class BatchIndexer:
         uow.commit()
         return pruned_count, link_report
 
+    def _sync_text_corpus(
+        self,
+        uow: UnitOfWorkProtocol,
+        repo_id: str,
+        repo_root: Path,
+        *,
+        force: bool,
+    ) -> None:
+        """Hash-diff and synchronize all UTF-8 repository text documents into ``text_files``."""
+        disk_stats = walk_repo_text_stats(
+            repo_root,
+            max_file_size_bytes=self._config.max_file_size_bytes,
+            test_dir_names=self._config.test_dir_names,
+        )
+        existing_by_path = {
+            meta.file_path: meta for meta in uow.text_search.list_metadata_for_repo(repo_id)
+        }
+        keep_ids: set[str] = set()
+        to_upsert: list[TextDocumentRecord] = []
+
+        for st in disk_stats:
+            prev = existing_by_path.get(st.file_path)
+            if (
+                not force
+                and prev is not None
+                and prev.mtime_ns > 0
+                and prev.mtime_ns == st.mtime_ns
+                and prev.size_bytes == st.size_bytes
+            ):
+                keep_ids.add(prev.id)
+                continue
+
+            doc = read_text_document(
+                repo_id,
+                repo_root,
+                st.file_path,
+                max_file_size_bytes=self._config.max_file_size_bytes,
+                test_dir_names=self._config.test_dir_names,
+            )
+            if doc is None:
+                continue
+            keep_ids.add(doc.id)
+            if force or prev is None or prev.content_hash != doc.content_hash:
+                to_upsert.append(doc)
+
+        uow.text_search.upsert_many(to_upsert)
+        uow.text_search.prune_not_in_ids(repo_id, keep_ids)
+
     def _execute_audited_run(
         self,
         uow: UnitOfWorkProtocol,
@@ -244,6 +294,7 @@ class BatchIndexer:
                 force=force,
             )
             batch = self._extract_changed_files(repo_root, to_extract)
+            self._sync_text_corpus(uow, repo.id, repo_root, force=force)
             pruned_count, link_report = self._persist_and_link_batch(
                 uow,
                 repo,

@@ -45,35 +45,37 @@ def writable_conn(temp_db_path: Path) -> Iterator[Connection]:
         factory.close(conn)
 
 
-def test_schema_version_is_2(writable_conn: Connection) -> None:
-    """Initialized DB sets PRAGMA user_version == 2 and enables WAL + FK pragmas."""
+def test_schema_version_is_3(writable_conn: Connection) -> None:
+    """Initialized DB sets PRAGMA user_version == 3 and enables WAL + FK pragmas."""
     version = int(writable_conn.exec_driver_sql("PRAGMA user_version").scalar_one())
     fk = int(writable_conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one())
     journal = str(writable_conn.exec_driver_sql("PRAGMA journal_mode").scalar_one()).lower()
     busy_timeout = int(writable_conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one())
 
-    assert SCHEMA_VERSION == 2
-    assert version == 2
+    assert SCHEMA_VERSION == 3
+    assert version == 3
     assert fk == 1
     assert journal == "wal"
     assert busy_timeout == 5000
 
 
-def test_initialize_database_creates_v2_tables_fts_and_triggers(
+def test_initialize_database_creates_v3_tables_fts_and_triggers(
     writable_conn: Connection,
 ) -> None:
-    """Schema v2 creates core tables, FTS5 table, triggers, and v2 indexes."""
+    """Schema v3 creates core tables, text_files, both FTS5 tables, triggers, and indexes."""
     tables = set(
         writable_conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars()
     )
     expected_tables = {
         "repos",
         "files",
+        "text_files",
         "nodes",
         "edges",
         "index_runs",
         "reference_refresh",
         "nodes_fts",
+        "text_fts",
     }
     assert expected_tables.issubset(tables)
 
@@ -82,7 +84,14 @@ def test_initialize_database_creates_v2_tables_fts_and_triggers(
             "SELECT name FROM sqlite_master WHERE type='trigger'"
         ).scalars()
     )
-    assert {"nodes_fts_ai", "nodes_fts_au", "nodes_fts_ad"}.issubset(triggers)
+    assert {
+        "nodes_fts_ai",
+        "nodes_fts_au",
+        "nodes_fts_ad",
+        "text_files_ai",
+        "text_files_au",
+        "text_files_ad",
+    }.issubset(triggers)
 
     indexes = set(
         writable_conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='index'").scalars()
@@ -90,6 +99,8 @@ def test_initialize_database_creates_v2_tables_fts_and_triggers(
     expected_indexes = {
         "idx_files_repo_id",
         "idx_files_uri",
+        "idx_text_files_repo_id",
+        "idx_text_files_repo_lang",
         "idx_nodes_repo_id",
         "idx_nodes_file_id",
         "idx_nodes_qualified_name",
@@ -112,10 +123,10 @@ def test_initialize_database_creates_v2_tables_fts_and_triggers(
 def test_initialize_database_is_idempotent_and_rejects_future_version(
     writable_conn: Connection,
 ) -> None:
-    """SchemaMigrator.initialize is idempotent on v2 and rejects future versions."""
+    """SchemaMigrator.initialize is idempotent on v3 and rejects future versions."""
     migrator = SchemaMigrator()
     migrator.initialize(writable_conn)
-    assert migrator.read_user_version(writable_conn) == 2
+    assert migrator.read_user_version(writable_conn) == 3
 
     writable_conn.exec_driver_sql("PRAGMA user_version = 99")
     writable_conn.commit()
@@ -142,8 +153,8 @@ def test_foreign_key_constraints_enforced(temp_db_path: Path) -> None:
         uow.nodes.upsert(orphan_node)
 
 
-def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v2(temp_db_path: Path) -> None:
-    """Upgrading a v1 database cleanly replaces legacy tables with v2 schema."""
+def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v3(temp_db_path: Path) -> None:
+    """Upgrading a v1 database cleanly replaces legacy tables with v3 schema."""
     raw = sqlite3.connect(temp_db_path)
     try:
         raw.execute(
@@ -160,11 +171,42 @@ def test_v1_upgrade_drops_legacy_tables_and_upgrades_to_v2(temp_db_path: Path) -
     conn = factory.open_path(temp_db_path)
     try:
         migrator.initialize(conn)
-        assert migrator.read_user_version(conn) == 2
+        assert migrator.read_user_version(conn) == 3
         cols = {
             row[1] for row in conn.exec_driver_sql("PRAGMA table_info(files)").fetchall()
         }
         assert {"line_count", "is_test"}.issubset(cols)
+    finally:
+        factory.close(conn)
+
+
+def test_v2_upgrade_is_non_destructive_and_adds_text_fts(temp_db_path: Path) -> None:
+    """Upgrading a v2 database preserves existing repos while adding text_files and text_fts."""
+    factory = ConnectionFactory()
+    migrator = SchemaMigrator()
+    conn = factory.open_path(temp_db_path)
+    try:
+        migrator.initialize(conn)
+        conn.exec_driver_sql(
+            "INSERT INTO repos (id, root_path, name, default_language, created_at) "
+            "VALUES ('repo:keep', '/keep', 'keep', 'python', '2026-01-01T00:00:00Z')"
+        )
+        conn.exec_driver_sql("DROP TRIGGER IF EXISTS text_files_ai")
+        conn.exec_driver_sql("DROP TRIGGER IF EXISTS text_files_au")
+        conn.exec_driver_sql("DROP TRIGGER IF EXISTS text_files_ad")
+        conn.exec_driver_sql("DROP TABLE IF EXISTS text_fts")
+        conn.exec_driver_sql("DROP TABLE IF EXISTS text_files")
+        conn.exec_driver_sql("PRAGMA user_version = 2")
+        conn.commit()
+
+        migrator.initialize(conn)
+        assert migrator.read_user_version(conn) == 3
+        kept = conn.exec_driver_sql("SELECT id FROM repos WHERE id = 'repo:keep'").scalar_one()
+        assert kept == "repo:keep"
+        tables = set(
+            conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars()
+        )
+        assert {"text_files", "text_fts"}.issubset(tables)
     finally:
         factory.close(conn)
 
@@ -265,7 +307,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
     sql_conn = conn_factory.open_readonly_sql(temp_db_path)
     try:
         assert sql_conn.exec_driver_sql("SELECT 1 AS one").mappings().one()["one"] == 1
-        assert int(sql_conn.exec_driver_sql("PRAGMA user_version").scalar_one()) == 2
+        assert int(sql_conn.exec_driver_sql("PRAGMA user_version").scalar_one()) == 3
         with pytest.raises(SADatabaseError):
             sql_conn.exec_driver_sql("DELETE FROM repos")
     finally:

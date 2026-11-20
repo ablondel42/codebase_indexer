@@ -9,6 +9,7 @@ from mcp_server.models.inputs import (
     GetSymbolReferencesInput,
     GetSymbolSourceInput,
     ListFilesInput,
+    SearchCodeInput,
     SearchSymbolsInput,
 )
 
@@ -22,5 +23,6 @@ __all__ = [
     "ListFilesInput",
     "McpErrorCode",
     "McpErrorDetail",
+    "SearchCodeInput",
     "SearchSymbolsInput",
 ]

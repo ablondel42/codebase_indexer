@@ -25,13 +25,25 @@ from core.utils.pathing import (
     to_file_uri,
     to_relative_path,
 )
+from core.utils.text_files import (
+    TEXT_IGNORED_DIRS,
+    classify_text_language,
+    is_ignored_text_dir,
+    is_ignored_text_filename,
+    is_ignored_text_rel_path,
+    is_test_rel_path,
+    read_text_document,
+    walk_repo_text_stats,
+)
 from core.utils.timestamps import latest_timestamp, utc_now_iso, validate_iso_timestamp
 
 __all__ = [
     "FreshnessCheckResult",
     "ROOT_LOGGER_NAME",
+    "TEXT_IGNORED_DIRS",
     "VerifiedFileText",
     "check_file_disk_freshness",
+    "classify_text_language",
     "compute_symbol_content_hash",
     "configure_logging",
     "derive_file_id",
@@ -42,9 +54,14 @@ __all__ = [
     "format_line_span",
     "from_json",
     "get_logger",
+    "is_ignored_text_dir",
+    "is_ignored_text_filename",
+    "is_ignored_text_rel_path",
     "is_logging_configured",
+    "is_test_rel_path",
     "latest_timestamp",
     "normalize_repo_root",
+    "read_text_document",
     "read_verified_file_text",
     "reset_logging",
     "sha256_file",
@@ -54,4 +71,5 @@ __all__ = [
     "to_relative_path",
     "utc_now_iso",
     "validate_iso_timestamp",
+    "walk_repo_text_stats",
 ]

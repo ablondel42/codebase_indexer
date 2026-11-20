@@ -25,6 +25,8 @@ from storage.utils.schema import (
     nodes_table,
     reference_refresh_table,
     repos_table,
+    text_files_table,
+    text_fts_table,
 )
 from storage.utils.sql_helpers import (
     build_fts_match_expression,
@@ -70,4 +72,6 @@ __all__ = [
     "row_to_run",
     "row_to_symbol_summary",
     "sqlite_select_only_authorizer",
+    "text_files_table",
+    "text_fts_table",
 ]

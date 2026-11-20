@@ -39,6 +39,11 @@ from core.models.runs import (
     IndexRunRecord,
     ReferenceRefreshState,
 )
+from core.models.search import (
+    TextCandidateQuery,
+    TextDocumentMeta,
+    TextDocumentRecord,
+)
 
 
 @runtime_checkable
@@ -960,4 +965,67 @@ class DiagnosticsRepositoryProtocol(Protocol):
         Returns:
             Populated ``TableListReport`` model.
         """
+        ...
+
+
+@runtime_checkable
+class TextSearchRepositoryProtocol(Protocol):
+    """Persistence contract for the whole-repository UTF-8 ``text_files`` + ``text_fts`` index."""
+
+    def upsert_many(self, documents: Sequence[TextDocumentRecord]) -> None:
+        """Insert or update a batch of ``TextDocumentRecord`` rows and sync ``text_fts``.
+
+        Args:
+            documents: UTF-8 repository text documents to persist.
+        """
+        ...
+
+    def delete_by_paths(self, repo_id: str, file_paths: Sequence[str]) -> int:
+        """Delete ``text_files`` rows matching ``file_paths`` under ``repo_id``.
+
+        Args:
+            repo_id: Owning repository identifier.
+            file_paths: Repository-relative POSIX paths to remove.
+
+        Returns:
+            Number of rows deleted.
+        """
+        ...
+
+    def prune_not_in_ids(self, repo_id: str, keep_ids: set[str]) -> int:
+        """Delete ``text_files`` rows for ``repo_id`` absent from ``keep_ids``.
+
+        Args:
+            repo_id: Owning repository identifier.
+            keep_ids: Set of active ``file:...`` document IDs to retain.
+
+        Returns:
+            Number of stale rows pruned.
+        """
+        ...
+
+    def list_metadata_for_repo(self, repo_id: str) -> list[TextDocumentMeta]:
+        """List lightweight ``TextDocumentMeta`` rows for ``repo_id`` without loading ``content``.
+
+        Args:
+            repo_id: Owning repository identifier.
+
+        Returns:
+            Sorted list of ``TextDocumentMeta`` records.
+        """
+        ...
+
+    def query_candidates(self, query: TextCandidateQuery) -> list[TextDocumentRecord]:
+        """Fetch candidate ``TextDocumentRecord`` items pruned by ``required_trigrams`` when set.
+
+        Args:
+            query: ``TextCandidateQuery`` specifying repo, optional trigram phrases, and filters.
+
+        Returns:
+            Ordered list of matching ``TextDocumentRecord`` rows.
+        """
+        ...
+
+    def check_fts_integrity(self) -> bool:
+        """Run SQLite FTS5 ``'integrity-check'`` on ``text_fts`` and return ``True`` when valid."""
         ...

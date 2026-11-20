@@ -11,6 +11,7 @@ from cli.utils.argv import (
 from cli.utils.output import (
     emit_cli_error,
     emit_json,
+    format_code_search_for_cli,
     format_files_for_cli,
     format_index_result_for_cli,
     format_mcp_call_envelope,
@@ -30,6 +31,7 @@ __all__ = [
     "KNOWN_COMMANDS",
     "emit_cli_error",
     "emit_json",
+    "format_code_search_for_cli",
     "format_files_for_cli",
     "format_index_result_for_cli",
     "format_mcp_call_envelope",

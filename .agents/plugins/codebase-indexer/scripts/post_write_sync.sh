@@ -10,12 +10,4 @@ if [ ! -x "$REPO_ROOT/venv/bin/python" ] || [ ! -f "$REPO_ROOT/codebase_indexer.
     exit 0
 fi
 
-case "$PAYLOAD" in
-    *'.py"'*) ;;
-    *)
-        printf '{}\n'
-        exit 0
-        ;;
-esac
-
 printf '%s' "$PAYLOAD" | PYTHONPATH="$REPO_ROOT/src" exec "$REPO_ROOT/venv/bin/python" "$SCRIPT_DIR/post_write_sync.py"

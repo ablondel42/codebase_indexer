@@ -1,6 +1,7 @@
 """Stateless wire compaction and structured error envelope helpers for MCP tools."""
 
 from mcp_server.utils.compact import (
+    adapt_code_search,
     adapt_file_list,
     adapt_outline,
     adapt_repo_overview,
@@ -20,6 +21,7 @@ from mcp_server.utils.errors import (
 )
 
 __all__ = [
+    "adapt_code_search",
     "adapt_file_list",
     "adapt_outline",
     "adapt_repo_overview",

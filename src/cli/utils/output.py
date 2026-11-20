@@ -14,6 +14,7 @@ from context.models.source import SymbolSnippet
 from context.models.symbol_context import ContextEdge, FocusSymbol, SymbolContext
 from core.models.base import FrozenModel
 from core.models.node import SymbolSummary
+from core.models.search import CodeMatchItem, CodeSearchReport
 from core.utils.file_io import format_line_span
 from core.utils.logging import get_logger
 from engine.models.responses import FileListPage, SymbolListPage, SymbolSearchPage
@@ -578,9 +579,53 @@ def format_mcp_call_envelope(tool_name: str, raw_response: str) -> tuple[McpCall
     return envelope, exit_code
 
 
+def _serialize_cli_code_match(item: CodeMatchItem) -> dict[str, Any]:
+    """Serialize a ``CodeMatchItem`` omitting empty context tuples and ``None`` symbol fields."""
+    entry: dict[str, Any] = {
+        "file_path": item.file_path,
+        "language": item.language,
+        "line": item.line,
+        "column": item.column,
+        "preview": item.preview,
+    }
+    if item.context_before:
+        entry["context_before"] = list(item.context_before)
+    if item.context_after:
+        entry["context_after"] = list(item.context_after)
+    if item.symbol_id is not None:
+        entry["symbol_id"] = item.symbol_id
+    if item.qualified_name is not None:
+        entry["qualified_name"] = item.qualified_name
+    if item.symbol_kind is not None:
+        entry["symbol_kind"] = item.symbol_kind
+    if item.symbol_lines is not None:
+        entry["symbol_lines"] = item.symbol_lines
+    return entry
+
+
+def format_code_search_for_cli(report: CodeSearchReport) -> dict[str, Any]:
+    """Format a ``CodeSearchReport`` into the ``cbi search`` JSON output shape."""
+    return {
+        "repo_id": report.repo_id,
+        "query": report.query,
+        "regex": report.regex,
+        "case_sensitive": report.case_sensitive,
+        "total_matches": report.total_matches,
+        "matched_file_count": report.matched_file_count,
+        "returned_count": report.returned_count,
+        "offset": report.offset,
+        "limit": report.limit,
+        "has_more": report.has_more,
+        "file_counts": [fc.model_dump() for fc in report.file_counts],
+        "matches": [_serialize_cli_code_match(item) for item in report.matches],
+        "stats": report.stats.model_dump(),
+    }
+
+
 __all__ = [
     "emit_cli_error",
     "emit_json",
+    "format_code_search_for_cli",
     "format_files_for_cli",
     "format_index_result_for_cli",
     "format_mcp_call_envelope",

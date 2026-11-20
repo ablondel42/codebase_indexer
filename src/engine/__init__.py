@@ -1,5 +1,6 @@
 """Headless and UI-ready application layer exposing ``IndexerEngine`` and typed DTOs."""
 
+from core.models.search import CodeSearchQuery, CodeSearchReport
 from engine.models import (
     ContextQuery,
     DirectoryFileCount,
@@ -27,6 +28,8 @@ from engine.services import (
 )
 
 __all__ = [
+    "CodeSearchQuery",
+    "CodeSearchReport",
     "CommandEngine",
     "ContextQuery",
     "DirectoryFileCount",

@@ -1,6 +1,7 @@
 """MCP tool registration and in-process tool invocation registry service."""
 
-from collections.abc import Coroutine, Mapping
+import inspect
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from mcp_server.models.inputs import (
     GetSymbolReferencesInput,
     GetSymbolSourceInput,
     ListFilesInput,
+    SearchCodeInput,
     SearchSymbolsInput,
 )
 from mcp_server.services.repo_handlers import RepoMcpHandlers
@@ -29,15 +31,46 @@ from mcp_server.utils.errors import map_exception_to_error_result
 
 logger = get_logger("mcp_server.services.registry")
 
+_PK = inspect.Parameter.POSITIONAL_OR_KEYWORD
+_SEARCH_CODE_SIGNATURE = inspect.Signature(
+    parameters=[
+        inspect.Parameter("query", _PK, annotation=str),
+        inspect.Parameter("repo_id", _PK, default=None, annotation=str | None),
+        inspect.Parameter("regex", _PK, default=False, annotation=bool),
+        inspect.Parameter("case_sensitive", _PK, default=False, annotation=bool),
+        inspect.Parameter("path_prefix", _PK, default=None, annotation=str | None),
+        inspect.Parameter("language", _PK, default=None, annotation=str | None),
+        inspect.Parameter("include_tests", _PK, default=True, annotation=bool),
+        inspect.Parameter("context_lines", _PK, default=0, annotation=int),
+        inspect.Parameter("limit", _PK, default=50, annotation=int),
+        inspect.Parameter("offset", _PK, default=0, annotation=int),
+    ],
+    return_annotation=str,
+)
+_SEARCH_CODE_ANNOTATIONS: dict[str, Any] = {
+    "query": str,
+    "repo_id": str | None,
+    "regex": bool,
+    "case_sensitive": bool,
+    "path_prefix": str | None,
+    "language": str | None,
+    "include_tests": bool,
+    "context_lines": int,
+    "limit": int,
+    "offset": int,
+    "return": str,
+}
+
 
 class McpToolRegistry:
-    """Registers the 8 token-lean MCP tools on an ``MCPServer`` and dispatches local calls."""
+    """Registers the 9 token-lean MCP tools on an ``MCPServer`` and dispatches local calls."""
 
     TOOL_NAMES: tuple[str, ...] = (
         "get_repo_overview",
         "list_files",
         "get_file_outline",
         "search_symbols",
+        "search_code",
         "get_symbol_source",
         "get_symbol_context",
         "get_symbol_references",
@@ -225,8 +258,22 @@ class McpToolRegistry:
                 {"symbols": symbols, "repo_id": repo_id, "db_path": target_db},
             )
 
+    def _register_search_tools(self, server: MCPServer[Any] | Any, target_db: str) -> None:
+        """Bind the ``search_code`` full-codebase text/regex search tool onto ``server``."""
+
+        async def search_code(**kwargs: Any) -> str:
+            """Search all UTF-8 repository text files (literal or regex) with symbol spans."""
+            payload = dict(kwargs)
+            payload["db_path"] = target_db
+            return await self.call_tool("search_code", payload)
+
+        fn_meta: Any = search_code
+        fn_meta.__signature__ = _SEARCH_CODE_SIGNATURE
+        fn_meta.__annotations__ = dict(_SEARCH_CODE_ANNOTATIONS)
+        server.tool(name="search_code")(search_code)
+
     def bind(self, server: MCPServer[Any] | Any, *, db_path: Path | str | None = None) -> None:
-        """Register all 8 token-lean MCP tools onto ``server``.
+        """Register all 9 token-lean MCP tools onto ``server``.
 
         Args:
             server: ``MCPServer`` instance (or compatible ``.tool()`` decorator target).
@@ -234,6 +281,7 @@ class McpToolRegistry:
         """
         target_db = str(db_path) if db_path is not None else str(self._engine.db_path)
         self._register_repo_tools(server, target_db)
+        self._register_search_tools(server, target_db)
         self._register_symbol_tools(server, target_db)
 
     def _dispatch_repo_tool(
@@ -241,28 +289,34 @@ class McpToolRegistry:
         tool_name: str,
         payload: Mapping[str, Any],
     ) -> Coroutine[Any, Any, str] | None:
-        """Validate ``payload`` and return the matching repo-tool coroutine if matched.
+        """Validate ``payload`` and return the matching repo/search-tool coroutine if matched.
 
         Args:
             tool_name: Validated MCP tool name.
             payload: Raw argument mapping including ``db_path``.
 
         Returns:
-            Handler coroutine when ``tool_name`` is a repository tool, else ``None``.
+            Handler coroutine when ``tool_name`` is a repository/search tool, else ``None``.
         """
-        if tool_name == "get_repo_overview":
-            return self._repo_handlers.get_repo_overview(
+        dispatchers: dict[str, Callable[[], Coroutine[Any, Any, str]]] = {
+            "get_repo_overview": lambda: self._repo_handlers.get_repo_overview(
                 GetRepoOverviewInput.model_validate(payload)
-            )
-        if tool_name == "list_files":
-            return self._repo_handlers.list_files(ListFilesInput.model_validate(payload))
-        if tool_name == "get_file_outline":
-            return self._repo_handlers.get_file_outline(
+            ),
+            "list_files": lambda: self._repo_handlers.list_files(
+                ListFilesInput.model_validate(payload)
+            ),
+            "get_file_outline": lambda: self._repo_handlers.get_file_outline(
                 GetFileOutlineInput.model_validate(payload)
-            )
-        if tool_name == "search_symbols":
-            return self._repo_handlers.search_symbols(SearchSymbolsInput.model_validate(payload))
-        return None
+            ),
+            "search_symbols": lambda: self._repo_handlers.search_symbols(
+                SearchSymbolsInput.model_validate(payload)
+            ),
+            "search_code": lambda: self._repo_handlers.search_code(
+                SearchCodeInput.model_validate(payload)
+            ),
+        }
+        factory = dispatchers.get(tool_name)
+        return factory() if factory is not None else None
 
     def _dispatch_symbol_tool(
         self,

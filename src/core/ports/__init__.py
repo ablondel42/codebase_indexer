@@ -10,6 +10,7 @@ from core.ports.repositories import (
     NodeRepositoryProtocol,
     ReferenceRefreshRepositoryProtocol,
     RepoRepositoryProtocol,
+    TextSearchRepositoryProtocol,
 )
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 
@@ -24,6 +25,7 @@ __all__ = [
     "NodeRepositoryProtocol",
     "ReferenceRefreshRepositoryProtocol",
     "RepoRepositoryProtocol",
+    "TextSearchRepositoryProtocol",
     "UnitOfWorkFactoryProtocol",
     "UnitOfWorkProtocol",
 ]

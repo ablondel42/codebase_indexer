@@ -13,6 +13,7 @@ from core.utils.pathing import (
     ensure_safe_repo_file,
     to_relative_path,
 )
+from core.utils.text_files import read_text_document
 from indexing.models.events import FileChangeEvent, FileEventType
 from indexing.models.results import (
     IncrementalBatchResult,
@@ -228,6 +229,7 @@ class IncrementalIndexer:
                 )
                 invalidated_refs = uow.refresh.invalidate_for_file(file_id)
                 uow.replace_file_graph(extraction.file, extraction.nodes, extraction.edges)
+                self._sync_single_text_file(uow, repo_id, resolved_root, repo_relative)
                 invalidated_targets = uow.refresh.mark_file_symbols_stale(file_id)
                 if run_linker:
                     link_report = self._link_coordinator.link_repository(uow, repo_id)
@@ -259,6 +261,27 @@ class IncrementalIndexer:
             reset_edge_count=reset_count,
         )
 
+    def _sync_single_text_file(
+        self,
+        uow: UnitOfWorkProtocol,
+        repo_id: str,
+        resolved_root: Path,
+        file_path: Path | str,
+    ) -> bool:
+        """Upsert one UTF-8 repository text document into ``text_files`` when eligible."""
+        doc = read_text_document(
+            repo_id,
+            resolved_root,
+            file_path,
+            max_file_size_bytes=self._config.max_file_size_bytes,
+            test_dir_names=self._config.test_dir_names,
+        )
+        if doc is None:
+            return False
+        self._ensure_repo_record(uow, repo_id, resolved_root, None)
+        uow.text_search.upsert_many([doc])
+        return True
+
     def reindex_file(
         self,
         uow: UnitOfWorkProtocol,
@@ -284,6 +307,15 @@ class IncrementalIndexer:
 
         target = self._resolve_reindex_target(raw_root, resolved_root, file_path)
         if isinstance(target, IncrementalFileResult):
+            if target.status == IncrementalStatus.SKIPPED:
+                synced = self._sync_single_text_file(
+                    uow,
+                    derive_repo_id(resolved_root),
+                    resolved_root,
+                    file_path,
+                )
+                if synced and run_linker:
+                    uow.commit()
             return target
         safe_path, repo_relative = target
 
@@ -411,10 +443,13 @@ class IncrementalIndexer:
         Returns:
             ``IncrementalFileResult`` summarizing deleted nodes/edges and reset links.
         """
+        deleted_text = uow.text_search.delete_by_paths(repo_id, [repo_relative_path])
         file_rec = uow.files.get_by_path(repo_id, repo_relative_path)
         if file_rec is None:
             file_rec = uow.files.get_by_id(derive_file_id(repo_id, repo_relative_path))
         if file_rec is None:
+            if deleted_text > 0 and run_linker:
+                uow.commit()
             logger.debug(
                 "Deleted file %s is not tracked in repository %s",
                 repo_relative_path,

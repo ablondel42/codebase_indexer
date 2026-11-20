@@ -22,6 +22,7 @@ from context.models import (
     SymbolSnippet,
 )
 from context.services import (
+    CodeSearchService,
     ContextEvaluator,
     OutlineBuilder,
     SourceReader,
@@ -29,6 +30,7 @@ from context.services import (
 )
 
 __all__ = [
+    "CodeSearchService",
     "CompactSymbol",
     "ConfidenceSummary",
     "ContextBuildOptions",

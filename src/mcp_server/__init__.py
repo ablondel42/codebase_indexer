@@ -10,6 +10,7 @@ from mcp_server.models import (
     ListFilesInput,
     McpErrorCode,
     McpErrorDetail,
+    SearchCodeInput,
     SearchSymbolsInput,
 )
 from mcp_server.services import (
@@ -32,6 +33,7 @@ __all__ = [
     "McpServerRunner",
     "McpToolRegistry",
     "RepoMcpHandlers",
+    "SearchCodeInput",
     "SearchSymbolsInput",
     "SymbolMcpHandlers",
 ]

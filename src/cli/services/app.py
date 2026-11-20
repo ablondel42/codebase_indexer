@@ -96,6 +96,7 @@ class CliApplication:
             "symbols.search": self._symbol_cmds.run_search,
             "symbols.list": self._symbol_cmds.run_list,
             "symbols.show": self._symbol_cmds.run_show,
+            "search": self._symbol_cmds.run_code_search,
             "source": self._symbol_cmds.run_source,
             "refs": self._analysis_cmds.run_refs,
             "risk": self._analysis_cmds.run_risk,

@@ -9,6 +9,7 @@ from storage.services.nodes import SqlNodeRepository
 from storage.services.refresh import SqlReferenceRefreshRepository
 from storage.services.repos import SqlRepoRepository
 from storage.services.runs import SqlIndexRunRepository
+from storage.services.text_search import SqlTextSearchRepository
 from storage.services.uow import SqlUnitOfWork, SqlUnitOfWorkFactory
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "SqlNodeRepository",
     "SqlReferenceRefreshRepository",
     "SqlRepoRepository",
+    "SqlTextSearchRepository",
     "SqlUnitOfWork",
     "SqlUnitOfWorkFactory",
 ]

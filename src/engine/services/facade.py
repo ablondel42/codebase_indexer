@@ -6,6 +6,7 @@ from types import TracebackType
 from typing import Self
 
 from context.services.builder import SymbolContextBuilder
+from context.services.code_search import CodeSearchService
 from context.services.outline import OutlineBuilder
 from context.services.source import SourceReader
 from core.models.config import AppConfig
@@ -55,6 +56,7 @@ class _EngineRuntime:
             source_reader=self.source_reader,
             reference_analyzer=self.reference_analyzer,
         )
+        self.code_search = CodeSearchService(config)
         self.lsp_coordinator = RepoLspCoordinator(config=config)
         self.batch_indexer = BatchIndexer(config=config, lsp_coordinator=self.lsp_coordinator)
         self.incremental_indexer = IncrementalIndexer(config=config)
@@ -162,6 +164,7 @@ class _EngineRuntime:
             source_reader=self.source_reader,
             outline_builder=self.outline_builder,
             context_builder=self.context_builder,
+            code_search=self.code_search,
         )
 
     def close_all(self) -> None:

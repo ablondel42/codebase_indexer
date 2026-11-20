@@ -16,6 +16,7 @@ from context.models.symbol_context import (
 )
 from core.models.enums import EdgeKind
 from core.models.node import SymbolSummary
+from core.models.search import CodeMatchItem, CodeSearchReport
 from core.utils.file_io import format_line_span
 from engine.models.responses import FileListPage, RepoOverview, SymbolSearchPage
 from graph.models.references import (
@@ -705,7 +706,53 @@ def adapt_risk_assessment(result: RiskAssessment) -> dict[str, Any]:
     }
 
 
+def _adapt_code_match(item: CodeMatchItem) -> dict[str, Any]:
+    """Adapt a single ``CodeMatchItem`` into a compact dictionary omitting empty fields."""
+    return omit_none(
+        {
+            "file_path": item.file_path,
+            "language": item.language,
+            "line": item.line,
+            "column": item.column,
+            "preview": item.preview,
+            "context_before": list(item.context_before) if item.context_before else None,
+            "context_after": list(item.context_after) if item.context_after else None,
+            "symbol_id": item.symbol_id,
+            "qualified_name": item.qualified_name,
+            "symbol_kind": item.symbol_kind,
+            "symbol_lines": item.symbol_lines,
+        }
+    )
+
+
+def adapt_code_search(report: CodeSearchReport) -> dict[str, Any]:
+    """Adapt a ``CodeSearchReport`` into a compact MCP payload with full ``file_counts``."""
+    return {
+        "repo_id": report.repo_id,
+        "query": report.query,
+        "regex": report.regex,
+        "case_sensitive": report.case_sensitive,
+        "total_matches": report.total_matches,
+        "matched_file_count": report.matched_file_count,
+        "returned_count": report.returned_count,
+        "offset": report.offset,
+        "limit": report.limit,
+        "has_more": report.has_more,
+        "file_counts": [
+            {
+                "file_path": fc.file_path,
+                "language": fc.language,
+                "count": fc.count,
+            }
+            for fc in report.file_counts
+        ],
+        "matches": [_adapt_code_match(item) for item in report.matches],
+        "stats": report.stats.model_dump(),
+    }
+
+
 __all__ = [
+    "adapt_code_search",
     "adapt_file_list",
     "adapt_outline",
     "adapt_repo_overview",

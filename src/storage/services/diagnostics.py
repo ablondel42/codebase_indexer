@@ -41,6 +41,7 @@ _REQUIRED_STATUS_TABLES: frozenset[str] = frozenset({
     "edges",
     "index_runs",
     "reference_refresh",
+    "text_files",
 })
 
 
@@ -174,7 +175,7 @@ class SqlDiagnosticsRepository:
             table_names = [
                 name
                 for name in sorted(inspect(self._conn).get_table_names())
-                if not name.startswith("nodes_fts_")
+                if not name.startswith(("nodes_fts_", "text_fts_"))
             ]
             temp_meta = MetaData()
             entries: list[TableCountEntry] = []
