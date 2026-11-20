@@ -38,6 +38,7 @@ EXPECTED_DOMAINS: frozenset[str] = frozenset({
     "parsing",
     "graph",
     "context",
+    "views",
     "indexing",
     "engine",
     "mcp_server",
@@ -50,6 +51,7 @@ DOMAIN_SERVICE_PACKAGES: frozenset[str] = frozenset({
     "lsp",
     "graph",
     "context",
+    "views",
     "indexing",
     "engine",
 })
@@ -63,6 +65,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
     "parsing": frozenset({"core", "parsing", "pydantic"}),
     "graph": frozenset({"core", "graph", "pydantic"}),
     "context": frozenset({"core", "graph", "context", "pydantic"}),
+    "views": frozenset({"core", "views", "pydantic"}),
     "indexing": frozenset({"core", "parsing", "lsp", "indexing", "pydantic", "watchdog"}),
     "engine": frozenset({
         "core",
@@ -71,6 +74,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
         "parsing",
         "graph",
         "context",
+        "views",
         "indexing",
         "engine",
         "pydantic",
@@ -80,6 +84,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
         "engine",
         "graph.models",
         "context.models",
+        "views.models",
         "indexing.models",
         "mcp_server",
         "pydantic",
@@ -90,6 +95,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
         "engine",
         "graph.models",
         "context.models",
+        "views.models",
         "indexing.models",
         "cli",
         "pydantic",
@@ -443,7 +449,10 @@ def _check_import_from_node(
         return errors
     if node.module == "contextlib" and any(alias.name == "suppress" for alias in node.names):
         errors.append(f"{rel_posix}:{node.lineno}: contextlib.suppress is banned")
-    if node.module in ("graph", "context", "indexing") and domain in ("mcp_server", "cli"):
+    if (
+        node.module in ("graph", "context", "views", "indexing")
+        and domain in ("mcp_server", "cli")
+    ):
         bad = [alias.name for alias in node.names if alias.name != "models"]
         if bad:
             errors.append(
@@ -635,7 +644,7 @@ class TestHexagonalArchitectureBoundaryGate:
     """AST static analysis gate enforcing Hexagonal package, import, model, and error rules."""
 
     def test_domain_package_layout_and_zero_service_suffixes(self) -> None:
-        """``src/`` contains only the 10 Hexagonal packages with ``{services,models,utils}``."""
+        """``src/`` contains only the 11 Hexagonal packages with ``{services,models,utils}``."""
         top_entries = {
             entry.name
             for entry in SRC_DIR.iterdir()

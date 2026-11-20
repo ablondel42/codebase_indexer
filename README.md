@@ -6,19 +6,20 @@ Local repository intelligence for safer, token-lean AI-assisted code planning an
 
 ## Hexagonal Service Architecture (`src/`)
 
-All 10 domain packages live directly under `src/` using a strict **Hexagonal (Ports & Adapters) + `<domain>/{services,models,utils}`** layout (`src/core/{ports,models,utils}`):
+All 11 domain packages live directly under `src/` using a strict **Hexagonal (Ports & Adapters) + `<domain>/{services,models,utils}`** layout (`src/core/{ports,models,utils}`):
 
 ```text
 Driving Adapters (Thin Consumers)
   ├── src/cli/{services,models,utils} + main.py     Grouped `cbi` CLI & interactive `cbi>` REPL
-  └── src/mcp_server/{services,models,utils}        8 token-lean MCP tools over stdio
+  └── src/mcp_server/{services,models,utils}        9 token-lean MCP tools over stdio
 
 Application Layer (Headless & UI-Ready)
-  └── src/engine/{services,models,utils}            IndexerEngine = QueryEngine + CommandEngine
+  └── src/engine/{services,models,utils}            IndexerEngine = QueryEngine + CommandEngine + ViewEngine
 
 Domain Read & Write Layers (CQRS)
-  ├── src/context/{services,models,utils}           Outlines, SourceReader, SymbolContextBuilder
+  ├── src/context/{services,models,utils}           Outlines, SourceReader, SymbolContextBuilder, CodeSearchService
   ├── src/graph/{services,models,utils}             GraphNavigator, SubgraphSlice, RiskAnalyzer
+  ├── src/views/{services,models,utils}             FilesystemViewBuilder (Explorer folder/file trees)
   ├── src/indexing/{services,models,utils}          BatchIndexer, IncrementalIndexer, RepoWatcher
   └── src/parsing/{services,models,utils}           RepoScanner, AstExtractionPipeline, SymbolLinker
 
@@ -52,9 +53,12 @@ Innermost Core (Zero Sibling Dependencies)
    - `BatchIndexer` executes hash-diffed repository indexing runs with optional `ReferenceEnricher` + `LspSessionPool` (`pyright-langserver --stdio`) enrichment.
    - `IncrementalIndexer` and `RepoWatcher` isolate per-file updates in SQLite savepoints, link once per debounced batch, preserve surviving callers' AST edges across file deletions for automatic re-linking, and emit typed lifecycle events via callbacks.
 
-6. **Headless `IndexerEngine`, MCP Server & `cbi` CLI (`src/engine/`, `src/mcp_server/`, `src/cli/`)**
-   - `IndexerEngine` exposes `engine.queries` and `engine.commands`, with `engine.for_db(db_path)` sharing warm Pyright LSP sessions across databases with zero global mutable state.
-   - `McpServerRunner` / `McpToolRegistry` expose 8 compact MCP tools over `stdio`, and `CliApplication` (`python -m cli.main` / `./cbi`) emits indented JSON to `stdout`.
+6. **Project Views (`src/views/`)**
+   - `FilesystemViewBuilder` projects indexed `TextDocumentMeta` entries into an Explorer tree (`FolderNode(name, path, folders, files)`) ordered subfolders-first without extra edges or disk reads.
+
+7. **Headless `IndexerEngine`, MCP Server & `cbi` CLI (`src/engine/`, `src/mcp_server/`, `src/cli/`)**
+   - `IndexerEngine` exposes `engine.queries`, `engine.views`, and `engine.commands`, with `engine.for_db(db_path)` sharing warm Pyright LSP sessions across databases with zero global mutable state.
+   - `McpServerRunner` / `McpToolRegistry` expose 9 compact MCP tools over `stdio`, and `CliApplication` (`python -m cli.main` / `./cbi`) emits indented JSON objects to `stdout`.
 
 ---
 
@@ -63,6 +67,7 @@ Innermost Core (Zero Sibling Dependencies)
 ```python
 from core import AppConfig
 from engine import (
+    FilesystemViewQuery,
     IndexerEngine,
     OutlineQuery,
     SubgraphQuery,
@@ -77,7 +82,10 @@ with IndexerEngine(config) as engine:
     # 1. Index a repository
     run = engine.commands.index_repository(".", BatchIndexOptions(include_tests=True))
 
-    # 2. Resolve symbols, class/module members, and file outlines
+    # 2. Render an Explorer filesystem view (folders -> subfolders -> files)
+    fs_view = engine.views.get_filesystem_view(FilesystemViewQuery(max_depth=2))
+
+    # 3. Resolve symbols, class/module members, and file outlines
     sym = engine.queries.get_symbol("IndexerEngine")
     members = engine.queries.get_symbol_members(
         SymbolMembersQuery(symbol=sym.id, include_private=False)
@@ -194,6 +202,7 @@ All CLI commands emit indented JSON objects to `stdout` (and structured JSON err
 | `cbi source <id_or_name> [--repo] [--max-lines 120] [--offset 0]` | Print line-numbered symbol source slice |
 | `cbi refs <id_or_name> [--repo] [--direction incoming\|outgoing\|both] [--refresh] [--limit 50]` | List calls/references with `file:line` and 1-line previews (optionally refreshing via Pyright LSP) |
 | `cbi risk <id_or_names...> [--repo]` | Compute risk score, decision, targets, facts, and issue codes |
+| `cbi view tree [path] [--repo] [--max-depth] [--no-tests]` | Emit nested JSON Explorer tree of indexed folders and files |
 | `cbi shell [--repo]` | Start interactive `cbi>` REPL bound to the database and active repository |
 | `cbi watch [repo_path] [--debounce-ms 500] [--include-tests] [--verbose]` | Watch repository for changes and incrementally update SQLite |
 | `cbi serve [--debug]` | Start the MCP server on `stdio` |

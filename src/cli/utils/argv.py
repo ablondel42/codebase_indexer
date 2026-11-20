@@ -22,6 +22,7 @@ KNOWN_COMMANDS: frozenset[str] = frozenset({
     "source",
     "refs",
     "risk",
+    "view",
     "shell",
     "watch",
     "serve",
@@ -43,6 +44,7 @@ _REPO_SCOPED_SUBS: frozenset[tuple[str, str]] = frozenset({
     ("symbols", "search"),
     ("symbols", "list"),
     ("symbols", "show"),
+    ("view", "tree"),
 })
 _PRIMARY_ARG_BY_TOOL: Mapping[str, str] = MappingProxyType({
     "get_repo_overview": "repo_id",

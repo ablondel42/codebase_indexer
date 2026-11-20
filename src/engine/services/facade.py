@@ -14,10 +14,15 @@ from core.models.exceptions import IndexerError
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol
 from core.utils.logging import get_logger
-from engine.models.collaborators import CommandCollaborators, QueryCollaborators
+from engine.models.collaborators import (
+    CommandCollaborators,
+    QueryCollaborators,
+    ViewCollaborators,
+)
 from engine.services.command import CommandEngine
 from engine.services.query import QueryEngine
 from engine.services.resolver import SymbolTargetResolver
+from engine.services.views import ViewEngine
 from graph.services.navigator import GraphNavigator
 from graph.services.references import ReferenceAnalyzer
 from graph.services.risk import RiskAnalyzer
@@ -27,6 +32,7 @@ from indexing.services.lsp_runner import RepoLspCoordinator
 from indexing.services.watcher import RepoWatcher
 from lsp.services.pool import LspSessionPool
 from storage.services.uow import SqlUnitOfWorkFactory
+from views.services.filesystem import FilesystemViewBuilder
 
 logger = get_logger("engine.services.facade")
 
@@ -58,6 +64,7 @@ class _EngineRuntime:
             reference_analyzer=self.reference_analyzer,
         )
         self.code_search = CodeSearchService(config)
+        self.filesystem_view_builder = FilesystemViewBuilder()
         self.lsp_coordinator = RepoLspCoordinator(config=config)
         self.batch_indexer = BatchIndexer(config=config, lsp_coordinator=self.lsp_coordinator)
         self.incremental_indexer = IncrementalIndexer(config=config)
@@ -163,6 +170,20 @@ class _EngineRuntime:
             ),
         )
 
+    def build_views(
+        self,
+        config: AppConfig,
+        uow_factory: UnitOfWorkFactoryProtocol,
+    ) -> ViewEngine:
+        """Construct a ``ViewEngine`` sharing this runtime's view builders."""
+        return ViewEngine(
+            config,
+            uow_factory,
+            collaborators=ViewCollaborators(
+                filesystem_builder=self.filesystem_view_builder,
+            ),
+        )
+
     def close_all(self) -> None:
         """Close the shared LSP pool and any closable cached UoW factories."""
         self.lsp_pool.close_all()
@@ -229,6 +250,7 @@ class IndexerEngine:
             self._uow_factory,
             self._commands,
         )
+        self._views = self._runtime.build_views(self._config, self._uow_factory)
 
     @property
     def config(self) -> AppConfig:
@@ -249,6 +271,11 @@ class IndexerEngine:
     def commands(self) -> CommandEngine:
         """Mutating ``CommandEngine`` bound to ``self.db_path`` and ``self.lsp_pool``."""
         return self._commands
+
+    @property
+    def views(self) -> ViewEngine:
+        """Side-effect-free ``ViewEngine`` bound to ``self.db_path``."""
+        return self._views
 
     @property
     def lsp_pool(self) -> LspPoolProtocol:

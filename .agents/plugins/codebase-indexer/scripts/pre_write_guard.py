@@ -18,6 +18,7 @@ EXPECTED_DOMAINS: frozenset[str] = frozenset(
         "parsing",
         "graph",
         "context",
+        "views",
         "indexing",
         "engine",
         "mcp_server",
@@ -26,7 +27,7 @@ EXPECTED_DOMAINS: frozenset[str] = frozenset(
 )
 
 DOMAIN_SERVICE_PACKAGES: frozenset[str] = frozenset(
-    {"storage", "parsing", "lsp", "graph", "context", "indexing", "engine"}
+    {"storage", "parsing", "lsp", "graph", "context", "views", "indexing", "engine"}
 )
 
 STDLIB_NON_SQLITE: frozenset[str] = frozenset(sys.stdlib_module_names) - {"sqlite3"}
@@ -38,6 +39,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
     "parsing": frozenset({"core", "parsing", "pydantic"}),
     "graph": frozenset({"core", "graph", "pydantic"}),
     "context": frozenset({"core", "graph", "context", "pydantic"}),
+    "views": frozenset({"core", "views", "pydantic"}),
     "indexing": frozenset({"core", "parsing", "lsp", "indexing", "pydantic", "watchdog"}),
     "engine": frozenset(
         {
@@ -47,6 +49,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
             "parsing",
             "graph",
             "context",
+            "views",
             "indexing",
             "engine",
             "pydantic",
@@ -58,6 +61,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
             "engine",
             "graph.models",
             "context.models",
+            "views.models",
             "indexing.models",
             "mcp_server",
             "pydantic",
@@ -70,6 +74,7 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
             "engine",
             "graph.models",
             "context.models",
+            "views.models",
             "indexing.models",
             "cli",
             "pydantic",
@@ -248,7 +253,7 @@ def _check_func_context_manager(
 
 
 def _check_src_layout(src_rel: str) -> tuple[str, str, list[str]]:
-    """Verify ``src/`` path obeys 10-domain ``{services,models,utils}`` and naming rules."""
+    """Verify ``src/`` path obeys 11-domain ``{services,models,utils}`` and naming rules."""
     parts = src_rel.split("/")
     domain = parts[0]
     layer = parts[1] if len(parts) > 2 else ""
@@ -302,7 +307,10 @@ def _check_src_import_from(domain: str, src_rel: str, node: ast.ImportFrom) -> l
     errors: list[str] = []
     if node.module == "contextlib" and any(alias.name == "suppress" for alias in node.names):
         errors.append(f"src/{src_rel}:{node.lineno}: contextlib.suppress is banned")
-    if node.module in ("graph", "context", "indexing") and domain in ("mcp_server", "cli"):
+    if (
+        node.module in ("graph", "context", "views", "indexing")
+        and domain in ("mcp_server", "cli")
+    ):
         bad = [alias.name for alias in node.names if alias.name != "models"]
         if bad:
             errors.append(

@@ -25,6 +25,12 @@ from engine.services import (
     IndexerEngine,
     QueryEngine,
     SymbolTargetResolver,
+    ViewEngine,
+)
+from views.models.filesystem import (
+    FilesystemView,
+    FilesystemViewQuery,
+    FolderNode,
 )
 
 __all__ = [
@@ -34,6 +40,9 @@ __all__ = [
     "ContextQuery",
     "DirectoryFileCount",
     "FileListPage",
+    "FilesystemView",
+    "FilesystemViewQuery",
+    "FolderNode",
     "IndexRunListReport",
     "IndexerEngine",
     "ListFilesQuery",
@@ -51,4 +60,5 @@ __all__ = [
     "SymbolSearchPage",
     "SymbolSnippetsQuery",
     "SymbolTargetResolver",
+    "ViewEngine",
 ]

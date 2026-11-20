@@ -16,6 +16,7 @@ from cli.services.parser import CliParserBuilder
 from cli.services.server import ServerCliCommands
 from cli.services.shell import InteractiveShell
 from cli.services.symbols import SymbolCliCommands
+from cli.services.views import ViewCliCommands
 from cli.utils.argv import preprocess_argv
 from cli.utils.output import (
     emit_cli_error,
@@ -63,6 +64,7 @@ class CliApplication:
         self._db_cmds = DbCliCommands(self._engine)
         self._symbol_cmds = SymbolCliCommands(self._engine)
         self._analysis_cmds = AnalysisCliCommands(self._engine)
+        self._view_cmds = ViewCliCommands(self._engine)
         self._server_cmds = ServerCliCommands(self._engine)
 
         self._handlers = self._build_handler_map()
@@ -102,6 +104,7 @@ class CliApplication:
             "source": self._symbol_cmds.run_source,
             "refs": self._analysis_cmds.run_refs,
             "risk": self._analysis_cmds.run_risk,
+            "view.tree": self._view_cmds.run_tree,
             "shell": self._run_shell_cmd,
             "watch": self._index_cmds.run_watch,
             "serve": self._server_cmds.run_serve,

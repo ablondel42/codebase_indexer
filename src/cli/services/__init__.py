@@ -8,6 +8,7 @@ from cli.services.parser import CliParserBuilder
 from cli.services.server import ServerCliCommands
 from cli.services.shell import InteractiveShell
 from cli.services.symbols import SymbolCliCommands
+from cli.services.views import ViewCliCommands
 
 __all__ = [
     "AnalysisCliCommands",
@@ -18,4 +19,5 @@ __all__ = [
     "InteractiveShell",
     "ServerCliCommands",
     "SymbolCliCommands",
+    "ViewCliCommands",
 ]

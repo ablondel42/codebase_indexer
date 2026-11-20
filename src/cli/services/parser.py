@@ -404,6 +404,39 @@ class CliParserBuilder:
         )
         self._bind_handler(p, "search")
 
+    def _add_view_parser(
+        self,
+        subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+        sub_common: argparse.ArgumentParser,
+    ) -> None:
+        """Register the ``cbi view`` subcommand group and its subcommands."""
+        view_parser = subparsers.add_parser(
+            "view",
+            parents=[sub_common],
+            help="Render high-level structural views of an indexed repository",
+        )
+        view_sub = view_parser.add_subparsers(dest="view_command", required=True)
+
+        tree_p = view_sub.add_parser(
+            "tree",
+            parents=[sub_common],
+            help="Emit folder and file Explorer tree JSON for the indexed codebase",
+        )
+        tree_p.add_argument(
+            "path", nargs="?", default=None, help="Optional repository folder path to focus on"
+        )
+        self._add_repo_arg(tree_p)
+        tree_p.add_argument(
+            "--max-depth", type=int, default=None, help="Maximum folder/file nesting depth"
+        )
+        tree_p.add_argument(
+            "--no-tests",
+            action="store_true",
+            default=False,
+            help="Exclude test files and test-only folders",
+        )
+        self._bind_handler(tree_p, "view.tree")
+
     def build(self) -> argparse.ArgumentParser:
         """Construct the complete ``cbi`` CLI ``ArgumentParser``."""
         sub_common = self._make_subcommand_common_parser()
@@ -432,6 +465,7 @@ class CliParserBuilder:
         self._add_search_parser(subparsers, sub_common)
         self._add_file_parsers(subparsers, sub_common)
         self._add_analysis_parsers(subparsers, sub_common)
+        self._add_view_parser(subparsers, sub_common)
         self._add_daemon_parsers(subparsers, sub_common)
         return parser
 

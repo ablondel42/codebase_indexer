@@ -1,6 +1,10 @@
 """Typed query and response Pydantic v2 models for the application engine layer."""
 
-from engine.models.collaborators import CommandCollaborators, QueryCollaborators
+from engine.models.collaborators import (
+    CommandCollaborators,
+    QueryCollaborators,
+    ViewCollaborators,
+)
 from engine.models.queries import (
     ContextQuery,
     ListFilesQuery,
@@ -43,4 +47,5 @@ __all__ = [
     "SymbolReferencesQuery",
     "SymbolSearchPage",
     "SymbolSnippetsQuery",
+    "ViewCollaborators",
 ]

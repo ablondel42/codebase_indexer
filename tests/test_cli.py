@@ -9,6 +9,7 @@ import pytest
 from cli.main import main
 from cli.services.app import CliApplication
 from cli.services.parser import CliParserBuilder
+from cli.utils.argv import preprocess_argv
 from core.models.config import AppConfig
 from core.models.enums import SymbolKind
 from core.utils.logging import reset_logging
@@ -109,3 +110,70 @@ def test_symbols_show_module_with_none_structural_parent_and_ambiguous_json_erro
         assert ambig_err["ok"] is False
         assert ambig_err["error"]["code"] == "ambiguous_symbol"
         assert len(ambig_err["error"]["details"]["candidates"]) == 2
+
+
+def test_cbi_view_tree_emits_nested_json_and_rejects_json_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``cbi view tree`` emits nested JSON by default and rejects ``--json``."""
+    assert preprocess_argv(["view", "tree"]) == ["view", "tree"]
+
+    parser = CliParserBuilder().build()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["view", "tree", "--json"])
+
+    repo_root = tmp_path / "tree_repo"
+    (repo_root / "src" / "pkg").mkdir(parents=True)
+    (repo_root / "tests").mkdir()
+    (repo_root / "README.md").write_text("# Tree Repo\n", encoding="utf-8")
+    (repo_root / "src" / "main.py").write_text(
+        "def run() -> int:\n    return 1\n",
+        encoding="utf-8",
+    )
+    (repo_root / "src" / "pkg" / "helper.py").write_text("X = 1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_main.py").write_text(
+        "def test_ok() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "view_cli.db"
+    with IndexerEngine(AppConfig(db_path=db_path, include_tests=True)) as engine:
+        engine.commands.index_repository(repo_root)
+        app = CliApplication(engine=engine)
+
+        assert app.run(["view", "tree", "--db-path", str(db_path)]) == 0
+        full_payload = json.loads(capsys.readouterr().out)
+        assert full_payload["repo_name"] == "tree_repo"
+        assert full_payload["root"]["name"] == "tree_repo"
+        assert full_payload["root"]["path"] == "."
+        assert [sub["name"] for sub in full_payload["root"]["folders"]] == ["src", "tests"]
+        assert [doc["file_path"] for doc in full_payload["root"]["files"]] == ["README.md"]
+        src_folder = full_payload["root"]["folders"][0]
+        assert [sub["name"] for sub in src_folder["folders"]] == ["pkg"]
+        assert [doc["file_path"] for doc in src_folder["folders"][0]["files"]] == [
+            "src/pkg/helper.py"
+        ]
+        assert [doc["file_path"] for doc in src_folder["files"]] == ["src/main.py"]
+
+        assert (
+            app.run(
+                [
+                    "view",
+                    "tree",
+                    "src",
+                    "--no-tests",
+                    "--max-depth",
+                    "1",
+                    "--db-path",
+                    str(db_path),
+                ]
+            )
+            == 0
+        )
+        focused = json.loads(capsys.readouterr().out)
+        assert focused["root"]["name"] == "src"
+        assert focused["root"]["path"] == "src"
+        assert [sub["name"] for sub in focused["root"]["folders"]] == ["pkg"]
+        assert focused["root"]["folders"][0]["files"] == []
+        assert [doc["file_path"] for doc in focused["root"]["files"]] == ["src/main.py"]

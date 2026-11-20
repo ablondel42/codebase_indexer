@@ -14,6 +14,7 @@ from indexing.services.batch import BatchIndexer
 from indexing.services.incremental import IncrementalIndexer
 from indexing.services.lsp_runner import RepoLspCoordinator
 from indexing.services.watcher import RepoWatcher
+from views.services.filesystem import FilesystemViewBuilder
 
 
 class CommandCollaborators(FrozenModel):
@@ -41,7 +42,16 @@ class QueryCollaborators(FrozenModel):
     code_search: CodeSearchService | None = None
 
 
+class ViewCollaborators(FrozenModel):
+    """Optional view-builder service overrides for ``ViewEngine``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    filesystem_builder: FilesystemViewBuilder | None = None
+
+
 __all__ = [
     "CommandCollaborators",
     "QueryCollaborators",
+    "ViewCollaborators",
 ]
