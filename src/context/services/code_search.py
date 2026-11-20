@@ -142,31 +142,35 @@ class CodeSearchService:
     def _enrich_page_symbols(
         self,
         uow: UnitOfWorkProtocol,
-        repo_id: str,
+        repo: RepoRecord,
         page_items: list[CodeMatchItem],
     ) -> list[CodeMatchItem]:
-        """Attach innermost enclosing Python symbol metadata onto ``page_items``."""
+        """Attach Cmd+Click ``location`` and innermost enclosing Python symbol metadata."""
         nodes_cache: dict[str, list[SymbolNode]] = {}
         enriched: list[CodeMatchItem] = []
+        root_path = Path(repo.root_path)
 
         for item in page_items:
+            match_loc = f"{root_path / item.file_path}:{item.line}:{item.column}"
             if item.language != "python":
-                enriched.append(item)
+                enriched.append(item.model_copy(update={"location": match_loc}))
                 continue
             if item.file_path not in nodes_cache:
-                file_id = derive_file_id(repo_id, item.file_path)
+                file_id = derive_file_id(repo.id, item.file_path)
                 nodes_cache[item.file_path] = uow.nodes.list_for_file(file_id)
             sym = self._find_enclosing_symbol(nodes_cache[item.file_path], item.line)
             if sym is None:
-                enriched.append(item)
+                enriched.append(item.model_copy(update={"location": match_loc}))
                 continue
             enriched.append(
                 item.model_copy(
                     update={
+                        "location": match_loc,
                         "symbol_id": sym.id,
                         "qualified_name": sym.qualified_name,
                         "symbol_kind": str(sym.kind),
                         "symbol_lines": f"{sym.start_line}-{sym.end_line}",
+                        "symbol_location": sym.location,
                     }
                 )
             )
@@ -243,7 +247,7 @@ class CodeSearchService:
         )
         enriched_page = self._enrich_page_symbols(
             uow,
-            repo.id,
+            repo,
             all_matches[query.offset : query.offset + query.limit],
         )
         return CodeSearchReport(

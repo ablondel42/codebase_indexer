@@ -47,6 +47,7 @@ class RiskTarget(FrozenModel):
     file_id: str
     file_path: str
     module_path: str
+    location: str | None = None
     visibility_hint: str | None = None
     parent_id: str | None = None
     lexical_parent_id: str | None = None

@@ -40,7 +40,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
     mod2_path.write_text("from mod1 import Class1\n", encoding="utf-8")
 
     factory = SqlUnitOfWorkFactory(tmp_path / "query.db")
-    repo_id = "repo:test:12345678"
+    repo_id = "project:test:12345678"
     f1 = FileRecord(
         id=f"file:{repo_id}:mod1.py",
         repo_id=repo_id,
@@ -65,7 +65,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
     )
     nodes = [
         SymbolNode(
-            id="sym:mod1",
+            id="node:mod1",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.MODULE,
@@ -82,7 +82,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id="sym:cls1",
+            id="node:cls1",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.CLASS,
@@ -92,7 +92,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             start_line=1,
             end_line=2,
             signature="class Class1",
-            parent_id="sym:mod1",
+            parent_id="node:mod1",
             visibility_hint="public",
             doc_summary="Base class",
             content_hash="sha256:c",
@@ -101,7 +101,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id="sym:func_pct",
+            id="node:func_pct",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.FUNCTION,
@@ -111,7 +111,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             start_line=5,
             end_line=10,
             signature="def compute_100%_rate()",
-            parent_id="sym:mod1",
+            parent_id="node:mod1",
             visibility_hint="public",
             doc_summary="Exact percent handler",
             content_hash="sha256:e",
@@ -120,7 +120,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id="sym:inner",
+            id="node:inner",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.LOCAL_FUNCTION,
@@ -129,17 +129,17 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             uri=f1.uri,
             start_line=6,
             end_line=8,
-            parent_id="sym:func_pct",
+            parent_id="node:func_pct",
             visibility_hint="local",
             doc_summary="Inner helper",
             content_hash="sha256:g",
             semantic_hash="sha256:h",
             scope=SymbolScope.FUNCTION,
-            lexical_parent_id="sym:func_pct",
+            lexical_parent_id="node:func_pct",
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id="sym:mod2",
+            id="node:mod2",
             repo_id=repo_id,
             file_id=f2.id,
             kind=SymbolKind.MODULE,
@@ -155,7 +155,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id="sym:sub",
+            id="node:sub",
             repo_id=repo_id,
             file_id=f2.id,
             kind=SymbolKind.CLASS,
@@ -164,7 +164,7 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             uri=f2.uri,
             start_line=2,
             end_line=5,
-            parent_id="sym:mod2",
+            parent_id="node:mod2",
             visibility_hint="public",
             content_hash="sha256:k",
             semantic_hash="sha256:l",
@@ -177,8 +177,8 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             id="edge:contains",
             repo_id=repo_id,
             kind=EdgeKind.CONTAINS,
-            from_id="sym:mod1",
-            to_id="sym:cls1",
+            from_id="node:mod1",
+            to_id="node:cls1",
             evidence_file_id=f1.id,
             evidence_uri=f1.uri,
         ),
@@ -186,8 +186,8 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             id="edge:scope",
             repo_id=repo_id,
             kind=EdgeKind.SCOPE_PARENT,
-            from_id="sym:inner",
-            to_id="sym:func_pct",
+            from_id="node:inner",
+            to_id="node:func_pct",
             evidence_file_id=f1.id,
             evidence_uri=f1.uri,
         ),
@@ -195,8 +195,8 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             id="edge:imp",
             repo_id=repo_id,
             kind=EdgeKind.IMPORTS,
-            from_id="sym:mod2",
-            to_id="sym:cls1",
+            from_id="node:mod2",
+            to_id="node:cls1",
             confidence=0.9,
             evidence_file_id=f2.id,
             evidence_uri=f2.uri,
@@ -210,8 +210,8 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             id="edge:inh",
             repo_id=repo_id,
             kind=EdgeKind.INHERITS,
-            from_id="sym:sub",
-            to_id="sym:cls1",
+            from_id="node:sub",
+            to_id="node:cls1",
             confidence=0.9,
             evidence_file_id=f2.id,
             evidence_uri=f2.uri,
@@ -221,8 +221,8 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
             id="edge:call",
             repo_id=repo_id,
             kind=EdgeKind.CALLS,
-            from_id="sym:sub",
-            to_id="sym:func_pct",
+            from_id="node:sub",
+            to_id="node:func_pct",
             confidence=0.9,
             evidence_file_id=f2.id,
             evidence_uri=f2.uri,
@@ -250,38 +250,40 @@ def query_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
 def test_symbol_and_hierarchy_lookups(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
     """Symbol lookups, batch ID fetches, members, and parent/child navigation work cleanly."""
     factory, _ = query_env
-    repo_id = "repo:test:12345678"
+    repo_id = "project:test:12345678"
     navigator = GraphNavigator()
 
     with factory.open(read_only=True) as uow:
-        cls1 = navigator.get_symbol(uow, "sym:cls1")
+        cls1 = navigator.get_symbol(uow, "node:cls1")
         assert cls1 is not None
-        summary = navigator.get_symbol_summary(uow, "sym:cls1")
+        summary = navigator.get_symbol_summary(uow, "node:cls1")
         assert summary is not None and summary.file_path == "mod1.py"
 
         by_qname = uow.nodes.get_by_qualified_name(repo_id, "mod1.Class1", SymbolKind.CLASS)
-        assert by_qname is not None and by_qname.id == "sym:cls1"
+        assert by_qname is not None and by_qname.id == "node:cls1"
         parent_sym = navigator.get_parent(uow, cls1)
-        assert parent_sym is not None and parent_sym.id == "sym:mod1"
+        assert parent_sym is not None and parent_sym.id == "node:mod1"
 
-        inner = navigator.get_symbol(uow, "sym:inner")
+        inner = navigator.get_symbol(uow, "node:inner")
         assert inner is not None
         lex_parent = navigator.get_lexical_parent(uow, inner)
-        assert lex_parent is not None and lex_parent.id == "sym:func_pct"
-        assert [c.id for c in navigator.get_lexical_children(uow, "sym:func_pct")] == ["sym:inner"]
-        assert {c.id for c in navigator.get_children(uow, "sym:mod1")} == {
-            "sym:cls1",
-            "sym:func_pct",
+        assert lex_parent is not None and lex_parent.id == "node:func_pct"
+        assert [c.id for c in navigator.get_lexical_children(uow, "node:func_pct")] == [
+            "node:inner"
+        ]
+        assert {c.id for c in navigator.get_children(uow, "node:mod1")} == {
+            "node:cls1",
+            "node:func_pct",
         }
-        assert {m.id for m in navigator.get_members(uow, "sym:mod1")} == {
-            "sym:cls1",
-            "sym:func_pct",
+        assert {m.id for m in navigator.get_members(uow, "node:mod1")} == {
+            "node:cls1",
+            "node:func_pct",
         }
         with pytest.raises(SymbolNotFoundError):
-            navigator.get_members(uow, "sym:missing")
+            navigator.get_members(uow, "node:missing")
 
-        batched_syms = uow.nodes.get_by_ids(["sym:cls1", "sym:sub", "sym:missing"])
-        assert set(batched_syms.keys()) == {"sym:cls1", "sym:sub"}
+        batched_syms = uow.nodes.get_by_ids(["node:cls1", "node:sub", "node:missing"])
+        assert set(batched_syms.keys()) == {"node:cls1", "node:sub"}
 
         batched_files = uow.files.get_by_ids(
             [f"file:{repo_id}:mod1.py", f"file:{repo_id}:mod2.py"]
@@ -298,28 +300,28 @@ def test_directed_edge_queries_subgraph_and_reference_report(
     ref_analyzer = ReferenceAnalyzer()
 
     with factory.open(read_only=True) as uow:
-        assert len(navigator.list_outgoing_edges(uow, "sym:mod1")) == 1
-        assert len(navigator.list_incoming_edges(uow, "sym:func_pct")) == 2  # scope_parent + calls
+        assert len(navigator.list_outgoing_edges(uow, "node:mod1")) == 1
+        assert len(navigator.list_incoming_edges(uow, "node:func_pct")) == 2  # scope_parent + calls
 
-        assert len(navigator.list_incoming_edges(uow, "sym:func_pct", EdgeKind.CALLS)) == 1
-        assert len(navigator.list_outgoing_edges(uow, "sym:sub", EdgeKind.CALLS)) == 1
-        assert len(navigator.list_incoming_edges(uow, "sym:cls1", EdgeKind.IMPORTS)) == 1
-        assert len(navigator.list_outgoing_edges(uow, "sym:mod2", EdgeKind.IMPORTS)) == 1
-        assert len(navigator.list_incoming_edges(uow, "sym:cls1", EdgeKind.INHERITS)) == 1
-        assert len(navigator.list_outgoing_edges(uow, "sym:sub", EdgeKind.INHERITS)) == 1
+        assert len(navigator.list_incoming_edges(uow, "node:func_pct", EdgeKind.CALLS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "node:sub", EdgeKind.CALLS)) == 1
+        assert len(navigator.list_incoming_edges(uow, "node:cls1", EdgeKind.IMPORTS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "node:mod2", EdgeKind.IMPORTS)) == 1
+        assert len(navigator.list_incoming_edges(uow, "node:cls1", EdgeKind.INHERITS)) == 1
+        assert len(navigator.list_outgoing_edges(uow, "node:sub", EdgeKind.INHERITS)) == 1
 
         subgraph = navigator.build_subgraph(
             uow,
-            ["sym:cls1"],
+            ["node:cls1"],
             SubgraphOptions(depth=1, max_nodes=10),
         )
         node_ids = {n.id for n in subgraph.nodes}
-        assert {"sym:cls1", "sym:mod1", "sym:mod2", "sym:sub"}.issubset(node_ids)
+        assert {"node:cls1", "node:mod1", "node:mod2", "node:sub"}.issubset(node_ids)
         assert subgraph.truncated is False
 
         trunc_sub = navigator.build_subgraph(
             uow,
-            ["sym:cls1"],
+            ["node:cls1"],
             SubgraphOptions(depth=1, max_nodes=2),
         )
         assert len(trunc_sub.nodes) == 2
@@ -327,7 +329,7 @@ def test_directed_edge_queries_subgraph_and_reference_report(
 
         report = ref_analyzer.inspect_references(
             uow,
-            "sym:cls1",
+            "node:cls1",
             ReferenceQueryOptions(direction=ReferenceDirection.INCOMING),
         )
         assert report.total_count == 2  # imports + inherits
@@ -337,14 +339,14 @@ def test_directed_edge_queries_subgraph_and_reference_report(
 def test_fts5_search_and_escaped_like(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
     """search_fts handles exact/prefix ranking, filters, and special tokens safely."""
     factory, _ = query_env
-    repo_id = "repo:test:12345678"
+    repo_id = "project:test:12345678"
 
     with factory.open(read_only=True) as uow:
         exact_hits = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query="Class1"))
-        assert exact_hits and exact_hits[0].id == "sym:cls1"
+        assert exact_hits and exact_hits[0].id == "node:cls1"
 
         prefix_hits = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query="Sub"))
-        assert [h.id for h in prefix_hits] == ["sym:sub"]
+        assert [h.id for h in prefix_hits] == ["node:sub"]
 
         filtered = uow.nodes.search_fts(
             SymbolSearchQuery(
@@ -354,19 +356,19 @@ def test_fts5_search_and_escaped_like(query_env: tuple[SqlUnitOfWorkFactory, Pat
                 file_path="mod2.py",
             )
         )
-        assert [h.id for h in filtered] == ["sym:sub"]
+        assert [h.id for h in filtered] == ["node:sub"]
 
         # Escaped LIKE: '%' and '_' must NOT act as SQLite wildcards
         pct_hits = uow.nodes.find_by_name(repo_id, "100%")
-        assert {h.id for h in pct_hits} == {"sym:func_pct", "sym:inner"}
+        assert {h.id for h in pct_hits} == {"node:func_pct", "node:inner"}
         rate_hits = uow.nodes.find_by_name(repo_id, "%_rate", kind=SymbolKind.FUNCTION)
-        assert [h.id for h in rate_hits] == ["sym:func_pct"]
+        assert [h.id for h in rate_hits] == ["node:func_pct"]
         assert uow.nodes.find_by_name(repo_id, "100_rate") == []
 
         fts_special = uow.nodes.search_fts(
             SymbolSearchQuery(repo_id=repo_id, query="100%", kind=SymbolKind.FUNCTION)
         )
-        assert [h.id for h in fts_special] == ["sym:func_pct"]
+        assert [h.id for h in fts_special] == ["node:func_pct"]
 
         # FTS operator / punctuation edge cases never raise sqlite3.OperationalError
         bad_fts = uow.nodes.search_fts(SymbolSearchQuery(repo_id=repo_id, query='NOT OR * "bad"'))
@@ -376,7 +378,7 @@ def test_fts5_search_and_escaped_like(query_env: tuple[SqlUnitOfWorkFactory, Pat
 def test_outline_helpers_and_disk_freshness(query_env: tuple[SqlUnitOfWorkFactory, Path]) -> None:
     """Outline helpers and check_file_freshness reflect live disk edits."""
     factory, repo_root = query_env
-    repo_id = "repo:test:12345678"
+    repo_id = "project:test:12345678"
     navigator = GraphNavigator()
 
     with factory.open(read_only=True) as uow:

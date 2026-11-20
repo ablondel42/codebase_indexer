@@ -181,7 +181,7 @@ def test_cbi_files_and_outline_json(
     assert outline_public.returncode == 0, outline_public.stderr
     outline_pub_data = json.loads(outline_public.stdout)
     calc_node = next(s for s in outline_pub_data["symbols"] if s["name"] == "Calculator")
-    assert calc_node["id"].startswith("sym:")
+    assert calc_node["id"].startswith("node:")
     assert [c["name"] for c in calc_node["children"]] == ["double"]
 
     outline_full = _run_cbi("outline", "pkg/math_ops.py", "--db-path", str(db_path), cwd=repo_root)
@@ -246,7 +246,7 @@ def test_cbi_symbols_and_source_commands(
     src_res = _run_cbi("source", "pkg.math_ops.add", "--db-path", str(db_path), cwd=repo_root)
     assert src_res.returncode == 0
     src_data = json.loads(src_res.stdout)
-    assert src_data["symbol_id"].startswith("sym:")
+    assert src_data["symbol_id"].startswith("node:")
     assert "def add(" in src_data["source"]
     assert "return a + b" in src_data["source"]
 

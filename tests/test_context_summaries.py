@@ -18,29 +18,29 @@ def test_evaluate_structural_counts_and_truncation() -> None:
     evaluator = ContextEvaluator()
     context = SymbolContext(
         focus_symbol=FocusSymbol(
-            id="sym:1",
+            id="node:1",
             kind=SymbolKind.CLASS,
             name="Svc",
             qualified_name="mod.Svc",
             scope=SymbolScope.MODULE,
         ),
         structural_parent=FocusSymbol(
-            id="sym:mod",
+            id="node:mod",
             kind=SymbolKind.MODULE,
             name="mod",
             qualified_name="mod",
         ),
         structural_children=[
-            CompactSymbol(id="sym:m1", kind=SymbolKind.METHOD, name="m1"),
-            CompactSymbol(id="sym:m2", kind=SymbolKind.METHOD, name="m2"),
+            CompactSymbol(id="node:m1", kind=SymbolKind.METHOD, name="m1"),
+            CompactSymbol(id="node:m2", kind=SymbolKind.METHOD, name="m2"),
         ],
         incoming_edges=[
-            ContextEdge(id="edge:e1", kind=EdgeKind.CALLS, from_id="sym:x", to_id="sym:1")
+            ContextEdge(id="edge:e1", kind=EdgeKind.CALLS, from_id="node:x", to_id="node:1")
         ],
         outgoing_edges=[
-            ContextEdge(id="edge:e2", kind=EdgeKind.CALLS, from_id="sym:1", to_id="sym:y")
+            ContextEdge(id="edge:e2", kind=EdgeKind.CALLS, from_id="node:1", to_id="node:y")
         ],
-        file_siblings=[CompactSymbol(id="sym:sib", kind=SymbolKind.FUNCTION, name="sib")],
+        file_siblings=[CompactSymbol(id="node:sib", kind=SymbolKind.FUNCTION, name="sib")],
     )
     summary = evaluator.evaluate_structural(
         context,
@@ -64,31 +64,31 @@ def test_evaluate_structural_counts_and_truncation() -> None:
 def test_nested_declaration_distinguishes_class_methods_from_function_locals() -> None:
     """Class methods are never classified as nested lexical declarations."""
     local_fn = FocusSymbol(
-        id="sym:lf",
+        id="node:lf",
         kind=SymbolKind.LOCAL_FUNCTION,
         name="inner",
         qualified_name="mod.fn.inner",
         scope=SymbolScope.FUNCTION,
-        lexical_parent_id="sym:fn",
+        lexical_parent_id="node:fn",
     )
     local_cls = FocusSymbol(
-        id="sym:lc",
+        id="node:lc",
         kind=SymbolKind.CLASS,
         name="LocalCls",
         qualified_name="mod.fn.LocalCls",
         scope=SymbolScope.FUNCTION,
-        lexical_parent_id="sym:fn",
+        lexical_parent_id="node:fn",
     )
     cls_method = FocusSymbol(
-        id="sym:m",
+        id="node:m",
         kind=SymbolKind.METHOD,
         name="run",
         qualified_name="mod.Cls.run",
         scope=SymbolScope.CLASS,
-        lexical_parent_id="sym:cls",
+        lexical_parent_id="node:cls",
     )
     mod_fn = FocusSymbol(
-        id="sym:f",
+        id="node:f",
         kind=SymbolKind.FUNCTION,
         name="f",
         qualified_name="mod.f",
@@ -109,7 +109,7 @@ def test_evaluate_confidence_placeholders_and_balanced_edge_selection() -> None:
     evaluator = ContextEvaluator()
     no_edges = SymbolContext(
         focus_symbol=FocusSymbol(
-            id="sym:1",
+            id="node:1",
             kind=SymbolKind.FUNCTION,
             name="f",
             qualified_name="mod.f",
@@ -125,7 +125,7 @@ def test_evaluate_confidence_placeholders_and_balanced_edge_selection() -> None:
     assert "unresolved_call:" in PLACEHOLDER_PREFIXES
     with_call_placeholder = SymbolContext(
         focus_symbol=FocusSymbol(
-            id="sym:1",
+            id="node:1",
             kind=SymbolKind.FUNCTION,
             name="f",
             qualified_name="mod.f",
@@ -135,7 +135,7 @@ def test_evaluate_confidence_placeholders_and_balanced_edge_selection() -> None:
             ContextEdge(
                 id="edge:p",
                 kind=EdgeKind.CALLS,
-                from_id="sym:1",
+                from_id="node:1",
                 to_id="unresolved_call:foo",
                 confidence=0.7,
             )
@@ -147,9 +147,9 @@ def test_evaluate_confidence_placeholders_and_balanced_edge_selection() -> None:
     assert conf_edges.contains_placeholder_targets is True
 
     edges = [
-        Edge(id="e1", repo_id="repo:r", kind=EdgeKind.CALLS, from_id="sym:1", to_id="sym:a"),
-        Edge(id="e2", repo_id="repo:r", kind=EdgeKind.CALLS, from_id="sym:1", to_id="sym:b"),
-        Edge(id="e3", repo_id="repo:r", kind=EdgeKind.IMPORTS, from_id="sym:1", to_id="sym:c"),
+        Edge(id="e1", repo_id="project:r", kind=EdgeKind.CALLS, from_id="node:1", to_id="node:a"),
+        Edge(id="e2", repo_id="project:r", kind=EdgeKind.CALLS, from_id="node:1", to_id="node:b"),
+        Edge(id="e3", repo_id="project:r", kind=EdgeKind.IMPORTS, from_id="node:1", to_id="node:c"),
     ]
     balanced = select_balanced_edges(edges, limit=2)
     assert {e.kind for e in balanced} == {EdgeKind.CALLS, EdgeKind.IMPORTS}

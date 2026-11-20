@@ -162,7 +162,7 @@ def test_build_symbol_context_edge_limit_and_missing(
         ContextBuildOptions(edge_limit=-1)
 
     with pytest.raises(SymbolNotFoundError), factory.open(read_only=True) as uow:
-        builder.build_context(uow, "sym:nonexistent")
+        builder.build_context(uow, "node:nonexistent")
 
 
 def test_build_file_outline_structure_and_filters(

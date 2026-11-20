@@ -264,6 +264,7 @@ def _serialize_cli_symbol_entry(symbol: SymbolSummary) -> dict[str, Any]:
         "kind": str(symbol.kind),
         "name": symbol.name,
         "qualified_name": symbol.qualified_name,
+        "location": symbol.location,
         "file_path": symbol.file_path or None,
         "module_path": symbol.module_path or None,
         "start_line": symbol.start_line,
@@ -323,6 +324,7 @@ def format_source_for_cli(snippet: SymbolSnippet) -> dict[str, Any]:
         "symbol_id": snippet.symbol_id,
         "qualified_name": snippet.qualified_name,
         "kind": str(snippet.kind),
+        "location": snippet.location,
         "module_path": snippet.module_path,
         "lines": snippet.lines,
         "signature": snippet.signature,
@@ -353,6 +355,7 @@ def _format_cli_focus_symbol(focus: FocusSymbol) -> dict[str, Any]:
         "kind": str(focus.kind),
         "name": focus.name,
         "qualified_name": focus.qualified_name,
+        "location": focus.location,
         "file_path": focus.file_path,
         "module_path": focus.module_path,
         "start_line": focus.start_line,
@@ -389,6 +392,7 @@ def _format_cli_context_edge(edge: ContextEdge) -> dict[str, Any]:
         "from_id": edge.from_id,
         "to_id": edge.to_id,
         "peer_name": edge.peer_name,
+        "location": edge.location,
         "file_path": edge.file_path,
         "line": edge.line,
         "confidence": edge.confidence,
@@ -438,18 +442,20 @@ def _format_cli_ref_site(site: ReferenceSiteEntry) -> dict[str, Any]:
         site: ``ReferenceSiteEntry`` model.
 
     Returns:
-        Dictionary matching the legacy ``cbi refs`` item shape.
+        Dictionary matching the ``cbi refs`` item shape.
     """
     return {
+        "id": site.id,
         "direction": site.direction,
         "kind": str(site.kind),
         "from_id": site.from_id,
         "to_id": site.to_id,
         "peer_id": site.peer_id,
         "peer_name": site.peer_name,
+        "location": site.location,
         "file_path": site.file_path,
         "line": site.line,
-        "location": site.location,
+        "column": site.column,
         "confidence": site.confidence,
         "source": site.source,
         "preview": site.preview,
@@ -463,7 +469,7 @@ def format_references_for_cli(report: SymbolReferencesReport) -> dict[str, Any]:
         report: ``SymbolReferencesReport`` model.
 
     Returns:
-        Dictionary matching the legacy ``cbi refs`` JSON structure.
+        Dictionary matching the ``cbi refs`` JSON structure.
     """
     sym = report.symbol
     return {
@@ -471,6 +477,7 @@ def format_references_for_cli(report: SymbolReferencesReport) -> dict[str, Any]:
             "id": sym.id,
             "kind": str(sym.kind),
             "qualified_name": sym.qualified_name,
+            "location": sym.location,
             "file_path": sym.file_path,
             "lines": sym.lines,
             "signature": sym.signature,
@@ -500,6 +507,7 @@ def _serialize_cli_risk_target(target: RiskTarget) -> dict[str, Any]:
         "qualified_name": target.qualified_name,
         "kind": str(target.kind),
         "scope": target.scope,
+        "location": target.location,
         "file_path": target.file_path,
         "module_path": target.module_path,
         "lines": format_line_span(target.start_line, target.end_line),
@@ -581,26 +589,22 @@ def format_mcp_call_envelope(tool_name: str, raw_response: str) -> tuple[McpCall
 
 def _serialize_cli_code_match(item: CodeMatchItem) -> dict[str, Any]:
     """Serialize a ``CodeMatchItem`` omitting empty context tuples and ``None`` symbol fields."""
-    entry: dict[str, Any] = {
+    raw: dict[str, Any] = {
+        "location": item.location,
         "file_path": item.file_path,
         "language": item.language,
         "line": item.line,
         "column": item.column,
         "preview": item.preview,
+        "context_before": list(item.context_before) if item.context_before else None,
+        "context_after": list(item.context_after) if item.context_after else None,
+        "symbol_id": item.symbol_id,
+        "qualified_name": item.qualified_name,
+        "symbol_kind": item.symbol_kind,
+        "symbol_lines": item.symbol_lines,
+        "symbol_location": item.symbol_location,
     }
-    if item.context_before:
-        entry["context_before"] = list(item.context_before)
-    if item.context_after:
-        entry["context_after"] = list(item.context_after)
-    if item.symbol_id is not None:
-        entry["symbol_id"] = item.symbol_id
-    if item.qualified_name is not None:
-        entry["qualified_name"] = item.qualified_name
-    if item.symbol_kind is not None:
-        entry["symbol_kind"] = item.symbol_kind
-    if item.symbol_lines is not None:
-        entry["symbol_lines"] = item.symbol_lines
-    return entry
+    return {key: val for key, val in raw.items() if val is not None}
 
 
 def format_code_search_for_cli(report: CodeSearchReport) -> dict[str, Any]:

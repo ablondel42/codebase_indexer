@@ -126,8 +126,8 @@ class TestMapperUtf16AndFraming:
         assert range_contains(inner, outer) is False
 
         mod_sym = SymbolNode(
-            id="sym:mod",
-            repo_id="repo:r",
+            id="node:mod",
+            repo_id="project:r",
             file_id="file:r:a.py",
             kind=SymbolKind.MODULE,
             name="a",
@@ -136,8 +136,8 @@ class TestMapperUtf16AndFraming:
             decl_range=outer,
         )
         fn_sym = SymbolNode(
-            id="sym:fn",
-            repo_id="repo:r",
+            id="node:fn",
+            repo_id="project:r",
             file_id="file:r:a.py",
             kind=SymbolKind.FUNCTION,
             name="fn",
@@ -146,9 +146,9 @@ class TestMapperUtf16AndFraming:
             decl_range=outer,
         )
         picked = pick_smallest_containing_symbol([mod_sym, fn_sym], outer)
-        assert picked is not None and picked.id == "sym:fn"
+        assert picked is not None and picked.id == "node:fn"
         mod_node = find_module_node_for_file([mod_sym, fn_sym])
-        assert mod_node is not None and mod_node.id == "sym:mod"
+        assert mod_node is not None and mod_node.id == "node:mod"
 
     def test_normalize_location_and_framing_helpers(self) -> None:
         """normalize_location handles Location/LocationLink and framing enforces bounds."""
@@ -191,8 +191,8 @@ class TestResolverAndPosition:
     def test_query_position_preference_and_missing(self) -> None:
         """Prefers selection_range.start, falls back to decl_range, raises LspError if missing."""
         sym = SymbolNode(
-            id="sym:1",
-            repo_id="repo:r",
+            id="node:1",
+            repo_id="project:r",
             file_id="file:r:a.py",
             kind=SymbolKind.FUNCTION,
             name="f",
@@ -227,7 +227,7 @@ class TestResolverAndPosition:
         symlink_root = tmp_path / "link_repo"
         symlink_root.symlink_to(real_root)
 
-        repo_id = "repo:real_repo:12345678"
+        repo_id = "project:real_repo:12345678"
         with uow_factory.open() as uow:
             uow.repos.upsert(
                 RepoRecord(
@@ -272,7 +272,7 @@ class TestReferenceEdgePersistenceAndStats:
         tmp_path: Path,
     ) -> None:
         """replace_lsp_references_for_target stores single JSON and switches stats to LSP."""
-        repo_id = "repo:test:12345678"
+        repo_id = "project:test:12345678"
         file_rec = FileRecord(
             id=f"file:{repo_id}:a.py",
             repo_id=repo_id,
@@ -283,8 +283,8 @@ class TestReferenceEdgePersistenceAndStats:
             size_bytes=10,
             last_modified_at="2026-01-01T00:00:00Z",
         )
-        target_id = f"sym:{repo_id}:function:a.target"
-        caller_id = f"sym:{repo_id}:function:a.caller"
+        target_id = f"node:{repo_id}:function:a.target"
+        caller_id = f"node:{repo_id}:function:a.caller"
         target_node = SymbolNode(
             id=target_id,
             repo_id=repo_id,
@@ -332,6 +332,34 @@ class TestReferenceEdgePersistenceAndStats:
                     end=Position(line=2, character=10),
                 ),
             )
+            assert edge.id == f"edge:{repo_id}:references:{caller_id}@3:5->{target_id}"
+            assert edge.location == "/tmp/a.py:3:5"
+            assert edge.confidence == 0.9
+
+            module_node = SymbolNode(
+                id=f"node:{repo_id}:module:a",
+                repo_id=repo_id,
+                file_id=file_rec.id,
+                kind=SymbolKind.MODULE,
+                name="a",
+                qualified_name="a",
+                uri=file_rec.uri,
+            )
+            mod_edge = build_reference_edge(
+                repo_id=repo_id,
+                target=target_node,
+                source=module_node,
+                file_id=file_rec.id,
+                evidence_uri=file_rec.uri,
+                usage_range=Range(
+                    start=Position(line=0, character=12),
+                    end=Position(line=0, character=18),
+                ),
+            )
+            assert mod_edge.confidence == 0.9
+            assert mod_edge.payload["mapping_mode"] == "module_scope"
+            assert mod_edge.id == f"edge:{repo_id}:references:{module_node.id}@1:13->{target_id}"
+            assert mod_edge.location == "/tmp/a.py:1:13"
             uow.edges.replace_lsp_references_for_target(repo_id, target_id, [edge])
             uow.refresh.upsert(
                 ReferenceRefreshState(

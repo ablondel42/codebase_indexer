@@ -51,8 +51,8 @@ class TestIdDerivation:
         id_a = derive_repo_id(repo_a)
         id_b = derive_repo_id(repo_b)
 
-        assert re.fullmatch(r"repo:service:[0-9a-f]{8}", id_a)
-        assert re.fullmatch(r"repo:service:[0-9a-f]{8}", id_b)
+        assert re.fullmatch(r"project:service:[0-9a-f]{8}", id_a)
+        assert re.fullmatch(r"project:service:[0-9a-f]{8}", id_b)
         assert id_a != id_b
         assert id_a == derive_repo_id(repo_a)
 

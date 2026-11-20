@@ -76,6 +76,7 @@ class RiskFactCollector:
             file_id=summary.file_id,
             file_path=summary.file_path,
             module_path=summary.module_path,
+            location=summary.location,
             visibility_hint=summary.visibility_hint,
             parent_id=summary.parent_id,
             lexical_parent_id=summary.lexical_parent_id,

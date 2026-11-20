@@ -21,7 +21,7 @@ class TextDocumentMeta(FrozenModel):
     """Persisted metadata row from ``text_files`` excluding raw ``content`` text."""
 
     id: str = Field(..., min_length=1, pattern="^file:.+")
-    repo_id: str = Field(..., min_length=1, pattern="^repo:.+")
+    repo_id: str = Field(..., min_length=1, pattern="^project:.+")
     file_path: str = Field(..., min_length=1)
     language: str = "text"
     content_hash: str = Field(..., pattern="^sha256:.+")
@@ -35,7 +35,7 @@ class TextDocumentRecord(FrozenModel):
     """Canonical UTF-8 repository text document stored in ``text_files`` and ``text_fts``."""
 
     id: str = Field(..., min_length=1, pattern="^file:.+")
-    repo_id: str = Field(..., min_length=1, pattern="^repo:.+")
+    repo_id: str = Field(..., min_length=1, pattern="^project:.+")
     file_path: str = Field(..., min_length=1)
     language: str = "text"
     content_hash: str = Field(..., pattern="^sha256:.+")
@@ -88,12 +88,14 @@ class CodeMatchItem(FrozenModel):
     line: int = Field(..., ge=1)
     column: int = Field(..., ge=1)
     preview: str
+    location: str | None = None
     context_before: tuple[str, ...] = ()
     context_after: tuple[str, ...] = ()
     symbol_id: str | None = None
     qualified_name: str | None = None
     symbol_kind: str | None = None
     symbol_lines: str | None = None
+    symbol_location: str | None = None
 
 
 class CodeSearchStats(FrozenModel):

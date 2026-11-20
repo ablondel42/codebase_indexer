@@ -65,17 +65,17 @@ def test_app_config_and_build_config_defaults() -> None:
 def test_repo_and_file_record_v2_fields() -> None:
     """RepoRecord and FileRecord support v0.2.0 fields and ISO timestamp validation."""
     repo = RepoRecord(
-        id="repo:test:1234abcd",
+        id="project:test:1234abcd",
         root_path="/path/to/repo",
         name="test-repo",
         default_language=Language.PYTHON,
         created_at="2026-03-23T00:00:00Z",
     )
-    assert repo.id == "repo:test:1234abcd"
+    assert repo.id == "project:test:1234abcd"
     assert repo.last_indexed_at is None
 
     file_rec = FileRecord(
-        id="file:repo:test:1234abcd:app/main.py",
+        id="file:project:test:1234abcd:app/main.py",
         repo_id=repo.id,
         file_path="app/main.py",
         uri="file:///path/to/repo/app/main.py",
@@ -92,7 +92,7 @@ def test_repo_and_file_record_v2_fields() -> None:
 
     with pytest.raises(PydanticValidationError):
         FileRecord(
-            id="file:repo:test:1234abcd:app/main.py",
+            id="file:project:test:1234abcd:app/main.py",
             repo_id=repo.id,
             file_path="app/main.py",
             uri="file:///path/to/repo/app/main.py",
@@ -125,9 +125,9 @@ def test_symbol_node_supports_all_v2_kinds_and_structured_ranges(kind: SymbolKin
     long_name = "S" * 512
     node = SymbolNode.model_validate(
         {
-            "id": f"sym:repo:test:{kind.value}:app.{long_name}",
-            "repo_id": "repo:test:1234abcd",
-            "file_id": "file:repo:test:1234abcd:app/service.py",
+            "id": f"node:project:test:{kind.value}:app.{long_name}",
+            "repo_id": "project:test:1234abcd",
+            "file_id": "file:project:test:1234abcd:app/service.py",
             "kind": kind.value,
             "name": long_name,
             "qualified_name": f"app.{long_name}",
@@ -174,9 +174,9 @@ def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> No
     with pytest.raises(PydanticValidationError):
         SymbolNode.model_validate(
             {
-                "id": "sym:repo:test:constant:app.X",
-                "repo_id": "repo:test:1234abcd",
-                "file_id": "file:repo:test:1234abcd:app/service.py",
+                "id": "node:project:test:constant:app.X",
+                "repo_id": "project:test:1234abcd",
+                "file_id": "file:project:test:1234abcd:app/service.py",
                 "kind": "constant",
                 "name": "X",
                 "qualified_name": "app.X",
@@ -188,9 +188,9 @@ def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> No
     with pytest.raises(PydanticValidationError):
         SymbolNode.model_validate(
             {
-                "id": "sym:repo:test:constant:app.X",
-                "repo_id": "repo:test:1234abcd",
-                "file_id": "file:repo:test:1234abcd:app/service.py",
+                "id": "node:project:test:constant:app.X",
+                "repo_id": "project:test:1234abcd",
+                "file_id": "file:project:test:1234abcd:app/service.py",
                 "kind": "constant",
                 "name": "X",
                 "qualified_name": "app.X",
@@ -201,9 +201,9 @@ def test_symbol_node_rejects_extra_legacy_json_fields_and_oversized_name() -> No
 
     with pytest.raises(PydanticValidationError):
         SymbolNode(
-            id="sym:repo:test:constant:app.X",
-            repo_id="repo:test:1234abcd",
-            file_id="file:repo:test:1234abcd:app/service.py",
+            id="node:project:test:constant:app.X",
+            repo_id="project:test:1234abcd",
+            file_id="file:project:test:1234abcd:app/service.py",
             kind=SymbolKind.CONSTANT,
             name="X" * 1025,
             qualified_name="app.X",
@@ -226,11 +226,11 @@ def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKin
     """Edge accepts normalized v2 kinds and structured evidence_range, rejecting bad inputs."""
     edge = Edge.model_validate(
         {
-            "id": f"edge:repo:test:{kind.value}:a->b",
-            "repo_id": "repo:test:1234abcd",
+            "id": f"edge:project:test:{kind.value}:a->b",
+            "repo_id": "project:test:1234abcd",
             "kind": kind.value,
-            "from_id": "sym:a",
-            "to_id": "sym:b",
+            "from_id": "node:a",
+            "to_id": "node:b",
             "payload": {"target": "b"},
             "evidence_range": {
                 "start": {"line": 1, "character": 0},
@@ -247,10 +247,10 @@ def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKin
         Edge.model_validate(
             {
                 "id": "edge:bad",
-                "repo_id": "repo:test:1234abcd",
+                "repo_id": "project:test:1234abcd",
                 "kind": "calls",
-                "from_id": "sym:a",
-                "to_id": "sym:b",
+                "from_id": "node:a",
+                "to_id": "node:b",
                 "evidence_range_json": "[legacy",
             }
         )
@@ -259,10 +259,10 @@ def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKin
         Edge.model_validate(
             {
                 "id": "edge:legacy_kind",
-                "repo_id": "repo:test:1234abcd",
+                "repo_id": "project:test:1234abcd",
                 "kind": "SCOPE_PARENT",
-                "from_id": "sym:a",
-                "to_id": "sym:b",
+                "from_id": "node:a",
+                "to_id": "node:b",
             }
         )
 
@@ -270,19 +270,19 @@ def test_edge_supports_normalized_v2_kinds_and_structured_evidence(kind: EdgeKin
 def test_symbol_context_and_risk_assessment_frozen_and_independent_defaults() -> None:
     """SymbolContext and RiskAssessment are immutable FrozenModels with isolated defaults."""
     focus1 = FocusSymbol(
-        id="sym:repo:test:function:app.fn1",
+        id="node:project:test:function:app.fn1",
         kind=SymbolKind.FUNCTION,
         name="fn1",
         qualified_name="app.fn1",
     )
     focus2 = FocusSymbol(
-        id="sym:repo:test:function:app.fn2",
+        id="node:project:test:function:app.fn2",
         kind=SymbolKind.FUNCTION,
         name="fn2",
         qualified_name="app.fn2",
     )
     child = CompactSymbol(
-        id="sym:repo:test:local_function:app.fn1.inner",
+        id="node:project:test:local_function:app.fn1.inner",
         kind=SymbolKind.LOCAL_FUNCTION,
         name="inner",
     )
@@ -294,11 +294,11 @@ def test_symbol_context_and_risk_assessment_frozen_and_independent_defaults() ->
         ctx1.structural_children = []
 
     target = RiskTarget(
-        symbol_id="sym:repo:test:function:app.fn1",
+        symbol_id="node:project:test:function:app.fn1",
         qualified_name="app.fn1",
         kind=SymbolKind.FUNCTION,
         scope="module",
-        file_id="file:repo:test:app.py",
+        file_id="file:project:test:app.py",
         file_path="app.py",
         module_path="app",
     )
@@ -323,13 +323,13 @@ def test_to_json_from_json_and_timestamp_helpers() -> None:
     assert to_json(Position(line=10, character=5)) == '{"character": 5, "line": 10}'
 
     repo = RepoRecord(
-        id="repo:test:1234abcd",
+        id="project:test:1234abcd",
         root_path="/tmp/repo",
         name="repo",
         created_at="2026-01-01T00:00:00Z",
     )
     dumped = from_json(to_json({"repo": repo, "path": Path("/tmp/repo")}))
-    assert dumped["repo"]["id"] == "repo:test:1234abcd"
+    assert dumped["repo"]["id"] == "project:test:1234abcd"
     assert dumped["path"] == "/tmp/repo"
     assert from_json(to_json(repo))["name"] == "repo"
 

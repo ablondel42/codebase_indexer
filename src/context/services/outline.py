@@ -12,6 +12,7 @@ from core.models.node import SymbolNode
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.file_io import format_line_span
 from core.utils.logging import get_logger
+from core.utils.pathing import format_edge_location
 from graph.services.navigator import GraphNavigator
 from graph.utils.predicates import derive_target_lines
 
@@ -120,6 +121,7 @@ class OutlineBuilder:
                     id=child.id,
                     kind=child.kind,
                     name=child.name,
+                    location=child.location,
                     lines=format_line_span(start_line, end_line),
                     signature=child.signature,
                     doc=child.doc_summary,
@@ -192,6 +194,7 @@ class OutlineBuilder:
         )
         return FileOutline(
             file_path=file_record.file_path,
+            location=format_edge_location(file_record.uri),
             module_path=file_record.module_path,
             line_count=file_record.line_count,
             is_fresh=freshness.is_fresh,

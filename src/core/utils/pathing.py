@@ -3,9 +3,11 @@
 import hashlib
 import stat
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from core.models.enums import PREFIX_FILE, PREFIX_REPO
 from core.models.exceptions import PathSecurityError
+from core.models.range import Range
 from core.utils.logging import get_logger
 
 logger = get_logger("core.utils.pathing")
@@ -286,3 +288,48 @@ def derive_module_path(repo_root: Path, file_path: Path) -> str:
         return Path(repo_root).resolve().name or "__init__"
 
     return ".".join(parts)
+
+
+def uri_to_file_path(uri: str | None) -> str | None:
+    """Convert a ``file://`` URI into a clean filesystem path string."""
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme != "file" or not parsed.path:
+        return None
+    decoded = unquote(parsed.path)
+    if len(decoded) >= 3 and decoded[0] == "/" and decoded[2] == ":" and decoded[1].isalpha():
+        decoded = decoded[1:]
+    return decoded
+
+
+def format_symbol_location(
+    uri: str | None,
+    selection_range: Range | None = None,
+    decl_range: Range | None = None,
+    start_line: int | None = None,
+) -> str | None:
+    """Format a 1-based Cmd+Click ``/abs/path:line:col`` jump string for a symbol."""
+    abs_path = uri_to_file_path(uri)
+    if not abs_path:
+        return None
+    if selection_range is not None:
+        return f"{abs_path}:{selection_range.start.line + 1}:{selection_range.start.character + 1}"
+    if decl_range is not None:
+        return f"{abs_path}:{decl_range.start.line + 1}:{decl_range.start.character + 1}"
+    if start_line is not None and start_line >= 1:
+        return f"{abs_path}:{start_line}:1"
+    return f"{abs_path}:1:1"
+
+
+def format_edge_location(
+    evidence_uri: str | None,
+    evidence_range: Range | None = None,
+) -> str | None:
+    """Format a 1-based Cmd+Click ``/abs/path:line:col`` jump string for an edge site."""
+    abs_path = uri_to_file_path(evidence_uri)
+    if not abs_path:
+        return None
+    if evidence_range is not None:
+        return f"{abs_path}:{evidence_range.start.line + 1}:{evidence_range.start.character + 1}"
+    return f"{abs_path}:1:1"

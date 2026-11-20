@@ -47,7 +47,7 @@ def risk_env(tmp_path: Path) -> tuple[SqlUnitOfWorkFactory, Path]:
 
 def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> str:
     """Populate a realistic two-module graph backed by real disk files."""
-    repo_id = "repo:test:12345678"
+    repo_id = "project:test:12345678"
     f1_disk = repo_root / "src" / "module1.py"
     f2_disk = repo_root / "src" / "module2.py"
     f1_disk.write_text(
@@ -87,7 +87,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
     )
     nodes = [
         SymbolNode(
-            id=f"sym:{repo_id}:class:src.module1.BaseModel",
+            id=f"node:{repo_id}:class:src.module1.BaseModel",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.CLASS,
@@ -104,7 +104,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id=f"sym:{repo_id}:method:src.module1.BaseModel.save",
+            id=f"node:{repo_id}:method:src.module1.BaseModel.save",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.METHOD,
@@ -114,7 +114,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             start_line=2,
             end_line=3,
             signature="def save(self)",
-            parent_id=f"sym:{repo_id}:class:src.module1.BaseModel",
+            parent_id=f"node:{repo_id}:class:src.module1.BaseModel",
             visibility_hint="public",
             content_hash="sha256:c",
             semantic_hash="sha256:d",
@@ -122,7 +122,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id=f"sym:{repo_id}:function:src.module1.func1",
+            id=f"node:{repo_id}:function:src.module1.func1",
             repo_id=repo_id,
             file_id=f1.id,
             kind=SymbolKind.FUNCTION,
@@ -139,7 +139,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id=f"sym:{repo_id}:class:src.module2.ChildModel",
+            id=f"node:{repo_id}:class:src.module2.ChildModel",
             repo_id=repo_id,
             file_id=f2.id,
             kind=SymbolKind.CLASS,
@@ -156,7 +156,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             last_indexed_at="2026-01-01T00:00:00Z",
         ),
         SymbolNode(
-            id=f"sym:{repo_id}:function:src.module2.func2",
+            id=f"node:{repo_id}:function:src.module2.func2",
             repo_id=repo_id,
             file_id=f2.id,
             kind=SymbolKind.FUNCTION,
@@ -178,8 +178,8 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             id=f"edge:{repo_id}:inherits:child->base",
             repo_id=repo_id,
             kind=EdgeKind.INHERITS,
-            from_id=f"sym:{repo_id}:class:src.module2.ChildModel",
-            to_id=f"sym:{repo_id}:class:src.module1.BaseModel",
+            from_id=f"node:{repo_id}:class:src.module2.ChildModel",
+            to_id=f"node:{repo_id}:class:src.module1.BaseModel",
             confidence=0.9,
             evidence_file_id=f2.id,
             evidence_uri=f2.uri,
@@ -190,8 +190,8 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             id=f"edge:{repo_id}:references:func2->func1",
             repo_id=repo_id,
             kind=EdgeKind.REFERENCES,
-            from_id=f"sym:{repo_id}:function:src.module2.func2",
-            to_id=f"sym:{repo_id}:function:src.module1.func1",
+            from_id=f"node:{repo_id}:function:src.module2.func2",
+            to_id=f"node:{repo_id}:function:src.module1.func1",
             source="lsp",
             confidence=0.9,
             evidence_file_id=f2.id,
@@ -207,8 +207,8 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
             id=f"edge:{repo_id}:calls:func2->func1",
             repo_id=repo_id,
             kind=EdgeKind.CALLS,
-            from_id=f"sym:{repo_id}:function:src.module2.func2",
-            to_id=f"sym:{repo_id}:function:src.module1.func1",
+            from_id=f"node:{repo_id}:function:src.module2.func2",
+            to_id=f"node:{repo_id}:function:src.module1.func1",
             confidence=0.9,
             evidence_file_id=f2.id,
             evidence_uri=f2.uri,
@@ -232,7 +232,7 @@ def _seed_two_module_graph(factory: SqlUnitOfWorkFactory, repo_root: Path) -> st
         uow.edges.upsert_many(edges)
         uow.refresh.upsert(
             ReferenceRefreshState(
-                target_symbol_id=f"sym:{repo_id}:function:src.module1.func1",
+                target_symbol_id=f"node:{repo_id}:function:src.module1.func1",
                 available=True,
                 last_refreshed_at="2026-01-01T00:00:00Z",
                 refresh_status=RefreshStatus.OK,
@@ -251,7 +251,7 @@ def test_load_risk_targets_populates_file_metadata_from_files_join(
     collector = RiskFactCollector()
 
     with factory.open(read_only=True) as uow:
-        targets = collector.load_targets(uow, [f"sym:{repo_id}:class:src.module1.BaseModel"])
+        targets = collector.load_targets(uow, [f"node:{repo_id}:class:src.module1.BaseModel"])
         assert len(targets) == 1
         t = targets[0]
         assert t.file_path == "src/module1.py"
@@ -261,7 +261,7 @@ def test_load_risk_targets_populates_file_metadata_from_files_join(
         assert t.end_line == 3
 
         with pytest.raises(SymbolNotFoundError, match="Symbol not found"):
-            collector.load_targets(uow, ["sym:missing"])
+            collector.load_targets(uow, ["node:missing"])
 
         with pytest.raises(ValidationError):
             collector.load_targets(uow, [])
@@ -270,7 +270,7 @@ def test_load_risk_targets_populates_file_metadata_from_files_join(
 def test_is_public_like_checks_local_scope_before_visibility_hint() -> None:
     """Local functions (scope=='function') are never public-like even with visibility='public'."""
     local_target = RiskTarget(
-        symbol_id="sym:local",
+        symbol_id="node:local",
         qualified_name="mod.outer.helper",
         kind=SymbolKind.LOCAL_FUNCTION,
         scope="function",
@@ -282,7 +282,7 @@ def test_is_public_like_checks_local_scope_before_visibility_hint() -> None:
     assert is_public_like(local_target) is False
 
     dunder = RiskTarget(
-        symbol_id="sym:init",
+        symbol_id="node:init",
         qualified_name="mod.Cls.__init__",
         kind=SymbolKind.METHOD,
         scope="class",
@@ -294,7 +294,7 @@ def test_is_public_like_checks_local_scope_before_visibility_hint() -> None:
     assert is_public_like(dunder) is True
 
     priv = RiskTarget(
-        symbol_id="sym:priv",
+        symbol_id="node:priv",
         qualified_name="mod._helper",
         kind=SymbolKind.FUNCTION,
         scope="module",
@@ -317,15 +317,15 @@ def test_base_class_incoming_inherits_and_method_inheritance_risk(
 
     with factory.open(read_only=True) as uow:
         for sym_id in (
-            f"sym:{repo_id}:class:src.module1.BaseModel",
-            f"sym:{repo_id}:class:src.module2.ChildModel",
-            f"sym:{repo_id}:method:src.module1.BaseModel.save",
+            f"node:{repo_id}:class:src.module1.BaseModel",
+            f"node:{repo_id}:class:src.module2.ChildModel",
+            f"node:{repo_id}:method:src.module1.BaseModel.save",
         ):
             targets = collector.load_targets(uow, [sym_id])
             facts = collector.collect_facts(uow, targets)
             assert facts.inheritance_involved is True
 
-        base_result = analyzer.analyze_symbol(uow, f"sym:{repo_id}:class:src.module1.BaseModel")
+        base_result = analyzer.analyze_symbol(uow, f"node:{repo_id}:class:src.module1.BaseModel")
         assert RiskIssueCode.INHERITANCE_RISK.value in base_result.issues
 
 
@@ -338,7 +338,7 @@ def test_multi_module_targets_and_cross_module_impact(
     analyzer = RiskAnalyzer()
 
     with factory.open(read_only=True) as uow:
-        single = analyzer.analyze_symbol(uow, f"sym:{repo_id}:function:src.module1.func1")
+        single = analyzer.analyze_symbol(uow, f"node:{repo_id}:function:src.module1.func1")
         assert single.facts.cross_file_impact is True
         assert single.facts.cross_module_impact is True
         assert RiskIssueCode.CROSS_FILE_IMPACT.value in single.issues
@@ -348,8 +348,8 @@ def test_multi_module_targets_and_cross_module_impact(
         multi = analyzer.analyze_targets(
             uow,
             [
-                f"sym:{repo_id}:function:src.module1.func1",
-                f"sym:{repo_id}:function:src.module2.func2",
+                f"node:{repo_id}:function:src.module1.func1",
+                f"node:{repo_id}:function:src.module2.func2",
             ],
         )
         assert multi.facts.target_spans_multiple_files is True
@@ -365,7 +365,7 @@ def test_disk_staleness_and_low_confidence_edge_capping(
     """RiskFactCollector detects modified disk files and caps low_confidence_edges at 25."""
     factory, repo_root = risk_env
     repo_id = _seed_two_module_graph(factory, repo_root)
-    target_id = f"sym:{repo_id}:function:src.module1.func1"
+    target_id = f"node:{repo_id}:function:src.module1.func1"
     f2_id = f"file:{repo_id}:src/module2.py"
 
     low_edges = [
@@ -373,7 +373,7 @@ def test_disk_staleness_and_low_confidence_edge_capping(
             id=f"edge:low:{i}",
             repo_id=repo_id,
             kind=EdgeKind.REFERENCES,
-            from_id=f"sym:{repo_id}:function:src.module2.func2",
+            from_id=f"node:{repo_id}:function:src.module2.func2",
             to_id=target_id,
             source="lsp",
             confidence=0.5,

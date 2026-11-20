@@ -18,6 +18,7 @@ class CompactSymbol(FrozenModel):
     id: str
     kind: SymbolKind
     name: str
+    location: str | None = None
     lines: str | None = None
     signature: str | None = None
     doc_summary: str | None = None
@@ -30,6 +31,7 @@ class FocusSymbol(FrozenModel):
     kind: SymbolKind
     name: str
     qualified_name: str
+    location: str | None = None
     file_path: str | None = None
     module_path: str | None = None
     start_line: int | None = None
@@ -58,6 +60,7 @@ class ContextEdge(FrozenModel):
     from_id: str
     to_id: str
     peer_name: str | None = None
+    location: str | None = None
     file_path: str | None = None
     line: int | None = None
     confidence: float = 1.0

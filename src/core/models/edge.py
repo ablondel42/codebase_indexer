@@ -7,6 +7,7 @@ from pydantic import Field, field_validator
 from core.models.base import FrozenModel
 from core.models.enums import EdgeKind, SymbolKind, SymbolScope
 from core.models.range import Range
+from core.utils.pathing import format_edge_location
 from core.utils.timestamps import validate_iso_timestamp
 
 
@@ -24,7 +25,14 @@ class Edge(FrozenModel):
     evidence_file_id: str | None = None
     evidence_uri: str | None = None
     evidence_range: Range | None = None
+    location: str | None = None
     last_indexed_at: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Populate Cmd+Click ``location`` from ``evidence_uri`` and ``evidence_range``."""
+        if self.location is None and self.evidence_uri:
+            computed = format_edge_location(self.evidence_uri, self.evidence_range)
+            object.__setattr__(self, "location", computed)
 
     @field_validator("last_indexed_at")
     @classmethod

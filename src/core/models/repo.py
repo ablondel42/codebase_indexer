@@ -10,7 +10,7 @@ from core.utils.timestamps import validate_iso_timestamp
 class RepoRecord(FrozenModel):
     """Canonical record representing an indexed repository on disk."""
 
-    id: str = Field(..., min_length=1, pattern=r"^repo:.+")
+    id: str = Field(..., min_length=1, pattern=r"^project:.+")
     root_path: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
     default_language: Language = Field(default=Language.PYTHON)

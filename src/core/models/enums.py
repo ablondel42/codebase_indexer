@@ -96,9 +96,9 @@ REFERENCE_AND_DEPENDENCY_EDGE_KINDS: tuple[EdgeKind, ...] = (
     EdgeKind.INHERITS,
 )
 
-PREFIX_REPO = "repo:"
+PREFIX_REPO = "project:"
 PREFIX_FILE = "file:"
-PREFIX_SYMBOL = "sym:"
+PREFIX_SYMBOL = "node:"
 PREFIX_EDGE = "edge:"
 PREFIX_SHA256 = "sha256:"
 SCHEME_FILE = "file://"

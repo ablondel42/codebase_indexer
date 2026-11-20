@@ -31,6 +31,7 @@ from core.models.node import SymbolNode
 from core.ports.uow import UnitOfWorkProtocol
 from core.utils.file_io import format_line_span
 from core.utils.logging import get_logger
+from core.utils.pathing import format_edge_location
 from graph.services.navigator import GraphNavigator
 from graph.services.references import ReferenceAnalyzer
 from graph.utils.predicates import (
@@ -243,6 +244,7 @@ class SymbolContextBuilder:
             kind=node.kind,
             name=node.name,
             qualified_name=node.qualified_name,
+            location=node.location,
             file_path=file_path,
             module_path=module_path,
             start_line=start_line,
@@ -278,6 +280,7 @@ class SymbolContextBuilder:
             id=node.id,
             kind=node.kind,
             name=node.name,
+            location=node.location,
             lines=format_line_span(start_line, end_line),
             signature=node.signature,
             doc_summary=node.doc_summary,
@@ -312,6 +315,11 @@ class SymbolContextBuilder:
                 allow_payload_fallback=not is_incoming,
             )
             ev_file = files_by_id.get(edge.evidence_file_id or "")
+            edge_loc = edge.location or (
+                format_edge_location(ev_file.uri, edge.evidence_range)
+                if ev_file is not None
+                else None
+            )
             items.append(
                 ContextEdge(
                     id=edge.id,
@@ -319,6 +327,7 @@ class SymbolContextBuilder:
                     from_id=edge.from_id,
                     to_id=edge.to_id,
                     peer_name=peer_name,
+                    location=edge_loc,
                     file_path=ev_file.file_path if ev_file is not None else None,
                     line=extract_edge_line(edge),
                     confidence=edge.confidence,

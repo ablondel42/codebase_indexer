@@ -56,6 +56,7 @@ class SymbolSnippet(FrozenModel):
     name: str
     qualified_name: str
     kind: SymbolKind
+    location: str | None = None
     file_path: str
     module_path: str
     language: str = "python"

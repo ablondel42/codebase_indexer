@@ -13,7 +13,7 @@ class FileRecord(FrozenModel):
     """Canonical record representing an indexed source file."""
 
     id: str = Field(..., min_length=1, pattern=r"^file:.+")
-    repo_id: str = Field(..., min_length=1, pattern=r"^repo:.+")
+    repo_id: str = Field(..., min_length=1, pattern=r"^project:.+")
     file_path: str = Field(..., min_length=1)
     uri: str = Field(..., pattern=r"^file://")
     module_path: str = Field(..., min_length=1)

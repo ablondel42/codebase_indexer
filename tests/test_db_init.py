@@ -138,8 +138,8 @@ def test_foreign_key_constraints_enforced(temp_db_path: Path) -> None:
     """Inserting a node referencing a missing repo/file fails due to FK enforcement."""
     uow_factory = SqlUnitOfWorkFactory(temp_db_path)
     orphan_node = SymbolNode(
-        id="sym:missing",
-        repo_id="repo:missing",
+        id="node:missing",
+        repo_id="project:missing",
         file_id="file:missing",
         language=Language.PYTHON,
         kind=SymbolKind.MODULE,
@@ -189,7 +189,7 @@ def test_v2_upgrade_is_non_destructive_and_adds_text_fts(temp_db_path: Path) -> 
         migrator.initialize(conn)
         conn.exec_driver_sql(
             "INSERT INTO repos (id, root_path, name, default_language, created_at) "
-            "VALUES ('repo:keep', '/keep', 'keep', 'python', '2026-01-01T00:00:00Z')"
+            "VALUES ('project:keep', '/keep', 'keep', 'python', '2026-01-01T00:00:00Z')"
         )
         conn.exec_driver_sql("DROP TRIGGER IF EXISTS text_files_ai")
         conn.exec_driver_sql("DROP TRIGGER IF EXISTS text_files_au")
@@ -201,8 +201,8 @@ def test_v2_upgrade_is_non_destructive_and_adds_text_fts(temp_db_path: Path) -> 
 
         migrator.initialize(conn)
         assert migrator.read_user_version(conn) == 3
-        kept = conn.exec_driver_sql("SELECT id FROM repos WHERE id = 'repo:keep'").scalar_one()
-        assert kept == "repo:keep"
+        kept = conn.exec_driver_sql("SELECT id FROM repos WHERE id = 'project:keep'").scalar_one()
+        assert kept == "project:keep"
         tables = set(
             conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").scalars()
         )
@@ -267,7 +267,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
     with uow_factory.open(initialize=True) as uow:
         uow.repos.upsert(
             RepoRecord(
-                id="repo:r1",
+                id="project:r1",
                 root_path="/tmp/r1",
                 name="r1",
                 created_at="2026-01-01T00:00:00Z",
@@ -275,7 +275,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
         )
         uow.repos.upsert(
             RepoRecord(
-                id="repo:r2",
+                id="project:r2",
                 root_path="/tmp/r2",
                 name="r2",
                 created_at="2026-01-01T00:00:00Z",
@@ -286,7 +286,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
     assert res.columns == ["id"]
     assert res.row_count == 1
     assert res.truncated is True
-    assert res.rows == [{"id": "repo:r1"}]
+    assert res.rows == [{"id": "project:r1"}]
 
     with pytest.raises(ValidationError):
         uow_factory.execute_readonly_sql("   ")
@@ -298,7 +298,7 @@ def test_readonly_sql_authorizer_and_uow_execute_readonly_sql(temp_db_path: Path
         "DROP TABLE repos",
         "UPDATE repos SET name = 'x'",
         "INSERT INTO repos (id, root_path, name, default_language, created_at) "
-        "VALUES ('repo:x', '/x', 'x', 'python', '2026-01-01T00:00:00Z')",
+        "VALUES ('project:x', '/x', 'x', 'python', '2026-01-01T00:00:00Z')",
     ):
         with pytest.raises(DatabaseError):
             uow_factory.execute_readonly_sql(stmt)
@@ -320,7 +320,7 @@ def test_uow_commits_rolls_back_and_shared_memory_persistence(temp_db_path: Path
     with uow_factory.open(initialize=True) as uow:
         uow.repos.upsert(
             RepoRecord(
-                id="repo:ok",
+                id="project:ok",
                 root_path="/tmp/ok",
                 name="ok",
                 created_at="2026-01-01T00:00:00Z",
@@ -330,7 +330,7 @@ def test_uow_commits_rolls_back_and_shared_memory_persistence(temp_db_path: Path
     with pytest.raises(RuntimeError, match="boom"), uow_factory.open() as uow:
         uow.repos.upsert(
             RepoRecord(
-                id="repo:fail",
+                id="project:fail",
                 root_path="/tmp/fail",
                 name="fail",
                 created_at="2026-01-01T00:00:00Z",
@@ -339,22 +339,22 @@ def test_uow_commits_rolls_back_and_shared_memory_persistence(temp_db_path: Path
         raise RuntimeError("boom")
 
     with uow_factory.open(read_only=True) as ro_uow:
-        assert {r.id for r in ro_uow.repos.list_all()} == {"repo:ok"}
+        assert {r.id for r in ro_uow.repos.list_all()} == {"project:ok"}
 
     mem_factory = SqlUnitOfWorkFactory(":memory:")
     try:
         with mem_factory.open(initialize=True) as mem_uow:
             mem_uow.repos.upsert(
                 RepoRecord(
-                    id="repo:mem",
+                    id="project:mem",
                     root_path="/tmp/mem",
                     name="mem",
                     created_at="2026-01-01T00:00:00Z",
                 )
             )
         with mem_factory.open(read_only=True) as mem_ro:
-            assert [r.id for r in mem_ro.repos.list_all()] == ["repo:mem"]
+            assert [r.id for r in mem_ro.repos.list_all()] == ["project:mem"]
         sql_res = mem_factory.execute_readonly_sql("SELECT id FROM repos")
-        assert sql_res.rows == [{"id": "repo:mem"}]
+        assert sql_res.rows == [{"id": "project:mem"}]
     finally:
         mem_factory.close()

@@ -12,6 +12,7 @@ class OutlineNode(FrozenModel):
     id: str
     kind: SymbolKind
     name: str
+    location: str | None = None
     lines: str | None = None
     signature: str | None = None
     doc: str | None = None
@@ -25,6 +26,7 @@ class FileOutline(FrozenModel):
     """Depth-bounded symbol skeleton, docstring, imports, and freshness for one file."""
 
     file_path: str
+    location: str | None = None
     module_path: str
     line_count: int
     is_fresh: bool

@@ -24,6 +24,7 @@ class ReferenceTargetSummary(FrozenModel):
     kind: SymbolKind
     name: str
     qualified_name: str
+    location: str | None = None
     file_path: str | None = None
     module_path: str | None = None
     lines: str | None = None
@@ -47,6 +48,7 @@ class ReferenceQueryOptions(FrozenModel):
 class ReferenceSiteEntry(FrozenModel):
     """Single incoming, outgoing, or self-referential relationship site entry."""
 
+    id: str = ""
     direction: str
     kind: EdgeKind
     from_id: str
@@ -57,6 +59,7 @@ class ReferenceSiteEntry(FrozenModel):
     to_name: str | None = None
     file_path: str | None = None
     line: int | None = None
+    column: int | None = None
     location: str | None = None
     confidence: float
     source: str

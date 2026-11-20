@@ -103,7 +103,7 @@ def _run_disk_oracle(
         if prefix and not st.file_path.startswith(prefix):
             continue
         doc = read_text_document(
-            "repo:oracle",
+            "project:oracle",
             root,
             st.file_path,
             max_file_size_bytes=config.max_file_size_bytes,

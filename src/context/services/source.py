@@ -122,6 +122,7 @@ class SourceReader:
             name=symbol.name,
             qualified_name=symbol.qualified_name,
             kind=symbol.kind,
+            location=symbol.location,
             file_path=file_record.file_path,
             module_path=file_record.module_path,
             language=str(symbol.language),

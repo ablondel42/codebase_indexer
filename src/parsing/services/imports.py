@@ -40,10 +40,10 @@ class ImportExtractor:
             Deterministic ``edge:<repo_id>:imports:...`` identifier.
         """
         lineno = getattr(node, "lineno", 0)
-        col_offset = getattr(node, "col_offset", 0)
+        site_col = getattr(node, "col_offset", 0) + 1
         return (
             f"{PREFIX_EDGE}{file_record.repo_id}:{EdgeKind.IMPORTS.value}:"
-            f"{from_id}->{to_id}:{lineno}:{col_offset}:{alias_idx}"
+            f"{from_id}@{lineno}:{site_col}:{alias_idx}->{to_id}"
         )
 
     def _entries_for_import(

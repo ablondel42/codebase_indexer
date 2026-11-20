@@ -176,6 +176,7 @@ class _CallVisitor(ast.NodeVisitor):
 
         lineno = getattr(node, "lineno", 0)
         col_offset = getattr(node, "col_offset", 0)
+        site_col = col_offset + 1
         edge_key = (from_id, placeholder_id, lineno, col_offset)
         dup_idx = self._seen_edge_keys.get(edge_key, 0)
         self._seen_edge_keys[edge_key] = dup_idx + 1
@@ -183,7 +184,7 @@ class _CallVisitor(ast.NodeVisitor):
         repo_id = self._file_record.repo_id
         edge_id = (
             f"{PREFIX_EDGE}{repo_id}:{EdgeKind.CALLS.value}:"
-            f"{from_id}->{placeholder_id}:{lineno}:{col_offset}"
+            f"{from_id}@{lineno}:{site_col}->{placeholder_id}"
         )
         if dup_idx > 0:
             edge_id = f"{edge_id}:dup{dup_idx}"

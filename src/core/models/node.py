@@ -7,20 +7,22 @@ from pydantic import Field, field_validator
 from core.models.base import FrozenModel
 from core.models.enums import Language, SymbolKind, SymbolScope
 from core.models.range import Range
+from core.utils.pathing import format_symbol_location
 from core.utils.timestamps import validate_iso_timestamp
 
 
 class SymbolNode(FrozenModel):
     """Canonical symbol declaration node in the repository graph."""
 
-    id: str = Field(..., min_length=1, pattern=r"^sym:.+")
-    repo_id: str = Field(..., min_length=1, pattern=r"^repo:.+")
+    id: str = Field(..., min_length=1, pattern=r"^node:.+")
+    repo_id: str = Field(..., min_length=1, pattern=r"^project:.+")
     file_id: str = Field(..., min_length=1, pattern=r"^file:.+")
     language: str = Field(default=Language.PYTHON)
     kind: SymbolKind
     name: str = Field(..., min_length=1, max_length=1024)
     qualified_name: str = Field(..., min_length=1)
     uri: str = Field(..., pattern=r"^file://")
+    location: str | None = None
     content_hash: str = ""
     semantic_hash: str = ""
     source: str = "python-ast"
@@ -37,6 +39,17 @@ class SymbolNode(FrozenModel):
     scope: SymbolScope | None = None
     lexical_parent_id: str | None = None
     last_indexed_at: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Populate Cmd+Click ``location`` from ``uri`` and declaration/selection ranges."""
+        if self.location is None:
+            computed = format_symbol_location(
+                self.uri,
+                self.selection_range,
+                self.decl_range,
+                self.start_line,
+            )
+            object.__setattr__(self, "location", computed)
 
     @field_validator("last_indexed_at")
     @classmethod
@@ -65,6 +78,7 @@ class SymbolSummary(FrozenModel):
     name: str
     qualified_name: str
     uri: str
+    location: str | None = None
     language: str = Language.PYTHON
     signature: str | None = None
     doc_summary: str | None = None
@@ -82,6 +96,17 @@ class SymbolSummary(FrozenModel):
     file_path: str = ""
     module_path: str = ""
     is_test: bool = False
+
+    def model_post_init(self, __context: Any) -> None:
+        """Populate Cmd+Click ``location`` from ``uri`` and declaration/selection ranges."""
+        if self.location is None:
+            computed = format_symbol_location(
+                self.uri,
+                self.selection_range,
+                self.decl_range,
+                self.start_line,
+            )
+            object.__setattr__(self, "location", computed)
 
     @classmethod
     def from_node(

@@ -17,6 +17,7 @@ from core.utils.file_io import (
     read_verified_file_text,
 )
 from core.utils.logging import get_logger
+from core.utils.pathing import format_edge_location
 from graph.models.references import (
     ReferenceQueryOptions,
     ReferenceSiteEntry,
@@ -157,8 +158,23 @@ class ReferenceAnalyzer:
         """
         file_path = ev_file.file_path if ev_file is not None else None
         line_num = extract_edge_line(edge)
+        col_num = (
+            edge.evidence_range.start.character + 1
+            if edge.evidence_range is not None
+            else None
+        )
+        site_loc = (
+            edge.location
+            or (
+                format_edge_location(ev_file.uri, edge.evidence_range)
+                if ev_file is not None
+                else None
+            )
+            or format_site_location(file_path, line_num)
+        )
         edge_dir, peer_id = classify_edge_peer(edge, target_id)
         return ReferenceSiteEntry(
+            id=edge.id,
             direction=edge_dir,
             kind=edge.kind,
             from_id=edge.from_id,
@@ -179,7 +195,8 @@ class ReferenceAnalyzer:
             ),
             file_path=file_path,
             line=line_num,
-            location=format_site_location(file_path, line_num),
+            column=col_num,
+            location=site_loc,
             confidence=edge.confidence,
             source=edge.source,
             preview=preview,
@@ -269,6 +286,7 @@ class ReferenceAnalyzer:
             kind=target.kind,
             name=target.name,
             qualified_name=target.qualified_name,
+            location=target.location,
             file_path=file_path,
             module_path=module_path,
             lines=format_line_span(start_line, end_line),

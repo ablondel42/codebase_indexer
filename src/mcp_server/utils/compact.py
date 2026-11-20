@@ -182,7 +182,7 @@ def _adapt_outline_node(
     has_signature = bool(signature and signature.strip())
     if compact_nested and depth >= 2:
         entry: dict[str, Any] = {
-            "kind": str(node.kind),
+            "kind": None if has_signature else str(node.kind),
             "name": None if has_signature else node.name,
             "lines": node.lines,
             "signature": signature if has_signature else None,
@@ -218,6 +218,7 @@ def adapt_outline(outline: FileOutline) -> dict[str, Any]:
     return omit_none(
         {
             "file_path": outline.file_path,
+            "location": outline.location,
             "module_path": outline.module_path,
             "line_count": outline.line_count,
             "is_fresh": outline.is_fresh,
@@ -267,6 +268,7 @@ def adapt_symbol_summary(symbol: SymbolSummary) -> dict[str, Any]:
             "kind": str(symbol.kind),
             "name": symbol.name,
             "qualified_name": symbol.qualified_name,
+            "location": symbol.location,
             "file_path": symbol.file_path or None,
             "module_path": symbol.module_path or None,
             "lines": _symbol_summary_lines(symbol),
@@ -312,6 +314,7 @@ def adapt_symbol_source(snippet: SymbolSnippet) -> dict[str, Any]:
             "symbol_id": snippet.symbol_id,
             "qualified_name": snippet.qualified_name,
             "kind": str(snippet.kind),
+            "location": snippet.location,
             "module_path": snippet.module_path,
             "lines": snippet.lines,
             "signature": snippet.signature,
@@ -389,6 +392,7 @@ def _adapt_focus_symbol(focus: FocusSymbol) -> dict[str, Any]:
             "kind": str(focus.kind),
             "name": focus.name,
             "qualified_name": focus.qualified_name,
+            "location": focus.location,
             "file_path": focus.file_path,
             "module_path": focus.module_path,
             "lines": lines,
@@ -418,7 +422,9 @@ def _adapt_context_edge_item(edge: ContextEdge, *, is_incoming: bool) -> dict[st
     return omit_none(
         {
             "id": peer_id,
+            "edge_id": edge.id,
             "name": edge.peer_name,
+            "location": edge.location,
             "file_path": edge.file_path,
             "line": edge.line,
             "confidence": edge.confidence,
@@ -585,6 +591,7 @@ def _adapt_reference_target(target: ReferenceTargetSummary) -> dict[str, Any]:
             "kind": str(target.kind),
             "name": target.name,
             "qualified_name": target.qualified_name,
+            "location": target.location,
             "file_path": target.file_path,
             "module_path": target.module_path,
             "lines": target.lines,
@@ -607,14 +614,17 @@ def _adapt_reference_site(site: ReferenceSiteEntry) -> dict[str, Any]:
     """
     return omit_none(
         {
+            "id": site.id or None,
             "kind": str(site.kind),
             "direction": site.direction,
             "from_id": site.from_id,
             "from_name": site.from_name,
             "to_id": site.to_id,
             "to_name": site.to_name,
+            "location": site.location,
             "file_path": site.file_path,
             "line": site.line,
+            "column": site.column,
             "confidence": site.confidence,
             "source": site.source,
             "preview": site.preview,
@@ -659,6 +669,7 @@ def _adapt_risk_target(target: RiskTarget) -> dict[str, Any]:
             "qualified_name": target.qualified_name,
             "kind": str(target.kind),
             "scope": target.scope,
+            "location": target.location,
             "file_path": target.file_path,
             "module_path": target.module_path,
             "lines": format_line_span(target.start_line, target.end_line),
@@ -710,6 +721,7 @@ def _adapt_code_match(item: CodeMatchItem) -> dict[str, Any]:
     """Adapt a single ``CodeMatchItem`` into a compact dictionary omitting empty fields."""
     return omit_none(
         {
+            "location": item.location,
             "file_path": item.file_path,
             "language": item.language,
             "line": item.line,
@@ -721,6 +733,7 @@ def _adapt_code_match(item: CodeMatchItem) -> dict[str, Any]:
             "qualified_name": item.qualified_name,
             "symbol_kind": item.symbol_kind,
             "symbol_lines": item.symbol_lines,
+            "symbol_location": item.symbol_location,
         }
     )
 

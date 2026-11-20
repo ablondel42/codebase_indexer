@@ -294,8 +294,8 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
 
     adapted_sym = adapt_symbol_summary(
         SymbolSummary(
-            id="sym:1",
-            repo_id="repo:1",
+            id="node:1",
+            repo_id="project:1",
             file_id="file:1",
             kind=SymbolKind.FUNCTION,
             name="f",
@@ -308,7 +308,7 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
 
     wide_ctx = SymbolContext(
         focus_symbol=FocusSymbol(
-            id="sym:c",
+            id="node:c",
             kind=SymbolKind.CLASS,
             name="C",
             qualified_name="m.C",
@@ -317,7 +317,7 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
         ),
         structural_children=[
             CompactSymbol(
-                id=f"sym:m{i}",
+                id=f"node:m{i}",
                 kind=SymbolKind.METHOD,
                 name=f"m{i}",
                 lines=f"{i}-{i}",
@@ -341,7 +341,7 @@ def test_adapters_omit_nulls_and_suppress_docs_above_10_children() -> None:
             module_path="a",
             line_count=10,
             is_fresh=True,
-            symbols=[OutlineNode(id="sym:s", kind=SymbolKind.FUNCTION, name="f", children=[])],
+            symbols=[OutlineNode(id="node:s", kind=SymbolKind.FUNCTION, name="f", children=[])],
         )
     )
     assert "children" not in out["symbols"][0]
@@ -653,20 +653,20 @@ def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_erro
 ) -> None:
     """``adapt_symbol_context`` deduplicates lexical fields and hides OS paths on symlink error."""
     mod_parent = FocusSymbol(
-        id="sym:mod",
+        id="node:mod",
         kind=SymbolKind.MODULE,
         name="mod",
         qualified_name="mod",
     )
     inner_child = CompactSymbol(
-        id="sym:inner",
+        id="node:inner",
         kind=SymbolKind.LOCAL_FUNCTION,
         name="inner",
         lines="2-4",
     )
     same_ctx = SymbolContext(
         focus_symbol=FocusSymbol(
-            id="sym:outer",
+            id="node:outer",
             kind=SymbolKind.FUNCTION,
             name="outer",
             qualified_name="mod.outer",
@@ -691,7 +691,7 @@ def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_erro
         update={
             "lexical_children": [
                 CompactSymbol(
-                    id="sym:local_only",
+                    id="node:local_only",
                     kind=SymbolKind.LOCAL_FUNCTION,
                     name="loc",
                     lines="3-4",
@@ -700,7 +700,7 @@ def test_adapt_context_dedups_lexical_children_and_sanitizes_symlink_source_erro
         }
     )
     distinct = adapt_symbol_context(distinct_ctx)
-    assert [c["id"] for c in distinct["lexical_children"]] == ["sym:local_only"]
+    assert [c["id"] for c in distinct["lexical_children"]] == ["node:local_only"]
 
     repo_root = tmp_path / "ctx_sec_repo"
     repo_root.mkdir()

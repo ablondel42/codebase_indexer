@@ -20,7 +20,7 @@ from core.models import (
 from core.utils.hashing import sha256_file
 
 
-def _focus_symbol(sym_id: str = "sym:1") -> FocusSymbol:
+def _focus_symbol(sym_id: str = "node:1") -> FocusSymbol:
     """Create a minimal FocusSymbol for freshness unit tests."""
     return FocusSymbol(
         id=sym_id,
@@ -31,15 +31,15 @@ def _focus_symbol(sym_id: str = "sym:1") -> FocusSymbol:
 
 
 def _focus_node(
-    sym_id: str = "sym:1",
+    sym_id: str = "node:1",
     *,
-    file_id: str = "file:repo:1:mod.py",
+    file_id: str = "file:project:1:mod.py",
     last_indexed_at: str | None = "2026-01-01T00:00:00Z",
 ) -> SymbolNode:
     """Create a minimal SymbolNode for freshness unit tests."""
     return SymbolNode(
         id=sym_id,
-        repo_id="repo:1",
+        repo_id="project:1",
         file_id=file_id,
         kind=SymbolKind.FUNCTION,
         name="fn",
@@ -56,17 +56,17 @@ def test_evaluate_freshness_ast_only_and_edge_snapshot() -> None:
     raw_edges = [
         Edge(
             id="edge:in",
-            repo_id="repo:1",
-            from_id="sym:other",
-            to_id="sym:1",
+            repo_id="project:1",
+            from_id="node:other",
+            to_id="node:1",
             kind=EdgeKind.CALLS,
             last_indexed_at="2026-01-01T01:00:00Z",
         ),
         Edge(
             id="edge:out",
-            repo_id="repo:1",
-            from_id="sym:1",
-            to_id="sym:dest",
+            repo_id="project:1",
+            from_id="node:1",
+            to_id="node:dest",
             kind=EdgeKind.CALLS,
             last_indexed_at="2026-01-02T03:00:00Z",
         ),
@@ -77,8 +77,8 @@ def test_evaluate_freshness_ast_only_and_edge_snapshot() -> None:
             ContextEdge(
                 id="edge:in",
                 kind=EdgeKind.CALLS,
-                from_id="sym:other",
-                to_id="sym:1",
+                from_id="node:other",
+                to_id="node:1",
                 last_indexed_at="2026-01-01T01:00:00Z",
             )
         ],
@@ -86,8 +86,8 @@ def test_evaluate_freshness_ast_only_and_edge_snapshot() -> None:
             ContextEdge(
                 id="edge:out",
                 kind=EdgeKind.CALLS,
-                from_id="sym:1",
-                to_id="sym:dest",
+                from_id="node:1",
+                to_id="node:dest",
                 last_indexed_at="2026-01-02T03:00:00Z",
             )
         ],
@@ -137,8 +137,8 @@ def test_evaluate_freshness_missing_timestamp_and_disk_staleness(tmp_path: Path)
     src = tmp_path / "mod.py"
     src.write_text("x = 1\n", encoding="utf-8")
     file_rec = FileRecord(
-        id="file:repo:1:mod.py",
-        repo_id="repo:1",
+        id="file:project:1:mod.py",
+        repo_id="project:1",
         file_path="mod.py",
         uri=src.as_uri(),
         module_path="mod",

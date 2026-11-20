@@ -74,7 +74,7 @@ def test_build_repo_and_file_record_v2_ids(tmp_path: Path) -> None:
 
     scanner = RepoScanner()
     repo = scanner.build_repo_record(repo_dir)
-    assert re.fullmatch(r"repo:my_project:[0-9a-f]{8}", repo.id)
+    assert re.fullmatch(r"project:my_project:[0-9a-f]{8}", repo.id)
     assert repo.name == "my_project"
     assert repo.root_path == str(repo_dir.resolve())
 

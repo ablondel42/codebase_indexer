@@ -54,6 +54,8 @@ class SymbolTargetResolver:
             "kind": str(candidate.kind),
             "qualified_name": candidate.qualified_name,
         }
+        if candidate.location is not None:
+            entry["location"] = candidate.location
         if candidate.file_path:
             entry["file_path"] = candidate.file_path
         lines = format_line_span(start_line, end_line)

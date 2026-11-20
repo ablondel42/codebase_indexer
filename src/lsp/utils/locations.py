@@ -17,7 +17,7 @@ from lsp.models.protocol import NormalizedLocation
 logger = get_logger("lsp.utils.locations")
 
 CONFIDENCE_EXACT = 0.9
-CONFIDENCE_MODULE = 0.7
+CONFIDENCE_MODULE = 0.9
 
 
 def _extract_non_negative_int(mapping: Mapping[str, Any], key: str) -> int | None:
@@ -302,7 +302,7 @@ def build_reference_edge(
     """Construct a deterministic LSP ``references`` ``Edge`` model.
 
     Derives ``mapping_mode`` and ``confidence`` from ``source.kind``
-    (``SymbolKind.MODULE`` -> ``"module_fallback"`` / ``0.7``, otherwise
+    (``SymbolKind.MODULE`` -> ``"module_scope"`` / ``0.9``, otherwise
     ``"exact_symbol"`` / ``0.9``).
 
     Args:
@@ -316,12 +316,14 @@ def build_reference_edge(
     Returns:
         Validated immutable ``Edge`` instance with ``source="lsp"``.
     """
-    is_module_fallback = source.kind == SymbolKind.MODULE
-    mapping_mode = "module_fallback" if is_module_fallback else "exact_symbol"
-    confidence = CONFIDENCE_MODULE if is_module_fallback else CONFIDENCE_EXACT
+    is_module_scope = source.kind == SymbolKind.MODULE
+    mapping_mode = "module_scope" if is_module_scope else "exact_symbol"
+    confidence = CONFIDENCE_MODULE if is_module_scope else CONFIDENCE_EXACT
+    site_line = usage_range.start.line + 1
+    site_col = usage_range.start.character + 1
     edge_id = (
         f"{PREFIX_EDGE}{repo_id}:{EdgeKind.REFERENCES.value}:"
-        f"{source.id}->{target.id}:{usage_range.start.line}:{usage_range.start.character}"
+        f"{source.id}@{site_line}:{site_col}->{target.id}"
     )
     return Edge(
         id=edge_id,

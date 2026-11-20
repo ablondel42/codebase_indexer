@@ -67,7 +67,7 @@ def test_preprocess_argv_and_shell_token_helpers(tmp_path: Path) -> None:
     assert preprocess_argv(["db", "status"]) == ["db", "status"]
 
     assert tokenize_shell_line("cbi db status") == ["db", "status"]
-    injected = inject_shell_defaults(["files"], tmp_path / "s.db", "repo:abc")
+    injected = inject_shell_defaults(["files"], tmp_path / "s.db", "project:abc")
     assert "--db-path" in injected and "--repo" in injected
 
 
