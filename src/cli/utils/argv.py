@@ -26,6 +26,7 @@ KNOWN_COMMANDS: frozenset[str] = frozenset({
     "shell",
     "watch",
     "serve",
+    "api",
     "mcp-call",
 })
 

@@ -31,6 +31,8 @@ from storage.services.uow import SqlUnitOfWorkFactory
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
 
+NON_PYTHON_SRC_DIRS: frozenset[str] = frozenset({"ui"})
+
 EXPECTED_DOMAINS: frozenset[str] = frozenset({
     "core",
     "storage",
@@ -42,6 +44,7 @@ EXPECTED_DOMAINS: frozenset[str] = frozenset({
     "indexing",
     "engine",
     "mcp_server",
+    "api",
     "cli",
 })
 
@@ -90,6 +93,19 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
         "pydantic",
         "mcp",
     }),
+    "api": frozenset({
+        "core",
+        "engine",
+        "graph.models",
+        "context.models",
+        "views.models",
+        "indexing.models",
+        "api",
+        "pydantic",
+        "fastapi",
+        "starlette",
+        "uvicorn",
+    }),
     "cli": frozenset({
         "core",
         "engine",
@@ -109,6 +125,7 @@ ALLOWED_PROTOCOL_DICT_RETURNS: frozenset[str] = frozenset({
 })
 
 DOCUMENTED_BROAD_EXCEPT_FILES: frozenset[str] = frozenset({
+    "api/services/gateway.py",
     "cli/services/app.py",
     "indexing/services/batch.py",
     "indexing/services/incremental.py",
@@ -410,11 +427,12 @@ class TestHeadlessIndexerEngineQueries:
 
 
 def _iter_src_python_files() -> list[Path]:
-    """Return sorted ``.py`` files inside ``src/`` excluding packaging metadata."""
+    """Return sorted ``.py`` files inside ``src/`` excluding packaging and frontend dirs."""
     return sorted(
         path
         for path in SRC_DIR.rglob("*.py")
-        if not any(part.endswith(".egg-info") for part in path.parts)
+        if path.relative_to(SRC_DIR).parts[0] not in NON_PYTHON_SRC_DIRS
+        and not any(part.endswith(".egg-info") for part in path.parts)
     )
 
 
@@ -425,7 +443,7 @@ def _is_module_allowed(domain: str, rel_posix: str, module_name: str) -> bool:
         return True
     allowed = set(ALLOWED_IMPORTS_BY_DOMAIN[domain])
     if rel_posix == "cli/services/server.py":
-        allowed.add("mcp_server")
+        allowed.update({"mcp_server", "api"})
     if top in allowed:
         return True
     parts = module_name.split(".")
@@ -451,7 +469,7 @@ def _check_import_from_node(
         errors.append(f"{rel_posix}:{node.lineno}: contextlib.suppress is banned")
     if (
         node.module in ("graph", "context", "views", "indexing")
-        and domain in ("mcp_server", "cli")
+        and domain in ("mcp_server", "cli", "api")
     ):
         bad = [alias.name for alias in node.names if alias.name != "models"]
         if bad:
@@ -644,11 +662,12 @@ class TestHexagonalArchitectureBoundaryGate:
     """AST static analysis gate enforcing Hexagonal package, import, model, and error rules."""
 
     def test_domain_package_layout_and_zero_service_suffixes(self) -> None:
-        """``src/`` contains only the 11 Hexagonal packages with ``{services,models,utils}``."""
+        """``src/`` contains only the 12 Hexagonal packages with ``{services,models,utils}``."""
         top_entries = {
             entry.name
             for entry in SRC_DIR.iterdir()
             if entry.name != "__pycache__"
+            and entry.name not in NON_PYTHON_SRC_DIRS
             and not entry.name.startswith(".")
             and not entry.name.endswith(".egg-info")
         }

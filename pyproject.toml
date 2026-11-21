@@ -11,6 +11,9 @@ dependencies = [
     "mcp>=2.0",
     "sqlalchemy>=2.0",
     "watchdog>=3.0.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +36,7 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py311"
 preview = true
-extend-exclude = ["tests/fixtures", ".agents"]
+extend-exclude = ["tests/fixtures", ".agents", "src/ui"]
 
 [tool.ruff.lint]
 explicit-preview-rules = true
@@ -82,6 +85,7 @@ exclude = [
     "tests/fixtures",
     ".agents",
     "venv",
+    "src/ui",
     "**/__pycache__",
 ]
 extraPaths = ["src"]

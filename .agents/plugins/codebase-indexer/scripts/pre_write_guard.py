@@ -22,6 +22,7 @@ EXPECTED_DOMAINS: frozenset[str] = frozenset(
         "indexing",
         "engine",
         "mcp_server",
+        "api",
         "cli",
     }
 )
@@ -68,6 +69,21 @@ ALLOWED_IMPORTS_BY_DOMAIN: dict[str, frozenset[str]] = {
             "mcp",
         }
     ),
+    "api": frozenset(
+        {
+            "core",
+            "engine",
+            "graph.models",
+            "context.models",
+            "views.models",
+            "indexing.models",
+            "api",
+            "pydantic",
+            "fastapi",
+            "starlette",
+            "uvicorn",
+        }
+    ),
     "cli": frozenset(
         {
             "core",
@@ -92,6 +108,7 @@ ALLOWED_PROTOCOL_DICT_RETURNS: frozenset[str] = frozenset(
 
 DOCUMENTED_BROAD_EXCEPT_FILES: frozenset[str] = frozenset(
     {
+        "api/services/gateway.py",
         "cli/services/app.py",
         "indexing/services/batch.py",
         "indexing/services/incremental.py",
@@ -149,7 +166,7 @@ def _resolve_repo_relative(payload: dict[str, Any], raw_path: object) -> tuple[P
         return None
     if resolved.suffix != ".py":
         return None
-    in_src = repo_rel.startswith("src/")
+    in_src = repo_rel.startswith("src/") and not repo_rel.startswith("src/ui/")
     in_tests = repo_rel.startswith("tests/") and not repo_rel.startswith("tests/fixtures/")
     return (resolved, repo_rel) if (in_src or in_tests) else None
 
@@ -253,7 +270,7 @@ def _check_func_context_manager(
 
 
 def _check_src_layout(src_rel: str) -> tuple[str, str, list[str]]:
-    """Verify ``src/`` path obeys 11-domain ``{services,models,utils}`` and naming rules."""
+    """Verify ``src/`` path obeys 12-domain ``{services,models,utils}`` and naming rules."""
     parts = src_rel.split("/")
     domain = parts[0]
     layer = parts[1] if len(parts) > 2 else ""
@@ -291,7 +308,7 @@ def _is_module_allowed(domain: str, src_rel: str, module_name: str) -> bool:
         return True
     allowed = set(ALLOWED_IMPORTS_BY_DOMAIN[domain])
     if src_rel == "cli/services/server.py":
-        allowed.add("mcp_server")
+        allowed.update({"mcp_server", "api"})
     if top in allowed:
         return True
     parts = module_name.split(".")
@@ -309,7 +326,7 @@ def _check_src_import_from(domain: str, src_rel: str, node: ast.ImportFrom) -> l
         errors.append(f"src/{src_rel}:{node.lineno}: contextlib.suppress is banned")
     if (
         node.module in ("graph", "context", "views", "indexing")
-        and domain in ("mcp_server", "cli")
+        and domain in ("mcp_server", "cli", "api")
     ):
         bad = [alias.name for alias in node.names if alias.name != "models"]
         if bad:

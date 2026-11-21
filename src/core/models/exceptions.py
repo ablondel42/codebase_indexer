@@ -95,7 +95,14 @@ class ParseError(IndexerError):
     error_code: str = "parse_error"
 
 
+class AcpError(IndexerError):
+    """Raised when Agent Client Protocol transport, security, or handshake checks fail."""
+
+    error_code: str = "acp_error"
+
+
 __all__ = [
+    "AcpError",
     "DatabaseError",
     "DatabaseNotFoundError",
     "IndexerError",

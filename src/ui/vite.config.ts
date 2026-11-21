@@ -11,4 +11,15 @@ export default defineConfig({
       "@": path.resolve(import.meta.dirname, "./src"),
     },
   },
+  server: {
+    proxy: {
+      "/acp": {
+        target: "http://127.0.0.1:8000",
+        ws: true,
+      },
+      "/healthz": {
+        target: "http://127.0.0.1:8000",
+      },
+    },
+  },
 });

@@ -1,5 +1,7 @@
 import "@xyflow/react/style.css";
+import { AcpStatusBar } from "@/components/acp-status-bar";
 import { ThemeProvider } from "@/components/theme-provider";
+import { useAcpConnection } from "@/hooks/use-acp-connection";
 import { ModeToggle } from "./components/mode-toggle";
 import { useState, useCallback } from "react";
 import {
@@ -8,10 +10,12 @@ import {
   Background,
   Controls,
   MiniMap,
+  type Connection,
 } from "@xyflow/react";
 import { BackgroundVariant } from "@xyflow/react";
 
-function App() {
+function WorkspaceCanvas() {
+  const { status, result, error, reconnect } = useAcpConnection();
   const initialNodes = [
     { id: "n1", position: { x: 0, y: 0 }, data: { label: "Node 1" } },
     { id: "n2", position: { x: 0, y: 100 }, data: { label: "Node 2" } },
@@ -45,18 +49,23 @@ function App() {
     [],
   );
   const onConnect = useCallback(
-    (params: any) =>
+    (params: Connection) =>
       setEdges((edgesSnapshot) => addEdge(params, edgesSnapshot)),
     [],
   );
 
   return (
-    <ThemeProvider
-      defaultTheme="dark"
-      storageKey="vite-ui-theme"
-    >
-      <ModeToggle />
-      <div style={{ width: "100vw", height: "94vh" }}>
+    <div className="flex h-screen w-screen flex-col">
+      <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
+        <AcpStatusBar
+          status={status}
+          result={result}
+          error={error}
+          onReconnect={reconnect}
+        />
+        <ModeToggle />
+      </header>
+      <div className="min-h-0 flex-1">
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -74,6 +83,17 @@ function App() {
           />
         </ReactFlow>
       </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <ThemeProvider
+      defaultTheme="dark"
+      storageKey="vite-ui-theme"
+    >
+      <WorkspaceCanvas />
     </ThemeProvider>
   );
 }

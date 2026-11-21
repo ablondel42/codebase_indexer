@@ -177,3 +177,26 @@ def test_cbi_view_tree_emits_nested_json_and_rejects_json_flag(
         assert [sub["name"] for sub in focused["root"]["folders"]] == ["pkg"]
         assert focused["root"]["folders"][0]["files"] == []
         assert [doc["file_path"] for doc in focused["root"]["files"]] == ["src/main.py"]
+
+
+def test_cbi_api_parser_and_non_loopback_rejection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``cbi api`` parses server flags and rejects non-loopback hosts by default."""
+    assert preprocess_argv(["api", "--port", "8001"]) == ["api", "--port", "8001"]
+
+    parser = CliParserBuilder().build()
+    parsed = parser.parse_args(["api", "--port", "8001", "--no-agy-sandbox"])
+    assert parsed.port == 8001
+    assert parsed.no_agy_sandbox is True
+
+    app = CliApplication(AppConfig(db_path=tmp_path / "cli_api.db"))
+    rc = app.run(["api", "--host", "0.0.0.0"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    err = json.loads(captured.err)
+    assert err["ok"] is False
+    assert err["error"]["code"] == "acp_error"
+    assert "non-loopback" in err["error"]["message"]

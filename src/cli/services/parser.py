@@ -375,6 +375,63 @@ class CliParserBuilder:
         self._add_repo_arg(mcp_call_p, "Repository selector")
         self._bind_handler(mcp_call_p, "mcp-call")
 
+        self._add_api_parser(subparsers, sub_common)
+
+    def _add_api_parser(
+        self,
+        subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+        sub_common: argparse.ArgumentParser,
+    ) -> None:
+        """Register the ``cbi api`` FastAPI ACP WebSocket server subcommand."""
+        api_p = subparsers.add_parser(
+            "api",
+            parents=[sub_common],
+            help="Start FastAPI server hosting the hardened /acp WebSocket bridge",
+        )
+        api_p.add_argument(
+            "--host",
+            type=str,
+            default="127.0.0.1",
+            help="Bind address (default: 127.0.0.1 loopback-only)",
+        )
+        api_p.add_argument(
+            "--port",
+            type=int,
+            default=8000,
+            help="Listening TCP port (default: 8000)",
+        )
+        api_p.add_argument(
+            "--allow-non-loopback",
+            action="store_true",
+            default=False,
+            help="Allow binding non-loopback network interfaces (unsafe on untrusted LANs)",
+        )
+        api_p.add_argument(
+            "--allow-origin",
+            action="append",
+            default=[],
+            help="Additional allowed WebSocket Origin (repeatable)",
+        )
+        api_p.add_argument(
+            "--workspace",
+            type=Path,
+            default=None,
+            help="Optional workspace root directory passed as cwd for agy acp",
+        )
+        api_p.add_argument(
+            "--no-agy-sandbox",
+            action="store_true",
+            default=False,
+            help="Disable --sandbox flag when launching agy acp",
+        )
+        api_p.add_argument(
+            "--debug",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Enable debug logs",
+        )
+        self._bind_handler(api_p, "api")
+
     def _add_search_parser(
         self,
         subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",

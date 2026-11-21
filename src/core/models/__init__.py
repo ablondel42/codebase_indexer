@@ -40,6 +40,7 @@ from core.models.enums import (
     SymbolScope,
 )
 from core.models.exceptions import (
+    AcpError,
     DatabaseError,
     DatabaseNotFoundError,
     IndexerError,
@@ -83,6 +84,7 @@ from core.models.search import (
 __all__ = [
     "APP_VERSION",
     "AST_DEPENDENCY_EDGE_KINDS",
+    "AcpError",
     "AppConfig",
     "CALLABLE_KINDS",
     "CodeMatchItem",

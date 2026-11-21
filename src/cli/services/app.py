@@ -108,6 +108,7 @@ class CliApplication:
             "shell": self._run_shell_cmd,
             "watch": self._index_cmds.run_watch,
             "serve": self._server_cmds.run_serve,
+            "api": self._server_cmds.run_api,
             "mcp-call": self._server_cmds.run_mcp_call,
         }
 

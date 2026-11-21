@@ -1,9 +1,10 @@
-"""CLI command handlers for ``cbi serve`` and ``cbi mcp-call`` (sole CLI-to-MCP bridge)."""
+"""CLI command handlers for ``cbi serve``, ``cbi mcp-call``, and ``cbi api``."""
 
 import argparse
 import asyncio
 import json
 
+from api import DEFAULT_ALLOWED_ORIGINS, ApiServerConfig, ApiServerRunner
 from cli.utils.argv import normalize_mcp_tool_kwargs, parse_mcp_call_args
 from cli.utils.output import (
     emit_json,
@@ -84,6 +85,25 @@ class ServerCliCommands:
         envelope, exit_code = format_mcp_call_envelope(tool_name, raw_response)
         emit_json(envelope.model_dump())
         return exit_code
+
+    def run_api(self, args: argparse.Namespace) -> int:
+        """Start the FastAPI ACP bridge server after validating loopback security."""
+        db_path = resolve_cli_db_path(args, self._engine.db_path)
+        extra_origins = tuple(getattr(args, "allow_origin", []) or ())
+        debug = bool(getattr(args, "debug", self._engine.config.debug))
+        scoped = self._engine.for_db(db_path)
+        app_cfg = scoped.config.model_copy(update={"debug": debug})
+        api_cfg = ApiServerConfig(
+            host=str(getattr(args, "host", "127.0.0.1")),
+            port=int(getattr(args, "port", 8000)),
+            allow_non_loopback=bool(getattr(args, "allow_non_loopback", False)),
+            allowed_origins=(*DEFAULT_ALLOWED_ORIGINS, *extra_origins),
+            workspace_root=getattr(args, "workspace", None),
+            agy_sandbox=not bool(getattr(args, "no_agy_sandbox", False)),
+        )
+        runner = ApiServerRunner(api_cfg, app_cfg, engine=scoped)
+        runner.run()
+        return 0
 
 
 __all__ = [
