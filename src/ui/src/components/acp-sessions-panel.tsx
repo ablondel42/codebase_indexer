@@ -1,29 +1,71 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
-  ArrowLeft,
-  Database,
-  FileText,
-  FolderOpen,
-  History,
-  Loader2,
-  MessageSquare,
-  Play,
-  Plus,
-  RefreshCw,
-  Trash2,
-  Wrench,
-  X,
+  ArchiveIcon,
+  ArchiveRestoreIcon,
+  ArrowLeftIcon,
+  CircleAlertIcon,
+  DatabaseIcon,
+  FileTextIcon,
+  FolderOpenIcon,
+  HistoryIcon,
+  MessageSquareIcon,
+  PlayIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  XIcon,
 } from "lucide-react";
 
+import { SessionMessageBody } from "@/components/ai-elements/message-body";
+import { SessionChat } from "@/components/ai-elements/session-chat";
+import { FileTree } from "@/components/ai-elements/turn-prompts-and-files";
+import {
+  Alert,
+  AlertAction,
+  AlertDescription,
+  AlertTitle,
+} from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemFooter,
+  ItemGroup,
+  ItemMedia,
+  ItemTitle,
+} from "@/components/ui/item";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Toggle } from "@/components/ui/toggle";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useArchivedSessions } from "@/hooks/use-archived-sessions";
 import type {
+  AcpActiveSessionMode,
   AcpReplayedMessage,
   AcpSessionArtifactContent,
   AcpSessionArtifactSummary,
   AcpSessionCapabilitiesFlags,
   AcpSessionInfo,
 } from "@/lib/acp/types";
+
+type SessionsPanelTab = "sessions" | "chat" | "artifacts";
 
 interface AcpSessionsPanelProps {
   defaultCwd: string;
@@ -33,10 +75,14 @@ interface AcpSessionsPanelProps {
   sessions: AcpSessionInfo[];
   nextCursor: string | null;
   activeSessionId: string | null;
+  activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
+  onLoadArtifactContent: (
+    artifactName: string,
+  ) => Promise<AcpSessionArtifactContent | null>;
   sessionCaps: AcpSessionCapabilitiesFlags;
   sessionBusyId: string | null;
   sessionError: string | null;
@@ -47,7 +93,6 @@ interface AcpSessionsPanelProps {
   onLoadSession: (session: AcpSessionInfo) => Promise<void>;
   onResumeSession: (session: AcpSessionInfo) => Promise<void>;
   onCloseSession: () => Promise<void>;
-  onDeleteSession: (sessionId: string) => Promise<void>;
   onRefreshArtifacts: () => Promise<void>;
   onOpenArtifact: (artifactName: string) => Promise<void>;
   onCloseArtifact: () => void;
@@ -84,10 +129,12 @@ export function AcpSessionsPanel({
   sessions,
   nextCursor,
   activeSessionId,
+  activeSessionMode,
   replayedMessages,
   sessionArtifacts,
   selectedArtifact,
   artifactsBusy,
+  onLoadArtifactContent,
   sessionCaps,
   sessionBusyId,
   sessionError,
@@ -98,435 +145,559 @@ export function AcpSessionsPanel({
   onLoadSession,
   onResumeSession,
   onCloseSession,
-  onDeleteSession,
   onRefreshArtifacts,
   onOpenArtifact,
   onCloseArtifact,
 }: AcpSessionsPanelProps) {
-  const [activeTab, setActiveTab] = useState<
-    "sessions" | "messages" | "artifacts"
-  >("sessions");
+  const [activeTab, setActiveTab] = useState<SessionsPanelTab>("sessions");
+  const {
+    showArchived,
+    setShowArchived,
+    isArchived,
+    toggleArchived,
+    countArchivedIn,
+  } = useArchivedSessions();
 
   const activeSession = sessions.find(
     (item) => item.sessionId === activeSessionId,
   );
+  const archivedCount = useMemo(
+    () => countArchivedIn(sessions),
+    [countArchivedIn, sessions],
+  );
+  const visibleSessions = useMemo(
+    () =>
+      showArchived
+        ? sessions
+        : sessions.filter((item) => !isArchived(item.sessionId)),
+    [isArchived, sessions, showArchived],
+  );
+  const artifactPaths = useMemo(
+    () => sessionArtifacts.map((art) => art.name),
+    [sessionArtifacts],
+  );
 
   const handleLoadClick = async (session: AcpSessionInfo) => {
     await onLoadSession(session);
-    setActiveTab("messages");
+    setActiveTab("chat");
+  };
+
+  const handleResumeClick = async (session: AcpSessionInfo) => {
+    await onResumeSession(session);
+    setActiveTab("chat");
+  };
+
+  const handleCreateClick = async () => {
+    await onCreateSession();
+    setActiveTab("chat");
   };
 
   return (
-    <aside className="flex h-full w-96 shrink-0 flex-col border-l border-border bg-card/50 text-xs">
-      <div className="flex flex-col gap-2 border-b border-border p-3">
-        <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0 flex-1">
-            <div
-              className="flex min-w-0 items-center gap-1.5 text-muted-foreground"
-              title={defaultCwd}
-            >
-              <FolderOpen className="size-3.5 shrink-0" />
-              <span className="truncate font-medium text-foreground">
+    <div className="flex size-full min-h-0 min-w-0 flex-col bg-card/40">
+      <div className="flex shrink-0 flex-col gap-2.5 p-3 pb-2">
+        <Item variant="muted" size="xs">
+          <ItemMedia variant="icon">
+            <FolderOpenIcon />
+          </ItemMedia>
+          <ItemContent className="min-w-0">
+            <ItemTitle className="max-w-full">
+              <span className="truncate" title={defaultCwd}>
                 {defaultCwd || "Workspace"}
               </span>
-            </div>
-            <div
-              className="truncate pl-5 text-[10px] text-muted-foreground"
-              title={agyProfileDir}
-            >
+            </ItemTitle>
+            <ItemDescription className="truncate" title={agyProfileDir}>
               Profile: {agyProfileDir}
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={() => onToggleCbiMcp(!includeCbiMcp)}
-            className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${
-              includeCbiMcp
-                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                : "border-border bg-muted/40 text-muted-foreground"
-            }`}
-            title="Attach server-curated codebase-indexer MCP server on session setup"
-          >
-            <Database className="size-3" />
-            CBI MCP {includeCbiMcp ? "ON" : "OFF"}
-          </button>
-        </div>
-
-        <div className="flex items-center gap-1.5">
-          <Button
-            size="sm"
-            className="flex-1"
-            disabled={!defaultCwd || sessionBusyId !== null}
-            onClick={() => void onCreateSession()}
-          >
-            {sessionBusyId === "new" ? (
-              <Loader2 className="size-3.5 animate-spin" />
-            ) : (
-              <Plus className="size-3.5" />
-            )}
-            New Session
-          </Button>
-          {sessionCaps.canList && (
-            <Button
-              variant="outline"
-              size="icon-sm"
-              disabled={sessionBusyId !== null}
-              onClick={() => void onRefresh()}
-              title="Refresh sessions"
-            >
-              <RefreshCw
-                className={`size-3.5 ${sessionBusyId === "list" ? "animate-spin" : ""}`}
-              />
-            </Button>
-          )}
-        </div>
-
-        {activeSessionId && (
-          <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5">
-            <div className="min-w-0">
-              <div className="truncate font-medium text-foreground">
-                {activeSession?.title || "Active session"}
-              </div>
-              <div className="truncate text-[10px] text-muted-foreground">
-                {activeSessionId}
-              </div>
-            </div>
-            {sessionCaps.canClose && (
-              <Button
-                variant="outline"
-                size="xs"
-                disabled={sessionBusyId === "close"}
-                onClick={() => void onCloseSession()}
+            </ItemDescription>
+          </ItemContent>
+          <ItemActions>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Toggle
+                    variant="outline"
+                    size="sm"
+                    pressed={includeCbiMcp}
+                    onPressedChange={(pressed) => onToggleCbiMcp(pressed)}
+                    aria-label="Toggle codebase-indexer MCP attachment"
+                  />
+                }
               >
-                Close
-              </Button>
+                <DatabaseIcon />
+                <span>CBI MCP</span>
+                <Badge variant={includeCbiMcp ? "default" : "outline"}>
+                  {includeCbiMcp ? "ON" : "OFF"}
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>
+                  Attach server-curated codebase-indexer MCP server on session
+                  setup
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          </ItemActions>
+        </Item>
+
+        <div className="flex items-center justify-between gap-2">
+          <ButtonGroup className="flex-1">
+            <Button
+              size="sm"
+              className="flex-1"
+              disabled={!defaultCwd || sessionBusyId !== null}
+              onClick={() => void handleCreateClick()}
+            >
+              {sessionBusyId === "new" ? <Spinner /> : <PlusIcon />}
+              New Session
+            </Button>
+            {sessionCaps.canList && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="outline"
+                      size="icon-sm"
+                      aria-label="Refresh sessions"
+                      disabled={sessionBusyId !== null}
+                      onClick={() => void onRefresh()}
+                    />
+                  }
+                >
+                  {sessionBusyId === "list" ? <Spinner /> : <RefreshCwIcon />}
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Refresh sessions list</p>
+                </TooltipContent>
+              </Tooltip>
             )}
-          </div>
-        )}
+          </ButtonGroup>
+
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Toggle
+                  variant="outline"
+                  size="sm"
+                  pressed={showArchived}
+                  onPressedChange={setShowArchived}
+                  aria-label={
+                    showArchived
+                      ? "Hide archived conversations"
+                      : "Show archived conversations"
+                  }
+                />
+              }
+            >
+              <ArchiveIcon />
+              <span>Archived</span>
+              {archivedCount > 0 && (
+                <Badge variant="secondary">{archivedCount}</Badge>
+              )}
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>
+                {showArchived
+                  ? "Hide archived conversations"
+                  : "Show archived conversations"}
+              </p>
+            </TooltipContent>
+          </Tooltip>
+        </div>
 
         {sessionError && (
-          <div className="flex items-center justify-between gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-destructive">
-            <span className="truncate" title={sessionError}>
+          <Alert variant="destructive">
+            <CircleAlertIcon />
+            <AlertTitle>Session error</AlertTitle>
+            <AlertDescription className="truncate" title={sessionError}>
               {sessionError}
-            </span>
-            <button
-              type="button"
-              onClick={onClearSessionError}
-              className="shrink-0 rounded p-0.5 hover:bg-destructive/20"
-              aria-label="Dismiss session error"
-            >
-              <X className="size-3" />
-            </button>
-          </div>
+            </AlertDescription>
+            <AlertAction>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Dismiss session error"
+                onClick={onClearSessionError}
+              >
+                <XIcon />
+              </Button>
+            </AlertAction>
+          </Alert>
         )}
-
-        <div className="flex rounded-md border border-border bg-muted/40 p-0.5">
-          <button
-            type="button"
-            onClick={() => setActiveTab("sessions")}
-            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
-              activeTab === "sessions"
-                ? "bg-background text-foreground shadow-xs"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <History className="size-3" />
-            Sessions ({sessions.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("messages")}
-            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
-              activeTab === "messages"
-                ? "bg-background text-foreground shadow-xs"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <MessageSquare className="size-3" />
-            History ({replayedMessages.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("artifacts")}
-            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
-              activeTab === "artifacts"
-                ? "bg-background text-foreground shadow-xs"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <FileText className="size-3" />
-            Artifacts ({sessionArtifacts.length})
-          </button>
-        </div>
       </div>
 
-      {activeTab === "sessions" && (
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="flex flex-col gap-2 p-3">
-            {sessions.length === 0 ? (
-              <div className="py-8 text-center text-muted-foreground">
-                No sessions found for this workspace yet.
-              </div>
-            ) : (
-              sessions.map((session) => {
-                const isActive = session.sessionId === activeSessionId;
-                const isBusy = sessionBusyId === session.sessionId;
-                return (
-                  <div
-                    key={session.sessionId}
-                    className={`flex flex-col gap-2 rounded-lg border p-2.5 transition-colors ${
-                      isActive
-                        ? "border-primary/50 bg-accent/40"
-                        : "border-border bg-background/60"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <div
-                          className="truncate font-medium text-foreground"
-                          title={session.title || session.sessionId}
-                        >
-                          {session.title || "Untitled session"}
-                        </div>
-                        <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                          <span className="truncate">
-                            {session.sessionId.slice(0, 12)}
-                          </span>
-                          {session.updatedAt && (
-                            <>
-                              <span>·</span>
-                              <span className="shrink-0">
-                                {formatUpdatedAt(session.updatedAt)}
-                              </span>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    </div>
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => setActiveTab(value as SessionsPanelTab)}
+        className="min-h-0 flex-1 gap-0"
+      >
+        <div className="shrink-0 px-3 pb-2">
+          <TabsList className="w-full">
+            <TabsTrigger value="sessions">
+              <HistoryIcon />
+              <span>Sessions</span>
+              <Badge variant="secondary">{visibleSessions.length}</Badge>
+            </TabsTrigger>
+            <TabsTrigger value="chat">
+              <MessageSquareIcon />
+              <span>Chat</span>
+              {replayedMessages.length > 0 && (
+                <Badge variant="secondary">{replayedMessages.length}</Badge>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="artifacts">
+              <FileTextIcon />
+              <span>Artifacts</span>
+              {sessionArtifacts.length > 0 && (
+                <Badge variant="secondary">{sessionArtifacts.length}</Badge>
+              )}
+            </TabsTrigger>
+          </TabsList>
+        </div>
 
-                    <div className="flex items-center justify-end gap-1.5">
-                      {sessionCaps.canResume && (
+        <Separator />
+
+        <TabsContent value="sessions" className="flex min-h-0 flex-1 flex-col">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="flex flex-col gap-2.5 p-3">
+              {visibleSessions.length === 0 ? (
+                <Empty className="py-10">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      {sessions.length > 0 && archivedCount > 0 ? (
+                        <ArchiveIcon />
+                      ) : (
+                        <HistoryIcon />
+                      )}
+                    </EmptyMedia>
+                    <EmptyTitle>
+                      {sessions.length > 0 && archivedCount > 0
+                        ? "All conversations are archived"
+                        : "No sessions yet"}
+                    </EmptyTitle>
+                    <EmptyDescription>
+                      {sessions.length > 0 && archivedCount > 0
+                        ? `${archivedCount} archived ${archivedCount === 1 ? "conversation is" : "conversations are"} hidden from the active list.`
+                        : "Start a new ACP session in this workspace to inspect and chat with the agent."}
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent className="flex-row justify-center gap-2">
+                    <Button
+                      size="sm"
+                      disabled={!defaultCwd || sessionBusyId !== null}
+                      onClick={() => void handleCreateClick()}
+                    >
+                      {sessionBusyId === "new" ? <Spinner /> : <PlusIcon />}
+                      New Session
+                    </Button>
+                    {sessions.length > 0 &&
+                      archivedCount > 0 &&
+                      !showArchived && (
                         <Button
-                          variant="ghost"
-                          size="xs"
-                          disabled={sessionBusyId !== null}
-                          onClick={() => void onResumeSession(session)}
-                          title="Resume session without history replay (session/resume)"
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setShowArchived(true)}
                         >
-                          <Play className="size-3" />
-                          Resume
+                          <ArchiveRestoreIcon />
+                          Show Archived ({archivedCount})
                         </Button>
                       )}
-                      <Button
-                        variant="outline"
+                  </EmptyContent>
+                </Empty>
+              ) : (
+                <ItemGroup data-size="xs" className="gap-2">
+                  {visibleSessions.map((session) => {
+                    const isActive = session.sessionId === activeSessionId;
+                    const isBusy = sessionBusyId === session.sessionId;
+                    const archived = isArchived(session.sessionId);
+
+                    return (
+                      <Item
+                        key={session.sessionId}
+                        variant={isActive ? "muted" : "outline"}
                         size="xs"
-                        disabled={!sessionCaps.canLoad || sessionBusyId !== null}
-                        onClick={() => void handleLoadClick(session)}
-                        title="Load session and replay conversation history (session/load)"
+                        className={archived ? "opacity-75" : undefined}
                       >
-                        {isBusy ? (
-                          <Loader2 className="size-3 animate-spin" />
-                        ) : null}
-                        Load
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        size="xs"
-                        disabled={
-                          !sessionCaps.canDelete || sessionBusyId !== null
-                        }
-                        onClick={() => void onDeleteSession(session.sessionId)}
-                        title={
-                          sessionCaps.canDelete
-                            ? "Delete session from history (session/delete)"
-                            : "Agent did not advertise sessionCapabilities.delete"
-                        }
-                      >
-                        <Trash2 className="size-3" />
-                        Delete
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })
-            )}
+                        <ItemContent className="min-w-0">
+                          <ItemTitle className="max-w-full">
+                            <span
+                              className="truncate"
+                              title={session.title || session.sessionId}
+                            >
+                              {session.title || "Untitled session"}
+                            </span>
+                            {isActive && (
+                              <Badge variant="default">Active</Badge>
+                            )}
+                            {archived && (
+                              <Badge variant="outline">Archived</Badge>
+                            )}
+                          </ItemTitle>
+                          <ItemDescription className="truncate">
+                            {session.sessionId.slice(0, 12)}
+                            {session.updatedAt
+                              ? ` · ${formatUpdatedAt(session.updatedAt)}`
+                              : ""}
+                          </ItemDescription>
+                        </ItemContent>
+                        <ItemFooter className="justify-end pt-1">
+                          <ButtonGroup>
+                            {sessionCaps.canResume && (
+                              <Tooltip>
+                                <TooltipTrigger
+                                  render={
+                                    <Button
+                                      variant="outline"
+                                      size="xs"
+                                      disabled={sessionBusyId !== null}
+                                      onClick={() =>
+                                        void handleResumeClick(session)
+                                      }
+                                    />
+                                  }
+                                >
+                                  <PlayIcon />
+                                  Resume
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p>
+                                    Resume session without history replay
+                                    (session/resume)
+                                  </p>
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <Button
+                                    variant="outline"
+                                    size="xs"
+                                    disabled={
+                                      !sessionCaps.canLoad ||
+                                      sessionBusyId !== null
+                                    }
+                                    onClick={() =>
+                                      void handleLoadClick(session)
+                                    }
+                                  />
+                                }
+                              >
+                                {isBusy ? <Spinner /> : null}
+                                Load
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>
+                                  Load session and replay conversation history
+                                  (session/load)
+                                </p>
+                              </TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <Button
+                                    variant="outline"
+                                    size="xs"
+                                    aria-label={
+                                      archived
+                                        ? "Unarchive conversation"
+                                        : "Archive conversation"
+                                    }
+                                    onClick={() =>
+                                      toggleArchived(session.sessionId)
+                                    }
+                                  />
+                                }
+                              >
+                                {archived ? (
+                                  <ArchiveRestoreIcon />
+                                ) : (
+                                  <ArchiveIcon />
+                                )}
+                                {archived ? "Unarchive" : "Archive"}
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>
+                                  {archived
+                                    ? "Restore conversation to main sessions list"
+                                    : "Archive conversation locally (hides unless Archived filter is active)"}
+                                </p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </ButtonGroup>
+                        </ItemFooter>
+                      </Item>
+                    );
+                  })}
+                </ItemGroup>
+              )}
 
-            {nextCursor && (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={sessionBusyId !== null}
-                onClick={() => void onLoadMore()}
-              >
-                {sessionBusyId === "more" ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : null}
-                Load more
-              </Button>
-            )}
-          </div>
-        </ScrollArea>
-      )}
+              {nextCursor && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={sessionBusyId !== null}
+                  onClick={() => void onLoadMore()}
+                >
+                  {sessionBusyId === "more" ? <Spinner /> : null}
+                  Load more
+                </Button>
+              )}
+            </div>
+          </ScrollArea>
+        </TabsContent>
 
-      {activeTab === "messages" && (
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="flex flex-col gap-2 p-3">
-            {replayedMessages.length === 0 ? (
-              <div className="py-8 text-center text-muted-foreground">
-                {activeSessionId
-                  ? "No replayed messages in this session yet."
-                  : "Load a session to replay its conversation history."}
-              </div>
-            ) : (
-              replayedMessages.map((msg, idx) =>
-                msg.role === "tool" ? (
-                  <div
-                    key={`${msg.id}-${idx}`}
-                    className="flex items-center justify-between gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 py-1.5"
-                  >
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <Wrench className="size-3 shrink-0 text-muted-foreground" />
-                      <span
-                        className="truncate font-medium text-foreground"
-                        title={msg.text}
-                      >
-                        {msg.text}
-                      </span>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
-                      {msg.toolKind && (
-                        <span className="rounded bg-background/80 px-1.5 py-0.5">
-                          {msg.toolKind}
-                        </span>
-                      )}
-                      {msg.toolStatus && (
-                        <span className="rounded bg-background/80 px-1.5 py-0.5 uppercase">
-                          {msg.toolStatus}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div
-                    key={`${msg.id}-${idx}`}
-                    className={`rounded-lg border p-2.5 ${
-                      msg.role === "user"
-                        ? "border-border bg-muted/50"
-                        : msg.role === "thought"
-                          ? "border-border/60 bg-background/40 italic text-muted-foreground"
-                          : "border-border bg-background"
-                    }`}
-                  >
-                    <div className="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
-                      {msg.role}
-                    </div>
-                    <pre className="font-sans text-xs whitespace-pre-wrap wrap-break-word text-foreground">
-                      {msg.text}
-                    </pre>
-                  </div>
-                ),
-              )
-            )}
-          </div>
-        </ScrollArea>
-      )}
+        <TabsContent value="chat" className="flex min-h-0 flex-1 flex-col">
+          <SessionChat
+            activeSessionId={activeSessionId}
+            activeSession={activeSession}
+            activeSessionMode={activeSessionMode}
+            replayedMessages={replayedMessages}
+            sessionArtifacts={sessionArtifacts}
+            onLoadArtifact={onLoadArtifactContent}
+            includeCbiMcp={includeCbiMcp}
+            onToggleCbiMcp={onToggleCbiMcp}
+            sessionCaps={sessionCaps}
+            sessionBusyId={sessionBusyId}
+            onCreateSession={handleCreateClick}
+            onCloseSession={onCloseSession}
+            onSwitchToSessionsTab={() => setActiveTab("sessions")}
+          />
+        </TabsContent>
 
-      {activeTab === "artifacts" && (
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="flex flex-col gap-2 p-3">
-            {!activeSessionId ? (
-              <div className="py-8 text-center text-muted-foreground">
-                Load or resume a session to inspect its markdown artifacts.
-              </div>
-            ) : selectedArtifact ? (
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between gap-2">
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    onClick={onCloseArtifact}
-                  >
-                    <ArrowLeft className="size-3" />
-                    All artifacts
-                  </Button>
-                  <span className="text-[10px] text-muted-foreground">
-                    {formatByteSize(selectedArtifact.size_bytes)}
-                  </span>
-                </div>
-                <div className="rounded-lg border border-border bg-background p-2.5">
-                  <div className="font-medium text-foreground">
-                    {selectedArtifact.name}
-                  </div>
-                  {selectedArtifact.summary && (
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      {selectedArtifact.summary}
-                    </div>
-                  )}
-                  <pre className="mt-2 border-t border-border pt-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap wrap-break-word text-foreground">
-                    {selectedArtifact.content}
-                  </pre>
-                </div>
-              </div>
-            ) : (
-              <>
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-muted-foreground">
-                    brain/{activeSessionId.slice(0, 12)}/*.md
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="xs"
-                    disabled={artifactsBusy}
-                    onClick={() => void onRefreshArtifacts()}
-                  >
-                    <RefreshCw
-                      className={`size-3 ${artifactsBusy ? "animate-spin" : ""}`}
-                    />
-                    Refresh
-                  </Button>
-                </div>
-                {sessionArtifacts.length === 0 ? (
-                  <div className="py-6 text-center text-muted-foreground">
-                    {artifactsBusy
-                      ? "Loading session artifacts…"
-                      : "No markdown artifacts found for this session."}
-                  </div>
-                ) : (
-                  sessionArtifacts.map((art) => (
-                    <button
-                      key={art.name}
-                      type="button"
-                      disabled={artifactsBusy}
-                      onClick={() => void onOpenArtifact(art.name)}
-                      className="flex flex-col gap-1 rounded-lg border border-border bg-background/60 p-2.5 text-left transition-colors hover:border-primary/50 hover:bg-accent/30"
+        <TabsContent value="artifacts" className="flex min-h-0 flex-1 flex-col">
+          <ScrollArea className="min-h-0 flex-1">
+            <div className="flex flex-col gap-3 p-3">
+              {!activeSessionId ? (
+                <Empty className="py-10">
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <FileTextIcon />
+                    </EmptyMedia>
+                    <EmptyTitle>No session selected</EmptyTitle>
+                    <EmptyDescription>
+                      Load or resume a session to browse its markdown artifacts.
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setActiveTab("sessions")}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="flex min-w-0 items-center gap-1.5 truncate font-medium text-foreground">
-                          <FileText className="size-3.5 shrink-0 text-muted-foreground" />
-                          <span className="truncate">{art.name}</span>
-                        </span>
-                        <span className="shrink-0 text-[10px] text-muted-foreground">
-                          {formatByteSize(art.size_bytes)}
-                        </span>
-                      </div>
-                      {art.summary && (
-                        <div className="line-clamp-2 text-[11px] text-muted-foreground">
-                          {art.summary}
-                        </div>
+                      <HistoryIcon />
+                      Browse Sessions
+                    </Button>
+                  </EmptyContent>
+                </Empty>
+              ) : selectedArtifact ? (
+                <div className="flex flex-col gap-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      onClick={onCloseArtifact}
+                    >
+                      <ArrowLeftIcon />
+                      All artifacts
+                    </Button>
+                    <Badge variant="secondary">
+                      {formatByteSize(selectedArtifact.size_bytes)}
+                    </Badge>
+                  </div>
+                  <Item variant="outline" size="sm">
+                    <ItemContent className="min-w-0">
+                      <ItemTitle>{selectedArtifact.name}</ItemTitle>
+                      {selectedArtifact.summary && (
+                        <ItemDescription>
+                          {selectedArtifact.summary}
+                        </ItemDescription>
                       )}
-                      {art.updated_at && (
-                        <div className="text-[10px] text-muted-foreground">
-                          {formatUpdatedAt(art.updated_at)}
-                        </div>
-                      )}
-                    </button>
-                  ))
-                )}
-              </>
-            )}
-          </div>
-        </ScrollArea>
-      )}
-    </aside>
+                    </ItemContent>
+                  </Item>
+                  <div className="rounded-lg border border-border bg-background/60 p-3">
+                    <SessionMessageBody text={selectedArtifact.content} />
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <Badge variant="outline" className="font-mono">
+                      brain/{activeSessionId.slice(0, 12)}/*.md
+                    </Badge>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      disabled={artifactsBusy}
+                      onClick={() => void onRefreshArtifacts()}
+                    >
+                      {artifactsBusy ? <Spinner /> : <RefreshCwIcon />}
+                      Refresh
+                    </Button>
+                  </div>
+
+                  {sessionArtifacts.length === 0 ? (
+                    <Empty className="py-8">
+                      <EmptyHeader>
+                        <EmptyMedia variant="icon">
+                          {artifactsBusy ? <Spinner /> : <FileTextIcon />}
+                        </EmptyMedia>
+                        <EmptyTitle>
+                          {artifactsBusy
+                            ? "Loading artifacts…"
+                            : "No markdown artifacts"}
+                        </EmptyTitle>
+                        <EmptyDescription>
+                          Plans, walkthroughs, and reports created during this
+                          session appear here.
+                        </EmptyDescription>
+                      </EmptyHeader>
+                    </Empty>
+                  ) : (
+                    <>
+                      <FileTree
+                        paths={artifactPaths}
+                        onSelect={(path) => void onOpenArtifact(path)}
+                      />
+                      <ItemGroup data-size="xs" className="gap-2">
+                        {sessionArtifacts.map((art) => (
+                          <Item
+                            key={art.name}
+                            variant="outline"
+                            size="xs"
+                            render={
+                              <button
+                                type="button"
+                                disabled={artifactsBusy}
+                                onClick={() => void onOpenArtifact(art.name)}
+                                className="cursor-pointer text-left hover:bg-muted/50"
+                              />
+                            }
+                          >
+                            <ItemMedia variant="icon">
+                              <FileTextIcon />
+                            </ItemMedia>
+                            <ItemContent className="min-w-0">
+                              <ItemTitle className="w-full justify-between">
+                                <span className="truncate">{art.name}</span>
+                                <Badge variant="secondary">
+                                  {formatByteSize(art.size_bytes)}
+                                </Badge>
+                              </ItemTitle>
+                              {art.summary && (
+                                <ItemDescription>{art.summary}</ItemDescription>
+                              )}
+                            </ItemContent>
+                          </Item>
+                        ))}
+                      </ItemGroup>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </ScrollArea>
+        </TabsContent>
+      </Tabs>
+    </div>
   );
 }

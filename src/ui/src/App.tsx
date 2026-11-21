@@ -12,9 +12,16 @@ import {
 
 import { AcpSessionsPanel } from "@/components/acp-sessions-panel";
 import { AcpStatusBar } from "@/components/acp-status-bar";
+import { ModeToggle } from "@/components/mode-toggle";
 import { ThemeProvider } from "@/components/theme-provider";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@/components/ui/resizable";
+import { Separator } from "@/components/ui/separator";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAcpConnection } from "@/hooks/use-acp-connection";
-import { ModeToggle } from "./components/mode-toggle";
 
 function WorkspaceCanvas() {
   const acp = useAcpConnection();
@@ -65,7 +72,7 @@ function WorkspaceCanvas() {
 
   return (
     <div className="flex h-screen w-screen flex-col">
-      <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
+      <header className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-4">
         <AcpStatusBar
           status={acp.status}
           result={acp.result}
@@ -86,53 +93,73 @@ function WorkspaceCanvas() {
           onLogout={acp.logout}
           onReconnect={acp.reconnect}
         />
-        <ModeToggle />
-      </header>
-      <div className="flex min-h-0 flex-1">
-        <div className="min-h-0 min-w-0 flex-1">
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            fitView
-          >
-            <Controls />
-            <MiniMap />
-            <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
-          </ReactFlow>
+        <div className="flex shrink-0 items-center gap-2.5 self-stretch py-2">
+          <Separator orientation="vertical" />
+          <ModeToggle />
         </div>
+      </header>
+      <ResizablePanelGroup orientation="horizontal" className="min-h-0 flex-1">
+        <ResizablePanel
+          id="workspace-canvas"
+          defaultSize={showPanel ? "66%" : "100%"}
+          minSize="35%"
+        >
+          <div className="size-full">
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              fitView
+            >
+              <Controls />
+              <MiniMap />
+              <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
+            </ReactFlow>
+          </div>
+        </ResizablePanel>
         {showPanel && (
-          <AcpSessionsPanel
-            defaultCwd={acp.defaultCwd}
-            agyProfileDir={acp.agyProfileDir}
-            includeCbiMcp={acp.includeCbiMcp}
-            onToggleCbiMcp={acp.setIncludeCbiMcp}
-            sessions={acp.sessions}
-            nextCursor={acp.nextCursor}
-            activeSessionId={acp.activeSessionId}
-            replayedMessages={acp.replayedMessages}
-            sessionArtifacts={acp.sessionArtifacts}
-            selectedArtifact={acp.selectedArtifact}
-            artifactsBusy={acp.artifactsBusy}
-            sessionCaps={acp.sessionCaps}
-            sessionBusyId={acp.sessionBusyId}
-            sessionError={acp.sessionError}
-            onClearSessionError={acp.clearSessionError}
-            onRefresh={acp.refreshSessions}
-            onLoadMore={acp.loadMoreSessions}
-            onCreateSession={acp.createNewSession}
-            onLoadSession={acp.loadExistingSession}
-            onResumeSession={acp.resumeExistingSession}
-            onCloseSession={acp.closeActiveSession}
-            onDeleteSession={acp.deleteExistingSession}
-            onRefreshArtifacts={acp.refreshArtifacts}
-            onOpenArtifact={acp.openArtifact}
-            onCloseArtifact={acp.closeArtifact}
-          />
+          <>
+            <ResizableHandle withHandle />
+            <ResizablePanel
+              id="acp-sessions-window"
+              defaultSize="34%"
+              minSize="24%"
+              maxSize="65%"
+            >
+              <AcpSessionsPanel
+                defaultCwd={acp.defaultCwd}
+                agyProfileDir={acp.agyProfileDir}
+                includeCbiMcp={acp.includeCbiMcp}
+                onToggleCbiMcp={acp.setIncludeCbiMcp}
+                sessions={acp.sessions}
+                nextCursor={acp.nextCursor}
+                activeSessionId={acp.activeSessionId}
+                activeSessionMode={acp.activeSessionMode}
+                replayedMessages={acp.replayedMessages}
+                sessionArtifacts={acp.sessionArtifacts}
+                selectedArtifact={acp.selectedArtifact}
+                artifactsBusy={acp.artifactsBusy}
+                onLoadArtifactContent={acp.loadArtifactContent}
+                sessionCaps={acp.sessionCaps}
+                sessionBusyId={acp.sessionBusyId}
+                sessionError={acp.sessionError}
+                onClearSessionError={acp.clearSessionError}
+                onRefresh={acp.refreshSessions}
+                onLoadMore={acp.loadMoreSessions}
+                onCreateSession={acp.createNewSession}
+                onLoadSession={acp.loadExistingSession}
+                onResumeSession={acp.resumeExistingSession}
+                onCloseSession={acp.closeActiveSession}
+                onRefreshArtifacts={acp.refreshArtifacts}
+                onOpenArtifact={acp.openArtifact}
+                onCloseArtifact={acp.closeArtifact}
+              />
+            </ResizablePanel>
+          </>
         )}
-      </div>
+      </ResizablePanelGroup>
     </div>
   );
 }
@@ -140,7 +167,9 @@ function WorkspaceCanvas() {
 function App() {
   return (
     <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
-      <WorkspaceCanvas />
+      <TooltipProvider>
+        <WorkspaceCanvas />
+      </TooltipProvider>
     </ThemeProvider>
   );
 }

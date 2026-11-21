@@ -15,15 +15,18 @@ import {
 import {
   ACP_AUTH_REQUIRED_CODE,
   DEFAULT_AUTH_METHOD_ID,
+  type AcpActiveSessionMode,
   type AcpAuthenticateOptions,
   type AcpAuthStatus,
   type AcpConnectionStatus,
   type AcpInitializeResult,
+  type AcpPlanStep,
   type AcpReplayedMessage,
   type AcpSessionArtifactContent,
   type AcpSessionArtifactSummary,
   type AcpSessionCapabilitiesFlags,
   type AcpSessionInfo,
+  type AcpToolStatus,
 } from "@/lib/acp/types";
 
 export interface UseAcpConnectionState {
@@ -41,10 +44,17 @@ export interface UseAcpConnectionState {
   sessions: AcpSessionInfo[];
   nextCursor: string | null;
   activeSessionId: string | null;
+  activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
+  loadArtifactContent: (
+    artifactName: string,
+  ) => Promise<AcpSessionArtifactContent | null>;
+  refreshArtifacts: () => Promise<void>;
+  openArtifact: (artifactName: string) => Promise<void>;
+  closeArtifact: () => void;
   sessionCaps: AcpSessionCapabilitiesFlags;
   sessionBusyId: string | null;
   error: string | null;
@@ -64,38 +74,13 @@ export interface UseAcpConnectionState {
   resumeExistingSession: (session: AcpSessionInfo) => Promise<void>;
   closeActiveSession: () => Promise<void>;
   deleteExistingSession: (sessionId: string) => Promise<void>;
-  refreshArtifacts: () => Promise<void>;
-  openArtifact: (artifactName: string) => Promise<void>;
-  closeArtifact: () => void;
   reconnect: () => void;
-}
-
-const MAX_REPLAY_MESSAGE_CHARS = 64_000;
-
-function extractUpdateText(rawContent: unknown): string {
-  if (Array.isArray(rawContent)) {
-    const joined = rawContent
-      .map((entry) => {
-        const block = entry as Record<string, unknown> | undefined;
-        return block?.type === "text" && typeof block.text === "string"
-          ? block.text
-          : "";
-      })
-      .filter(Boolean)
-      .join("");
-    return sanitizeMultilineAgentText(joined, MAX_REPLAY_MESSAGE_CHARS);
-  }
-  const block = rawContent as Record<string, unknown> | undefined;
-  if (block?.type === "text" && typeof block.text === "string") {
-    return sanitizeMultilineAgentText(block.text, MAX_REPLAY_MESSAGE_CHARS);
-  }
-  return "";
 }
 
 function appendMessageChunk(
   prev: AcpReplayedMessage[],
   id: string,
-  role: AcpReplayedMessage["role"],
+  role: "user" | "agent" | "thought",
   chunkText: string,
 ): AcpReplayedMessage[] {
   if (!chunkText) {
@@ -105,13 +90,7 @@ function appendMessageChunk(
   if (existingIdx >= 0) {
     return prev.map((item, idx) =>
       idx === existingIdx
-        ? {
-            ...item,
-            text: sanitizeMultilineAgentText(
-              item.text + chunkText,
-              MAX_REPLAY_MESSAGE_CHARS,
-            ),
-          }
+        ? { ...item, text: sanitizeMultilineAgentText(item.text + chunkText) }
         : item,
     );
   }
@@ -119,68 +98,129 @@ function appendMessageChunk(
   if (id.startsWith("auto_") && last && last.role === role) {
     return [
       ...prev.slice(0, -1),
-      {
-        ...last,
-        text: sanitizeMultilineAgentText(
-          last.text + chunkText,
-          MAX_REPLAY_MESSAGE_CHARS,
-        ),
-      },
+      { ...last, text: sanitizeMultilineAgentText(last.text + chunkText) },
     ];
   }
   return [...prev, { id, role, text: chunkText }];
 }
 
-function upsertToolCallMessage(
-  prev: AcpReplayedMessage[],
-  update: Record<string, unknown>,
-): AcpReplayedMessage[] {
-  const toolId =
-    typeof update.toolCallId === "string" && update.toolCallId
-      ? sanitizeAgentText(update.toolCallId, 96)
-      : "";
-  if (!toolId) {
-    return prev;
+function mapRawToolStatus(rawStatus: unknown): AcpToolStatus {
+  if (typeof rawStatus !== "string") {
+    return "done";
   }
-  const rawLabel =
-    typeof update.title === "string" && update.title
-      ? update.title
-      : typeof update.name === "string"
-        ? update.name
-        : "";
-  const cleanLabel = rawLabel ? sanitizeAgentText(rawLabel, 240) : "";
-  const toolKind =
-    typeof update.kind === "string" && update.kind
-      ? sanitizeAgentText(update.kind, 32)
-      : undefined;
-  const toolStatus =
-    typeof update.status === "string" && update.status
-      ? sanitizeAgentText(update.status, 32)
-      : undefined;
+  const normalized = rawStatus.toLowerCase();
+  if (normalized === "in_progress" || normalized === "running") {
+    return "running";
+  }
+  if (normalized === "pending") {
+    return "pending";
+  }
+  if (normalized === "failed" || normalized === "error") {
+    return "error";
+  }
+  if (normalized === "denied" || normalized === "rejected") {
+    return "denied";
+  }
+  return "done";
+}
 
-  const existingIdx = prev.findIndex((item) => item.id === toolId);
-  if (existingIdx >= 0) {
-    return prev.map((item, idx) =>
-      idx === existingIdx
-        ? {
-            ...item,
-            ...(cleanLabel ? { text: cleanLabel } : {}),
-            ...(toolKind !== undefined ? { toolKind } : {}),
-            ...(toolStatus !== undefined ? { toolStatus } : {}),
-          }
-        : item,
-    );
+function extractToolText(update: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (Array.isArray(update.content)) {
+    for (const entry of update.content) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const record = entry as Record<string, unknown>;
+      const inner = record.content as Record<string, unknown> | undefined;
+      if (typeof record.text === "string") {
+        parts.push(record.text);
+      } else if (typeof inner?.text === "string") {
+        parts.push(inner.text);
+      } else if (typeof record.path === "string") {
+        parts.push(record.path);
+      }
+    }
   }
-  return [
-    ...prev,
-    {
-      id: toolId,
-      role: "tool",
-      text: cleanLabel || "Tool invocation",
-      ...(toolKind !== undefined ? { toolKind } : {}),
-      ...(toolStatus !== undefined ? { toolStatus } : {}),
-    },
-  ];
+  if (parts.length === 0 && typeof update.rawOutput === "string") {
+    parts.push(update.rawOutput);
+  } else if (
+    parts.length === 0 &&
+    typeof update.rawOutput === "object" &&
+    update.rawOutput !== null
+  ) {
+    const rawOut = update.rawOutput as Record<string, unknown>;
+    if (typeof rawOut.stdout === "string") {
+      parts.push(rawOut.stdout);
+    }
+    if (typeof rawOut.stderr === "string" && rawOut.stderr) {
+      parts.push(rawOut.stderr);
+    }
+  }
+  return sanitizeMultilineAgentText(parts.join("\n"));
+}
+
+function extractToolLocations(update: Record<string, unknown>): string[] {
+  if (!Array.isArray(update.locations)) {
+    return [];
+  }
+  const locations: string[] = [];
+  for (const loc of update.locations) {
+    if (typeof loc === "string") {
+      locations.push(sanitizeAgentText(loc, 260));
+    } else if (typeof loc === "object" && loc !== null) {
+      const pathVal = (loc as Record<string, unknown>).path;
+      if (typeof pathVal === "string") {
+        locations.push(sanitizeAgentText(pathVal, 260));
+      }
+    }
+  }
+  return locations.filter(Boolean);
+}
+
+function parsePlanEntries(rawEntries: unknown): AcpPlanStep[] {
+  if (!Array.isArray(rawEntries)) {
+    return [];
+  }
+  const steps: AcpPlanStep[] = [];
+  for (const raw of rawEntries) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const item = raw as Record<string, unknown>;
+    const rawTitle =
+      typeof item.content === "string"
+        ? item.content
+        : typeof item.title === "string"
+          ? item.title
+          : "";
+    if (!rawTitle) {
+      continue;
+    }
+    const rawStatus = typeof item.status === "string" ? item.status : "pending";
+    const status: AcpPlanStep["status"] =
+      rawStatus === "completed" || rawStatus === "done"
+        ? "done"
+        : rawStatus === "in_progress" || rawStatus === "running"
+          ? "running"
+          : "pending";
+    steps.push({
+      title: sanitizeAgentText(rawTitle, 200),
+      status,
+    });
+  }
+  return steps;
+}
+
+async function safeFetchArtifacts(
+  sessionId: string,
+): Promise<AcpSessionArtifactSummary[]> {
+  try {
+    const list = await fetchSessionArtifacts(sessionId);
+    return list.artifacts;
+  } catch {
+    return [];
+  }
 }
 
 export function useAcpConnection(): UseAcpConnectionState {
@@ -204,6 +244,8 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [sessions, setSessions] = useState<AcpSessionInfo[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeSessionMode, setActiveSessionMode] =
+    useState<AcpActiveSessionMode>(null);
   const [replayedMessages, setReplayedMessages] = useState<
     AcpReplayedMessage[]
   >([]);
@@ -223,22 +265,6 @@ export function useAcpConnection(): UseAcpConnectionState {
   const clearSessionError = useCallback(() => setSessionError(null), []);
   const closeArtifact = useCallback(() => setSelectedArtifact(null), []);
 
-  const loadArtifactsForSession = useCallback(async (sessionId: string) => {
-    setArtifactsBusy(true);
-    try {
-      const listing = await fetchSessionArtifacts(sessionId);
-      setSessionArtifacts(listing.artifacts);
-    } catch (err: unknown) {
-      setSessionError(
-        err instanceof Error
-          ? err.message
-          : "Failed to load session artifacts.",
-      );
-    } finally {
-      setArtifactsBusy(false);
-    }
-  }, []);
-
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
       if (method !== "session/update") {
@@ -247,20 +273,23 @@ export function useAcpConnection(): UseAcpConnectionState {
       const sessionId =
         typeof params.sessionId === "string" ? params.sessionId : "";
       const update = params.update as Record<string, unknown> | undefined;
+      if (!update) {
+        return;
+      }
       const updateKind =
-        typeof update?.sessionUpdate === "string" ? update.sessionUpdate : "";
+        typeof update.sessionUpdate === "string" ? update.sessionUpdate : "";
 
       if (updateKind === "session_info_update" && sessionId) {
         const nextTitle =
-          update?.title === null
+          update.title === null
             ? null
-            : typeof update?.title === "string"
+            : typeof update.title === "string"
               ? sanitizeAgentText(update.title, 160)
               : undefined;
         const nextUpdated =
-          update?.updatedAt === null
+          update.updatedAt === null
             ? null
-            : typeof update?.updatedAt === "string"
+            : typeof update.updatedAt === "string"
               ? sanitizeAgentText(update.updatedAt, 64)
               : undefined;
         setSessions((prev) =>
@@ -279,29 +308,117 @@ export function useAcpConnection(): UseAcpConnectionState {
         return;
       }
 
-      if (
-        (updateKind === "tool_call" || updateKind === "tool_call_update") &&
-        update
-      ) {
-        setReplayedMessages((prev) => upsertToolCallMessage(prev, update));
+      if (updateKind === "plan") {
+        const planSteps = parsePlanEntries(update.entries);
+        if (planSteps.length === 0) {
+          return;
+        }
+        const planTitle =
+          typeof update.title === "string" && update.title
+            ? sanitizeAgentText(update.title, 140)
+            : "Execution plan";
+        setReplayedMessages((prev) => {
+          const lastPlanIdx = [...prev]
+            .reverse()
+            .findIndex((item) => item.role === "plan");
+          if (lastPlanIdx >= 0) {
+            const targetIdx = prev.length - 1 - lastPlanIdx;
+            return prev.map((item, idx) =>
+              idx === targetIdx ? { ...item, planTitle, planSteps } : item,
+            );
+          }
+          chunkCounterRef.current += 1;
+          return [
+            ...prev,
+            {
+              id: `plan_${chunkCounterRef.current}`,
+              role: "plan",
+              text: "",
+              planTitle,
+              planSteps,
+            },
+          ];
+        });
         return;
       }
 
-      const roleMap: Record<string, AcpReplayedMessage["role"] | undefined> = {
-        user_message_chunk: "user",
-        agent_message_chunk: "agent",
-        agent_thought_chunk: "thought",
-      };
+      if (updateKind === "tool_call" || updateKind === "tool_call_update") {
+        const rawToolId =
+          typeof update.toolCallId === "string" && update.toolCallId
+            ? sanitizeAgentText(update.toolCallId, 96)
+            : `tool_${chunkCounterRef.current++}`;
+        const toolKind =
+          typeof update.kind === "string"
+            ? sanitizeAgentText(update.kind, 48)
+            : undefined;
+        const toolTitle =
+          typeof update.title === "string" && update.title
+            ? sanitizeAgentText(update.title, 160)
+            : undefined;
+        const toolStatus =
+          update.status !== undefined
+            ? mapRawToolStatus(update.status)
+            : undefined;
+        const text = extractToolText(update);
+        const locations = extractToolLocations(update);
+        const rawOut =
+          typeof update.rawOutput === "object" && update.rawOutput !== null
+            ? (update.rawOutput as Record<string, unknown>)
+            : null;
+        const exitCode =
+          typeof rawOut?.exitCode === "number" ? rawOut.exitCode : undefined;
+
+        setReplayedMessages((prev) => {
+          const existingIdx = prev.findIndex((item) => item.id === rawToolId);
+          if (existingIdx >= 0) {
+            return prev.map((item, idx) =>
+              idx === existingIdx
+                ? {
+                    ...item,
+                    ...(toolKind ? { toolKind } : {}),
+                    ...(toolTitle ? { toolTitle } : {}),
+                    ...(toolStatus ? { toolStatus } : {}),
+                    ...(text ? { text } : {}),
+                    ...(locations.length > 0 ? { locations } : {}),
+                    ...(exitCode !== undefined ? { exitCode } : {}),
+                  }
+                : item,
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: rawToolId,
+              role: "tool",
+              text,
+              toolKind,
+              toolTitle,
+              toolStatus: toolStatus ?? "done",
+              locations: locations.length > 0 ? locations : undefined,
+              exitCode,
+            },
+          ];
+        });
+        return;
+      }
+
+      const roleMap: Record<string, "user" | "agent" | "thought" | undefined> =
+        {
+          user_message_chunk: "user",
+          agent_message_chunk: "agent",
+          agent_thought_chunk: "thought",
+        };
       const role = roleMap[updateKind];
       if (!role) {
         return;
       }
-      const cleanChunk = extractUpdateText(update?.content);
-      if (!cleanChunk) {
+      const content = update.content as Record<string, unknown> | undefined;
+      if (content?.type !== "text" || typeof content.text !== "string") {
         return;
       }
+      const cleanChunk = sanitizeMultilineAgentText(content.text);
       const rawMsgId =
-        typeof update?.messageId === "string" && update.messageId
+        typeof update.messageId === "string" && update.messageId
           ? sanitizeAgentText(update.messageId, 96)
           : `auto_${chunkCounterRef.current}`;
       if (rawMsgId.startsWith("auto_")) {
@@ -325,6 +442,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     setSessions([]);
     setNextCursor(null);
     setActiveSessionId(null);
+    setActiveSessionMode(null);
     setReplayedMessages([]);
     setSessionArtifacts([]);
     setSelectedArtifact(null);
@@ -489,6 +607,7 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessions([]);
       setNextCursor(null);
       setActiveSessionId(null);
+      setActiveSessionMode(null);
       setReplayedMessages([]);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
@@ -516,6 +635,7 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionArtifacts([]);
       setSelectedArtifact(null);
       setActiveSessionId(created.sessionId);
+      setActiveSessionMode("new");
       setSessions((prev) => [
         {
           sessionId: created.sessionId,
@@ -550,11 +670,15 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionArtifacts([]);
       setSelectedArtifact(null);
       try {
-        await client.loadSession(session.sessionId, session.cwd, {
-          includeCbiMcp,
-        });
+        const [, artifacts] = await Promise.all([
+          client.loadSession(session.sessionId, session.cwd, {
+            includeCbiMcp,
+          }),
+          safeFetchArtifacts(session.sessionId),
+        ]);
         setActiveSessionId(session.sessionId);
-        await loadArtifactsForSession(session.sessionId);
+        setActiveSessionMode("loaded");
+        setSessionArtifacts(artifacts);
       } catch (err: unknown) {
         setSessionError(
           err instanceof Error ? err.message : "Failed to load session.",
@@ -563,7 +687,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp, loadArtifactsForSession],
+    [includeCbiMcp],
   );
 
   const resumeExistingSession = useCallback(
@@ -578,11 +702,15 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionArtifacts([]);
       setSelectedArtifact(null);
       try {
-        await client.resumeSession(session.sessionId, session.cwd, {
-          includeCbiMcp,
-        });
+        const [, artifacts] = await Promise.all([
+          client.resumeSession(session.sessionId, session.cwd, {
+            includeCbiMcp,
+          }),
+          safeFetchArtifacts(session.sessionId),
+        ]);
         setActiveSessionId(session.sessionId);
-        await loadArtifactsForSession(session.sessionId);
+        setActiveSessionMode("resumed");
+        setSessionArtifacts(artifacts);
       } catch (err: unknown) {
         setSessionError(
           err instanceof Error ? err.message : "Failed to resume session.",
@@ -591,7 +719,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp, loadArtifactsForSession],
+    [includeCbiMcp],
   );
 
   const closeActiveSession = useCallback(async () => {
@@ -604,6 +732,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     try {
       await client.closeSession(activeSessionId);
       setActiveSessionId(null);
+      setActiveSessionMode(null);
       setReplayedMessages([]);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
@@ -631,6 +760,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         );
         if (activeSessionId === sessionId) {
           setActiveSessionId(null);
+          setActiveSessionMode(null);
           setReplayedMessages([]);
           setSessionArtifacts([]);
           setSelectedArtifact(null);
@@ -650,23 +780,45 @@ export function useAcpConnection(): UseAcpConnectionState {
     if (!activeSessionId) {
       return;
     }
-    setSessionError(null);
-    await loadArtifactsForSession(activeSessionId);
-  }, [activeSessionId, loadArtifactsForSession]);
+    setArtifactsBusy(true);
+    try {
+      const list = await fetchSessionArtifacts(activeSessionId);
+      setSessionArtifacts(list.artifacts);
+    } catch (err: unknown) {
+      setSessionError(
+        err instanceof Error ? err.message : "Failed to list artifacts.",
+      );
+    } finally {
+      setArtifactsBusy(false);
+    }
+  }, [activeSessionId]);
+
+  const loadArtifactContent = useCallback(
+    async (artifactName: string): Promise<AcpSessionArtifactContent | null> => {
+      if (!activeSessionId) {
+        return null;
+      }
+      try {
+        return await fetchSessionArtifactContent(activeSessionId, artifactName);
+      } catch {
+        return null;
+      }
+    },
+    [activeSessionId],
+  );
 
   const openArtifact = useCallback(
     async (artifactName: string) => {
       if (!activeSessionId) {
         return;
       }
-      setSessionError(null);
       setArtifactsBusy(true);
       try {
-        const doc = await fetchSessionArtifactContent(
+        const content = await fetchSessionArtifactContent(
           activeSessionId,
           artifactName,
         );
-        setSelectedArtifact(doc);
+        setSelectedArtifact(content);
       } catch (err: unknown) {
         setSessionError(
           err instanceof Error ? err.message : "Failed to read artifact.",
@@ -699,10 +851,15 @@ export function useAcpConnection(): UseAcpConnectionState {
     sessions,
     nextCursor,
     activeSessionId,
+    activeSessionMode,
     replayedMessages,
     sessionArtifacts,
     selectedArtifact,
     artifactsBusy,
+    loadArtifactContent,
+    refreshArtifacts,
+    openArtifact,
+    closeArtifact,
     sessionCaps,
     sessionBusyId,
     error,
@@ -719,9 +876,6 @@ export function useAcpConnection(): UseAcpConnectionState {
     resumeExistingSession,
     closeActiveSession,
     deleteExistingSession,
-    refreshArtifacts,
-    openArtifact,
-    closeArtifact,
     reconnect,
   };
 }
