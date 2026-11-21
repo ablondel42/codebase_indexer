@@ -98,7 +98,38 @@ class SessionDeleteParams(FrozenModel):
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
+class SessionArtifactSummary(FrozenModel):
+    """Metadata summary for a single markdown artifact in ``brain/<sessionId>/``."""
+
+    name: str
+    summary: str | None = None
+    updated_at: str
+    size_bytes: int = Field(ge=0)
+    user_facing: bool = True
+
+
+class SessionArtifactList(FrozenModel):
+    """Read-only listing of markdown artifacts belonging to an ACP session."""
+
+    session_id: str
+    artifacts: tuple[SessionArtifactSummary, ...] = ()
+
+
+class SessionArtifactContent(FrozenModel):
+    """Read-only markdown content and metadata for a single session artifact."""
+
+    session_id: str
+    name: str
+    summary: str | None = None
+    updated_at: str
+    size_bytes: int = Field(ge=0)
+    content: str
+
+
 __all__ = [
+    "SessionArtifactContent",
+    "SessionArtifactList",
+    "SessionArtifactSummary",
     "SessionCloseParams",
     "SessionDeleteParams",
     "SessionListParams",

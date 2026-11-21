@@ -1,6 +1,8 @@
 import { useState } from "react";
 import {
+  ArrowLeft,
   Database,
+  FileText,
   FolderOpen,
   History,
   Loader2,
@@ -9,6 +11,7 @@ import {
   Plus,
   RefreshCw,
   Trash2,
+  Wrench,
   X,
 } from "lucide-react";
 
@@ -16,18 +19,24 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type {
   AcpReplayedMessage,
+  AcpSessionArtifactContent,
+  AcpSessionArtifactSummary,
   AcpSessionCapabilitiesFlags,
   AcpSessionInfo,
 } from "@/lib/acp/types";
 
 interface AcpSessionsPanelProps {
   defaultCwd: string;
+  agyProfileDir: string;
   includeCbiMcp: boolean;
   onToggleCbiMcp: (enabled: boolean) => void;
   sessions: AcpSessionInfo[];
   nextCursor: string | null;
   activeSessionId: string | null;
   replayedMessages: AcpReplayedMessage[];
+  sessionArtifacts: AcpSessionArtifactSummary[];
+  selectedArtifact: AcpSessionArtifactContent | null;
+  artifactsBusy: boolean;
   sessionCaps: AcpSessionCapabilitiesFlags;
   sessionBusyId: string | null;
   sessionError: string | null;
@@ -39,6 +48,9 @@ interface AcpSessionsPanelProps {
   onResumeSession: (session: AcpSessionInfo) => Promise<void>;
   onCloseSession: () => Promise<void>;
   onDeleteSession: (sessionId: string) => Promise<void>;
+  onRefreshArtifacts: () => Promise<void>;
+  onOpenArtifact: (artifactName: string) => Promise<void>;
+  onCloseArtifact: () => void;
 }
 
 function formatUpdatedAt(iso: string | null | undefined): string {
@@ -57,14 +69,25 @@ function formatUpdatedAt(iso: string | null | undefined): string {
   });
 }
 
+function formatByteSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
 export function AcpSessionsPanel({
   defaultCwd,
+  agyProfileDir,
   includeCbiMcp,
   onToggleCbiMcp,
   sessions,
   nextCursor,
   activeSessionId,
   replayedMessages,
+  sessionArtifacts,
+  selectedArtifact,
+  artifactsBusy,
   sessionCaps,
   sessionBusyId,
   sessionError,
@@ -76,10 +99,13 @@ export function AcpSessionsPanel({
   onResumeSession,
   onCloseSession,
   onDeleteSession,
+  onRefreshArtifacts,
+  onOpenArtifact,
+  onCloseArtifact,
 }: AcpSessionsPanelProps) {
-  const [activeTab, setActiveTab] = useState<"sessions" | "messages">(
-    "sessions",
-  );
+  const [activeTab, setActiveTab] = useState<
+    "sessions" | "messages" | "artifacts"
+  >("sessions");
 
   const activeSession = sessions.find(
     (item) => item.sessionId === activeSessionId,
@@ -94,14 +120,22 @@ export function AcpSessionsPanel({
     <aside className="flex h-full w-96 shrink-0 flex-col border-l border-border bg-card/50 text-xs">
       <div className="flex flex-col gap-2 border-b border-border p-3">
         <div className="flex items-center justify-between gap-2">
-          <div
-            className="flex min-w-0 items-center gap-1.5 text-muted-foreground"
-            title={defaultCwd}
-          >
-            <FolderOpen className="size-3.5 shrink-0" />
-            <span className="truncate font-medium text-foreground">
-              {defaultCwd || "Workspace"}
-            </span>
+          <div className="min-w-0 flex-1">
+            <div
+              className="flex min-w-0 items-center gap-1.5 text-muted-foreground"
+              title={defaultCwd}
+            >
+              <FolderOpen className="size-3.5 shrink-0" />
+              <span className="truncate font-medium text-foreground">
+                {defaultCwd || "Workspace"}
+              </span>
+            </div>
+            <div
+              className="truncate pl-5 text-[10px] text-muted-foreground"
+              title={agyProfileDir}
+            >
+              Profile: {agyProfileDir}
+            </div>
           </div>
           <button
             type="button"
@@ -190,31 +224,43 @@ export function AcpSessionsPanel({
           <button
             type="button"
             onClick={() => setActiveTab("sessions")}
-            className={`flex flex-1 items-center justify-center gap-1.5 rounded py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
               activeTab === "sessions"
                 ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <History className="size-3.5" />
+            <History className="size-3" />
             Sessions ({sessions.length})
           </button>
           <button
             type="button"
             onClick={() => setActiveTab("messages")}
-            className={`flex flex-1 items-center justify-center gap-1.5 rounded py-1 font-medium transition-colors ${
+            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
               activeTab === "messages"
                 ? "bg-background text-foreground shadow-xs"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <MessageSquare className="size-3.5" />
+            <MessageSquare className="size-3" />
             History ({replayedMessages.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("artifacts")}
+            className={`flex flex-1 items-center justify-center gap-1 rounded py-1 font-medium transition-colors ${
+              activeTab === "artifacts"
+                ? "bg-background text-foreground shadow-xs"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <FileText className="size-3" />
+            Artifacts ({sessionArtifacts.length})
           </button>
         </div>
       </div>
 
-      {activeTab === "sessions" ? (
+      {activeTab === "sessions" && (
         <ScrollArea className="min-h-0 flex-1">
           <div className="flex flex-col gap-2 p-3">
             {sessions.length === 0 ? (
@@ -320,7 +366,9 @@ export function AcpSessionsPanel({
             )}
           </div>
         </ScrollArea>
-      ) : (
+      )}
+
+      {activeTab === "messages" && (
         <ScrollArea className="min-h-0 flex-1">
           <div className="flex flex-col gap-2 p-3">
             {replayedMessages.length === 0 ? (
@@ -330,25 +378,151 @@ export function AcpSessionsPanel({
                   : "Load a session to replay its conversation history."}
               </div>
             ) : (
-              replayedMessages.map((msg, idx) => (
-                <div
-                  key={`${msg.id}-${idx}`}
-                  className={`rounded-lg border p-2.5 ${
-                    msg.role === "user"
-                      ? "border-border bg-muted/50"
-                      : msg.role === "thought"
-                        ? "border-border/60 bg-background/40 italic text-muted-foreground"
-                        : "border-border bg-background"
-                  }`}
-                >
-                  <div className="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
-                    {msg.role}
+              replayedMessages.map((msg, idx) =>
+                msg.role === "tool" ? (
+                  <div
+                    key={`${msg.id}-${idx}`}
+                    className="flex items-center justify-between gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 py-1.5"
+                  >
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <Wrench className="size-3 shrink-0 text-muted-foreground" />
+                      <span
+                        className="truncate font-medium text-foreground"
+                        title={msg.text}
+                      >
+                        {msg.text}
+                      </span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+                      {msg.toolKind && (
+                        <span className="rounded bg-background/80 px-1.5 py-0.5">
+                          {msg.toolKind}
+                        </span>
+                      )}
+                      {msg.toolStatus && (
+                        <span className="rounded bg-background/80 px-1.5 py-0.5 uppercase">
+                          {msg.toolStatus}
+                        </span>
+                      )}
+                    </div>
                   </div>
-                  <pre className="font-sans text-xs whitespace-pre-wrap wrap-break-word text-foreground">
-                    {msg.text}
+                ) : (
+                  <div
+                    key={`${msg.id}-${idx}`}
+                    className={`rounded-lg border p-2.5 ${
+                      msg.role === "user"
+                        ? "border-border bg-muted/50"
+                        : msg.role === "thought"
+                          ? "border-border/60 bg-background/40 italic text-muted-foreground"
+                          : "border-border bg-background"
+                    }`}
+                  >
+                    <div className="mb-1 text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      {msg.role}
+                    </div>
+                    <pre className="font-sans text-xs whitespace-pre-wrap wrap-break-word text-foreground">
+                      {msg.text}
+                    </pre>
+                  </div>
+                ),
+              )
+            )}
+          </div>
+        </ScrollArea>
+      )}
+
+      {activeTab === "artifacts" && (
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="flex flex-col gap-2 p-3">
+            {!activeSessionId ? (
+              <div className="py-8 text-center text-muted-foreground">
+                Load or resume a session to inspect its markdown artifacts.
+              </div>
+            ) : selectedArtifact ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2">
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    onClick={onCloseArtifact}
+                  >
+                    <ArrowLeft className="size-3" />
+                    All artifacts
+                  </Button>
+                  <span className="text-[10px] text-muted-foreground">
+                    {formatByteSize(selectedArtifact.size_bytes)}
+                  </span>
+                </div>
+                <div className="rounded-lg border border-border bg-background p-2.5">
+                  <div className="font-medium text-foreground">
+                    {selectedArtifact.name}
+                  </div>
+                  {selectedArtifact.summary && (
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {selectedArtifact.summary}
+                    </div>
+                  )}
+                  <pre className="mt-2 border-t border-border pt-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap wrap-break-word text-foreground">
+                    {selectedArtifact.content}
                   </pre>
                 </div>
-              ))
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-muted-foreground">
+                    brain/{activeSessionId.slice(0, 12)}/*.md
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    disabled={artifactsBusy}
+                    onClick={() => void onRefreshArtifacts()}
+                  >
+                    <RefreshCw
+                      className={`size-3 ${artifactsBusy ? "animate-spin" : ""}`}
+                    />
+                    Refresh
+                  </Button>
+                </div>
+                {sessionArtifacts.length === 0 ? (
+                  <div className="py-6 text-center text-muted-foreground">
+                    {artifactsBusy
+                      ? "Loading session artifacts…"
+                      : "No markdown artifacts found for this session."}
+                  </div>
+                ) : (
+                  sessionArtifacts.map((art) => (
+                    <button
+                      key={art.name}
+                      type="button"
+                      disabled={artifactsBusy}
+                      onClick={() => void onOpenArtifact(art.name)}
+                      className="flex flex-col gap-1 rounded-lg border border-border bg-background/60 p-2.5 text-left transition-colors hover:border-primary/50 hover:bg-accent/30"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex min-w-0 items-center gap-1.5 truncate font-medium text-foreground">
+                          <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                          <span className="truncate">{art.name}</span>
+                        </span>
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {formatByteSize(art.size_bytes)}
+                        </span>
+                      </div>
+                      {art.summary && (
+                        <div className="line-clamp-2 text-[11px] text-muted-foreground">
+                          {art.summary}
+                        </div>
+                      )}
+                      {art.updated_at && (
+                        <div className="text-[10px] text-muted-foreground">
+                          {formatUpdatedAt(art.updated_at)}
+                        </div>
+                      )}
+                    </button>
+                  ))
+                )}
+              </>
             )}
           </div>
         </ScrollArea>

@@ -32,11 +32,15 @@ from api.models.acp import (
     SessionStepOutcome,
 )
 from api.models.config import (
+    DEFAULT_AGY_APP_DATA_DIR,
     DEFAULT_ALLOWED_ORIGINS,
     ApiServerConfig,
     HealthStatus,
 )
 from api.models.session import (
+    SessionArtifactContent,
+    SessionArtifactList,
+    SessionArtifactSummary,
     SessionCloseParams,
     SessionDeleteParams,
     SessionListParams,
@@ -61,6 +65,7 @@ __all__ = [
     "ClientAuthCapabilities",
     "ClientCapabilities",
     "ClientFsCapabilities",
+    "DEFAULT_AGY_APP_DATA_DIR",
     "DEFAULT_ALLOWED_ORIGINS",
     "HealthStatus",
     "ImplementationInfo",
@@ -78,6 +83,9 @@ __all__ = [
     "McpCapabilities",
     "PromptCapabilities",
     "SUPPORTED_ACP_VERSIONS",
+    "SessionArtifactContent",
+    "SessionArtifactList",
+    "SessionArtifactSummary",
     "SessionCapabilities",
     "SessionCloseParams",
     "SessionDeleteParams",

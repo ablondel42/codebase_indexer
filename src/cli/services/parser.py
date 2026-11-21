@@ -425,6 +425,18 @@ class CliParserBuilder:
             help="Disable --sandbox flag when launching agy acp",
         )
         api_p.add_argument(
+            "--agy-app-data-dir",
+            type=str,
+            default=None,
+            help="Directory under ~/.gemini for agy acp data (default: antigravity)",
+        )
+        api_p.add_argument(
+            "--agy-gemini-dir",
+            type=str,
+            default=None,
+            help="Optional absolute root directory override instead of ~/.gemini",
+        )
+        api_p.add_argument(
             "--debug",
             action="store_true",
             default=argparse.SUPPRESS,

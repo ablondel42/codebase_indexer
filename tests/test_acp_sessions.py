@@ -405,3 +405,104 @@ def test_session_capability_and_path_security_gates(tmp_path: Path) -> None:
         if line.strip()
     ]
     assert forwarded == ["initialize"]
+
+
+def test_session_artifacts_endpoints_list_read_and_enforce_containment(tmp_path: Path) -> None:
+    """Artifact HTTP endpoints list/read ``brain/<sessionId>/*.md`` & block traversal/rebinding."""
+    script = _write_session_agent_script(tmp_path / "artifacts_agent.py")
+    gemini_root = tmp_path / "gemini_store"
+    session_brain = gemini_root / "antigravity" / "brain" / "sess-123"
+    session_brain.mkdir(parents=True)
+
+    (session_brain / "walkthrough.md").write_text("# Walkthrough\nAll green.\n", encoding="utf-8")
+    (session_brain / "walkthrough.md.metadata.json").write_text(
+        json.dumps(
+            {
+                "summary": "Verified ACP walkthrough.",
+                "updatedAt": "2026-11-21T22:00:00Z",
+                "userFacing": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (session_brain / "plan.md").write_text("# Plan\nStep 1.\n", encoding="utf-8")
+    (session_brain / ".hidden.md").write_text("secret", encoding="utf-8")
+    sys_dir = session_brain / ".system_generated"
+    sys_dir.mkdir()
+    (sys_dir / "internal.md").write_text("internal", encoding="utf-8")
+    outside_secret = tmp_path / "outside.md"
+    outside_secret.write_text("outside", encoding="utf-8")
+    (session_brain / "escape.md").symlink_to(outside_secret)
+
+    api_cfg = ApiServerConfig(
+        agy_command=(sys.executable, "-u", str(script)),
+        agy_gemini_dir=str(gemini_root.resolve()),
+        workspace_root=tmp_path,
+    )
+    app = ApiServerRunner(api_cfg, AppConfig(db_path=tmp_path / "art.db")).create_app()
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        rebind = client.get(
+            "/api/sessions/sess-123/artifacts",
+            headers={"host": "attacker.example:8000"},
+        )
+        assert rebind.status_code == 403
+
+        bad_origin = client.get(
+            "/api/sessions/sess-123/artifacts",
+            headers={"host": "127.0.0.1:8000", "origin": "https://evil.example"},
+        )
+        assert bad_origin.status_code == 403
+
+        listed = client.get(
+            "/api/sessions/sess-123/artifacts",
+            headers={"host": "127.0.0.1:8000"},
+        )
+        assert listed.status_code == 200
+        names = [item["name"] for item in listed.json()["artifacts"]]
+        assert set(names) == {"walkthrough.md", "plan.md"}
+
+        doc = client.get(
+            "/api/sessions/sess-123/artifacts/walkthrough.md",
+            headers={"host": "127.0.0.1:8000"},
+        )
+        assert doc.status_code == 200
+        body = doc.json()
+        assert body["summary"] == "Verified ACP walkthrough."
+        assert body["content"] == "# Walkthrough\nAll green.\n"
+
+        empty_sess = client.get(
+            "/api/sessions/sess-empty/artifacts",
+            headers={"host": "127.0.0.1:8000"},
+        )
+        assert empty_sess.status_code == 200
+        assert empty_sess.json()["artifacts"] == []
+
+        assert (
+            client.get(
+                "/api/sessions/sess-123/artifacts/escape.md",
+                headers={"host": "127.0.0.1:8000"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                "/api/sessions/sess-123/artifacts/.hidden.md",
+                headers={"host": "127.0.0.1:8000"},
+            ).status_code
+            == 400
+        )
+        assert (
+            client.get(
+                "/api/sessions/sess-123/artifacts/walkthrough.md.metadata.json",
+                headers={"host": "127.0.0.1:8000"},
+            ).status_code
+            == 400
+        )
+        assert (
+            client.get(
+                "/api/sessions/..%2Fescape/artifacts",
+                headers={"host": "127.0.0.1:8000"},
+            ).status_code
+            in (400, 404)
+        )

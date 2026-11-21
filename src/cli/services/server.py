@@ -4,7 +4,12 @@ import argparse
 import asyncio
 import json
 
-from api import DEFAULT_ALLOWED_ORIGINS, ApiServerConfig, ApiServerRunner
+from api import (
+    DEFAULT_AGY_APP_DATA_DIR,
+    DEFAULT_ALLOWED_ORIGINS,
+    ApiServerConfig,
+    ApiServerRunner,
+)
 from cli.utils.argv import normalize_mcp_tool_kwargs, parse_mcp_call_args
 from cli.utils.output import (
     emit_json,
@@ -93,6 +98,7 @@ class ServerCliCommands:
         debug = bool(getattr(args, "debug", self._engine.config.debug))
         scoped = self._engine.for_db(db_path)
         app_cfg = scoped.config.model_copy(update={"debug": debug})
+        raw_app_dir = getattr(args, "agy_app_data_dir", None)
         api_cfg = ApiServerConfig(
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
@@ -100,6 +106,10 @@ class ServerCliCommands:
             allowed_origins=(*DEFAULT_ALLOWED_ORIGINS, *extra_origins),
             workspace_root=getattr(args, "workspace", None),
             agy_sandbox=not bool(getattr(args, "no_agy_sandbox", False)),
+            agy_app_data_dir=(
+                str(raw_app_dir) if raw_app_dir is not None else DEFAULT_AGY_APP_DATA_DIR
+            ),
+            agy_gemini_dir=getattr(args, "agy_gemini_dir", None),
         )
         runner = ApiServerRunner(api_cfg, app_cfg, engine=scoped)
         runner.run()

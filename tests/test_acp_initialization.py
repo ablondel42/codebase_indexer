@@ -19,9 +19,10 @@ from api.models.acp import (
     JSONRPC_INVALID_REQUEST,
     JSONRPC_PARSE_ERROR,
 )
-from api.models.config import ApiServerConfig
+from api.models.config import DEFAULT_AGY_APP_DATA_DIR, ApiServerConfig
 from api.services.server import ApiServerRunner
 from api.utils.formatting import configure_api_terminal_logging
+from api.utils.security import build_agy_acp_command
 from core.models.config import AppConfig
 from core.models.exceptions import AcpError
 from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
@@ -180,6 +181,36 @@ def test_healthz_and_non_loopback_bind_guard(tmp_path: Path) -> None:
         body = resp.json()
         assert body["status"] == "ok"
         assert body["supported_acp_versions"] == [1]
+        assert body["agy_app_data_dir"] == DEFAULT_AGY_APP_DATA_DIR
+        assert body["agy_profile_dir"] == "~/.gemini/antigravity"
+
+    assert build_agy_acp_command(ApiServerConfig()) == (
+        "agy",
+        "acp",
+        "--stdio",
+        "--sandbox",
+        "--app-data-dir",
+        "antigravity",
+    )
+    isolated_gemini = str((tmp_path / "cbi-gemini").resolve())
+    assert build_agy_acp_command(
+        ApiServerConfig(agy_gemini_dir=isolated_gemini, agy_app_data_dir="acp")
+    ) == (
+        "agy",
+        "acp",
+        "--stdio",
+        "--sandbox",
+        "--gemini-dir",
+        isolated_gemini,
+        "--app-data-dir",
+        "acp",
+    )
+    for bad_dir in ("/abs/path", "../escape", ""):
+        with pytest.raises(AcpError):
+            build_agy_acp_command(ApiServerConfig(agy_app_data_dir=bad_dir))
+    for bad_gemini in (".relative-gemini", f"{isolated_gemini}/../escape", ""):
+        with pytest.raises(AcpError):
+            build_agy_acp_command(ApiServerConfig(agy_gemini_dir=bad_gemini))
 
 
 def test_acp_initialize_happy_path_clamping_and_meta_scrubbing(tmp_path: Path) -> None:

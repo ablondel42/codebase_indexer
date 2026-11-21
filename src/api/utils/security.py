@@ -13,7 +13,7 @@ from api.models.acp import (
     AuthMethod,
     InitializeParams,
 )
-from api.models.config import ApiServerConfig
+from api.models.config import DEFAULT_AGY_APP_DATA_DIR, ApiServerConfig
 from core.models.exceptions import AcpError
 from core.utils.logging import get_logger
 
@@ -156,14 +156,94 @@ def is_allowed_ws_origin(origin_header: str | None, allowed_origins: Sequence[st
     return normalized in allowed
 
 
+def validate_agy_relative_dir(raw_dir: str, *, flag_name: str) -> str:
+    """Validate that an ``agy`` app-data directory flag is non-empty, relative, & safe."""
+    cleaned = raw_dir.strip()
+    if not cleaned:
+        raise AcpError(f"{flag_name} cannot be empty.")
+    path_obj = Path(cleaned)
+    if path_obj.is_absolute():
+        raise AcpError(
+            f"{flag_name} must be relative to the Gemini root (got absolute path '{cleaned}').",
+            context={"flag": flag_name, "value": cleaned},
+        )
+    if ".." in path_obj.parts:
+        raise AcpError(
+            f"{flag_name} cannot contain '..' traversal segments: '{cleaned}'.",
+            context={"flag": flag_name, "value": cleaned},
+        )
+    return cleaned
+
+
+def validate_agy_gemini_dir(raw_dir: str) -> str:
+    """Validate that ``--agy-gemini-dir`` is a non-empty, traversal-free absolute path."""
+    cleaned = raw_dir.strip()
+    if not cleaned:
+        raise AcpError("--agy-gemini-dir cannot be empty.")
+    raw_path = Path(cleaned)
+    if ".." in raw_path.parts:
+        raise AcpError(
+            f"--agy-gemini-dir cannot contain '..' traversal segments: '{cleaned}'.",
+            context={"flag": "--agy-gemini-dir", "value": cleaned},
+        )
+    expanded = raw_path.expanduser()
+    if not expanded.is_absolute():
+        raise AcpError(
+            f"--agy-gemini-dir must be an absolute path (got '{cleaned}').",
+            context={"flag": "--agy-gemini-dir", "value": cleaned},
+        )
+    return str(expanded)
+
+
+def resolve_agy_profile_root(config: ApiServerConfig) -> Path:
+    """Resolve the on-disk ``<gemini_dir>/<app_data_dir>`` profile directory for ``agy``."""
+    gemini_root = (
+        Path(validate_agy_gemini_dir(config.agy_gemini_dir))
+        if config.agy_gemini_dir is not None
+        else Path.home() / ".gemini"
+    )
+    app_dir = validate_agy_relative_dir(
+        config.agy_app_data_dir or DEFAULT_AGY_APP_DATA_DIR,
+        flag_name="--agy-app-data-dir",
+    )
+    return gemini_root / app_dir
+
+
+def format_agy_profile_display(config: ApiServerConfig) -> str:
+    """Format a compact profile path label (e.g. ``~/.gemini/antigravity``)."""
+    app_dir = validate_agy_relative_dir(
+        config.agy_app_data_dir or DEFAULT_AGY_APP_DATA_DIR,
+        flag_name="--agy-app-data-dir",
+    )
+    if config.agy_gemini_dir is None:
+        return f"~/.gemini/{app_dir}"
+    gemini_dir = validate_agy_gemini_dir(config.agy_gemini_dir).rstrip("/")
+    return f"{gemini_dir}/{app_dir}"
+
+
 def build_agy_acp_command(config: ApiServerConfig) -> tuple[str, ...]:
     """Build argument vector for launching ``agy acp`` without shell expansion."""
     if not config.agy_command:
         raise AcpError("ACP agent command cannot be empty.")
+    gemini_dir = (
+        validate_agy_gemini_dir(config.agy_gemini_dir)
+        if config.agy_gemini_dir is not None
+        else None
+    )
+    app_data_dir = (
+        validate_agy_relative_dir(config.agy_app_data_dir, flag_name="--agy-app-data-dir")
+        if config.agy_app_data_dir is not None
+        else None
+    )
     cmd = list(config.agy_command)
-    is_agy = Path(cmd[0]).name == "agy"
-    if is_agy and config.agy_sandbox and "--sandbox" not in cmd:
+    if Path(cmd[0]).name != "agy":
+        return tuple(cmd)
+    if config.agy_sandbox and "--sandbox" not in cmd:
         cmd.append("--sandbox")
+    if gemini_dir is not None and "--gemini-dir" not in cmd:
+        cmd.extend(["--gemini-dir", gemini_dir])
+    if app_data_dir is not None and "--app-data-dir" not in cmd:
+        cmd.extend(["--app-data-dir", app_data_dir])
     return tuple(cmd)
 
 
@@ -256,11 +336,15 @@ __all__ = [
     "clamp_client_capabilities",
     "extract_host_name",
     "find_advertised_auth_method",
+    "format_agy_profile_display",
     "is_allowed_ws_host",
     "is_allowed_ws_origin",
     "is_loopback_host",
     "normalize_origin",
+    "resolve_agy_profile_root",
     "sanitize_authenticate_params",
     "sanitize_meta_dict",
+    "validate_agy_gemini_dir",
+    "validate_agy_relative_dir",
     "validate_bind_host",
 ]

@@ -1,5 +1,12 @@
 """Public helper re-exports for ``api.utils``."""
 
+from api.utils.artifacts import (
+    MAX_ARTIFACT_BYTES,
+    list_session_artifacts,
+    read_session_artifact,
+    validate_artifact_filename,
+    validate_artifact_session_id,
+)
 from api.utils.formatting import (
     API_CONSOLE_DATEFMT,
     API_CONSOLE_FORMAT,
@@ -25,12 +32,16 @@ from api.utils.security import (
     clamp_client_capabilities,
     extract_host_name,
     find_advertised_auth_method,
+    format_agy_profile_display,
     is_allowed_ws_host,
     is_allowed_ws_origin,
     is_loopback_host,
     normalize_origin,
+    resolve_agy_profile_root,
     sanitize_authenticate_params,
     sanitize_meta_dict,
+    validate_agy_gemini_dir,
+    validate_agy_relative_dir,
     validate_bind_host,
 )
 from api.utils.session import (
@@ -49,6 +60,7 @@ __all__ = [
     "API_CONSOLE_DATEFMT",
     "API_CONSOLE_FORMAT",
     "FORBIDDEN_META_KEYS",
+    "MAX_ARTIFACT_BYTES",
     "SAFE_ENV_KEYS",
     "SAFE_ENV_PREFIXES",
     "SESSION_METHODS",
@@ -64,6 +76,7 @@ __all__ = [
     "extract_host_name",
     "extract_request_id",
     "find_advertised_auth_method",
+    "format_agy_profile_display",
     "format_jsonrpc_error",
     "format_kv_block",
     "format_raw_frame_for_log",
@@ -71,15 +84,22 @@ __all__ = [
     "is_allowed_ws_host",
     "is_allowed_ws_origin",
     "is_loopback_host",
+    "list_session_artifacts",
     "normalize_origin",
     "parse_client_frame",
     "prepare_session_params",
+    "read_session_artifact",
     "redact_for_log",
+    "resolve_agy_profile_root",
     "sanitize_authenticate_params",
     "sanitize_meta_dict",
     "sanitize_session_mcp_servers",
     "validate_absolute_dir",
     "validate_additional_dirs",
+    "validate_agy_gemini_dir",
+    "validate_agy_relative_dir",
+    "validate_artifact_filename",
+    "validate_artifact_session_id",
     "validate_bind_host",
     "validate_system_prompt_config",
 ]

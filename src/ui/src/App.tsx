@@ -106,12 +106,16 @@ function WorkspaceCanvas() {
         {showPanel && (
           <AcpSessionsPanel
             defaultCwd={acp.defaultCwd}
+            agyProfileDir={acp.agyProfileDir}
             includeCbiMcp={acp.includeCbiMcp}
             onToggleCbiMcp={acp.setIncludeCbiMcp}
             sessions={acp.sessions}
             nextCursor={acp.nextCursor}
             activeSessionId={acp.activeSessionId}
             replayedMessages={acp.replayedMessages}
+            sessionArtifacts={acp.sessionArtifacts}
+            selectedArtifact={acp.selectedArtifact}
+            artifactsBusy={acp.artifactsBusy}
             sessionCaps={acp.sessionCaps}
             sessionBusyId={acp.sessionBusyId}
             sessionError={acp.sessionError}
@@ -123,6 +127,9 @@ function WorkspaceCanvas() {
             onResumeSession={acp.resumeExistingSession}
             onCloseSession={acp.closeActiveSession}
             onDeleteSession={acp.deleteExistingSession}
+            onRefreshArtifacts={acp.refreshArtifacts}
+            onOpenArtifact={acp.openArtifact}
+            onCloseArtifact={acp.closeArtifact}
           />
         )}
       </div>

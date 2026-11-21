@@ -5,6 +5,8 @@ import {
   AcpRpcError,
   deriveSessionCapabilities,
   fetchServerDefaults,
+  fetchSessionArtifactContent,
+  fetchSessionArtifacts,
 } from "@/lib/acp/client";
 import {
   sanitizeAgentText,
@@ -18,6 +20,8 @@ import {
   type AcpConnectionStatus,
   type AcpInitializeResult,
   type AcpReplayedMessage,
+  type AcpSessionArtifactContent,
+  type AcpSessionArtifactSummary,
   type AcpSessionCapabilitiesFlags,
   type AcpSessionInfo,
 } from "@/lib/acp/types";
@@ -30,12 +34,17 @@ export interface UseAcpConnectionState {
   authenticatingMethodId: string | null;
   canLogout: boolean;
   defaultCwd: string;
+  agyAppDataDir: string;
+  agyProfileDir: string;
   includeCbiMcp: boolean;
   setIncludeCbiMcp: (enabled: boolean) => void;
   sessions: AcpSessionInfo[];
   nextCursor: string | null;
   activeSessionId: string | null;
   replayedMessages: AcpReplayedMessage[];
+  sessionArtifacts: AcpSessionArtifactSummary[];
+  selectedArtifact: AcpSessionArtifactContent | null;
+  artifactsBusy: boolean;
   sessionCaps: AcpSessionCapabilitiesFlags;
   sessionBusyId: string | null;
   error: string | null;
@@ -55,7 +64,32 @@ export interface UseAcpConnectionState {
   resumeExistingSession: (session: AcpSessionInfo) => Promise<void>;
   closeActiveSession: () => Promise<void>;
   deleteExistingSession: (sessionId: string) => Promise<void>;
+  refreshArtifacts: () => Promise<void>;
+  openArtifact: (artifactName: string) => Promise<void>;
+  closeArtifact: () => void;
   reconnect: () => void;
+}
+
+const MAX_REPLAY_MESSAGE_CHARS = 64_000;
+
+function extractUpdateText(rawContent: unknown): string {
+  if (Array.isArray(rawContent)) {
+    const joined = rawContent
+      .map((entry) => {
+        const block = entry as Record<string, unknown> | undefined;
+        return block?.type === "text" && typeof block.text === "string"
+          ? block.text
+          : "";
+      })
+      .filter(Boolean)
+      .join("");
+    return sanitizeMultilineAgentText(joined, MAX_REPLAY_MESSAGE_CHARS);
+  }
+  const block = rawContent as Record<string, unknown> | undefined;
+  if (block?.type === "text" && typeof block.text === "string") {
+    return sanitizeMultilineAgentText(block.text, MAX_REPLAY_MESSAGE_CHARS);
+  }
+  return "";
 }
 
 function appendMessageChunk(
@@ -71,7 +105,13 @@ function appendMessageChunk(
   if (existingIdx >= 0) {
     return prev.map((item, idx) =>
       idx === existingIdx
-        ? { ...item, text: sanitizeMultilineAgentText(item.text + chunkText) }
+        ? {
+            ...item,
+            text: sanitizeMultilineAgentText(
+              item.text + chunkText,
+              MAX_REPLAY_MESSAGE_CHARS,
+            ),
+          }
         : item,
     );
   }
@@ -79,10 +119,68 @@ function appendMessageChunk(
   if (id.startsWith("auto_") && last && last.role === role) {
     return [
       ...prev.slice(0, -1),
-      { ...last, text: sanitizeMultilineAgentText(last.text + chunkText) },
+      {
+        ...last,
+        text: sanitizeMultilineAgentText(
+          last.text + chunkText,
+          MAX_REPLAY_MESSAGE_CHARS,
+        ),
+      },
     ];
   }
   return [...prev, { id, role, text: chunkText }];
+}
+
+function upsertToolCallMessage(
+  prev: AcpReplayedMessage[],
+  update: Record<string, unknown>,
+): AcpReplayedMessage[] {
+  const toolId =
+    typeof update.toolCallId === "string" && update.toolCallId
+      ? sanitizeAgentText(update.toolCallId, 96)
+      : "";
+  if (!toolId) {
+    return prev;
+  }
+  const rawLabel =
+    typeof update.title === "string" && update.title
+      ? update.title
+      : typeof update.name === "string"
+        ? update.name
+        : "";
+  const cleanLabel = rawLabel ? sanitizeAgentText(rawLabel, 240) : "";
+  const toolKind =
+    typeof update.kind === "string" && update.kind
+      ? sanitizeAgentText(update.kind, 32)
+      : undefined;
+  const toolStatus =
+    typeof update.status === "string" && update.status
+      ? sanitizeAgentText(update.status, 32)
+      : undefined;
+
+  const existingIdx = prev.findIndex((item) => item.id === toolId);
+  if (existingIdx >= 0) {
+    return prev.map((item, idx) =>
+      idx === existingIdx
+        ? {
+            ...item,
+            ...(cleanLabel ? { text: cleanLabel } : {}),
+            ...(toolKind !== undefined ? { toolKind } : {}),
+            ...(toolStatus !== undefined ? { toolStatus } : {}),
+          }
+        : item,
+    );
+  }
+  return [
+    ...prev,
+    {
+      id: toolId,
+      role: "tool",
+      text: cleanLabel || "Tool invocation",
+      ...(toolKind !== undefined ? { toolKind } : {}),
+      ...(toolStatus !== undefined ? { toolStatus } : {}),
+    },
+  ];
 }
 
 export function useAcpConnection(): UseAcpConnectionState {
@@ -100,6 +198,8 @@ export function useAcpConnection(): UseAcpConnectionState {
   >(null);
 
   const [defaultCwd, setDefaultCwd] = useState("");
+  const [agyAppDataDir, setAgyAppDataDir] = useState("antigravity");
+  const [agyProfileDir, setAgyProfileDir] = useState("~/.gemini/antigravity");
   const [includeCbiMcp, setIncludeCbiMcp] = useState(true);
   const [sessions, setSessions] = useState<AcpSessionInfo[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -107,6 +207,12 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [replayedMessages, setReplayedMessages] = useState<
     AcpReplayedMessage[]
   >([]);
+  const [sessionArtifacts, setSessionArtifacts] = useState<
+    AcpSessionArtifactSummary[]
+  >([]);
+  const [selectedArtifact, setSelectedArtifact] =
+    useState<AcpSessionArtifactContent | null>(null);
+  const [artifactsBusy, setArtifactsBusy] = useState(false);
   const [sessionBusyId, setSessionBusyId] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +221,23 @@ export function useAcpConnection(): UseAcpConnectionState {
 
   const clearAuthError = useCallback(() => setAuthError(null), []);
   const clearSessionError = useCallback(() => setSessionError(null), []);
+  const closeArtifact = useCallback(() => setSelectedArtifact(null), []);
+
+  const loadArtifactsForSession = useCallback(async (sessionId: string) => {
+    setArtifactsBusy(true);
+    try {
+      const listing = await fetchSessionArtifacts(sessionId);
+      setSessionArtifacts(listing.artifacts);
+    } catch (err: unknown) {
+      setSessionError(
+        err instanceof Error
+          ? err.message
+          : "Failed to load session artifacts.",
+      );
+    } finally {
+      setArtifactsBusy(false);
+    }
+  }, []);
 
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
@@ -156,6 +279,14 @@ export function useAcpConnection(): UseAcpConnectionState {
         return;
       }
 
+      if (
+        (updateKind === "tool_call" || updateKind === "tool_call_update") &&
+        update
+      ) {
+        setReplayedMessages((prev) => upsertToolCallMessage(prev, update));
+        return;
+      }
+
       const roleMap: Record<string, AcpReplayedMessage["role"] | undefined> = {
         user_message_chunk: "user",
         agent_message_chunk: "agent",
@@ -165,11 +296,10 @@ export function useAcpConnection(): UseAcpConnectionState {
       if (!role) {
         return;
       }
-      const content = update?.content as Record<string, unknown> | undefined;
-      if (content?.type !== "text" || typeof content.text !== "string") {
+      const cleanChunk = extractUpdateText(update?.content);
+      if (!cleanChunk) {
         return;
       }
-      const cleanChunk = sanitizeMultilineAgentText(content.text);
       const rawMsgId =
         typeof update?.messageId === "string" && update.messageId
           ? sanitizeAgentText(update.messageId, 96)
@@ -196,6 +326,8 @@ export function useAcpConnection(): UseAcpConnectionState {
     setNextCursor(null);
     setActiveSessionId(null);
     setReplayedMessages([]);
+    setSessionArtifacts([]);
+    setSelectedArtifact(null);
     setAttempt((current) => current + 1);
   }, []);
 
@@ -211,6 +343,8 @@ export function useAcpConnection(): UseAcpConnectionState {
         }
         defaultCwdRef.current = serverDefaults.defaultCwd;
         setDefaultCwd(serverDefaults.defaultCwd);
+        setAgyAppDataDir(serverDefaults.agyAppDataDir);
+        setAgyProfileDir(serverDefaults.agyProfileDir);
         setIncludeCbiMcp(serverDefaults.cbiMcpEnabled);
         setResult(initResult);
         setStatus("ready");
@@ -356,6 +490,8 @@ export function useAcpConnection(): UseAcpConnectionState {
       setNextCursor(null);
       setActiveSessionId(null);
       setReplayedMessages([]);
+      setSessionArtifacts([]);
+      setSelectedArtifact(null);
       setAuthStatus("unauthenticated");
     } catch (err: unknown) {
       const message =
@@ -377,6 +513,8 @@ export function useAcpConnection(): UseAcpConnectionState {
     try {
       const created = await client.createSession(cwd, { includeCbiMcp });
       setReplayedMessages([]);
+      setSessionArtifacts([]);
+      setSelectedArtifact(null);
       setActiveSessionId(created.sessionId);
       setSessions((prev) => [
         {
@@ -409,11 +547,14 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionError(null);
       setSessionBusyId(session.sessionId);
       setReplayedMessages([]);
+      setSessionArtifacts([]);
+      setSelectedArtifact(null);
       try {
         await client.loadSession(session.sessionId, session.cwd, {
           includeCbiMcp,
         });
         setActiveSessionId(session.sessionId);
+        await loadArtifactsForSession(session.sessionId);
       } catch (err: unknown) {
         setSessionError(
           err instanceof Error ? err.message : "Failed to load session.",
@@ -422,7 +563,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp],
+    [includeCbiMcp, loadArtifactsForSession],
   );
 
   const resumeExistingSession = useCallback(
@@ -434,11 +575,14 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionError(null);
       setSessionBusyId(session.sessionId);
       setReplayedMessages([]);
+      setSessionArtifacts([]);
+      setSelectedArtifact(null);
       try {
         await client.resumeSession(session.sessionId, session.cwd, {
           includeCbiMcp,
         });
         setActiveSessionId(session.sessionId);
+        await loadArtifactsForSession(session.sessionId);
       } catch (err: unknown) {
         setSessionError(
           err instanceof Error ? err.message : "Failed to resume session.",
@@ -447,7 +591,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp],
+    [includeCbiMcp, loadArtifactsForSession],
   );
 
   const closeActiveSession = useCallback(async () => {
@@ -461,6 +605,8 @@ export function useAcpConnection(): UseAcpConnectionState {
       await client.closeSession(activeSessionId);
       setActiveSessionId(null);
       setReplayedMessages([]);
+      setSessionArtifacts([]);
+      setSelectedArtifact(null);
     } catch (err: unknown) {
       setSessionError(
         err instanceof Error ? err.message : "Failed to close session.",
@@ -486,6 +632,8 @@ export function useAcpConnection(): UseAcpConnectionState {
         if (activeSessionId === sessionId) {
           setActiveSessionId(null);
           setReplayedMessages([]);
+          setSessionArtifacts([]);
+          setSelectedArtifact(null);
         }
       } catch (err: unknown) {
         setSessionError(
@@ -493,6 +641,38 @@ export function useAcpConnection(): UseAcpConnectionState {
         );
       } finally {
         setSessionBusyId(null);
+      }
+    },
+    [activeSessionId],
+  );
+
+  const refreshArtifacts = useCallback(async () => {
+    if (!activeSessionId) {
+      return;
+    }
+    setSessionError(null);
+    await loadArtifactsForSession(activeSessionId);
+  }, [activeSessionId, loadArtifactsForSession]);
+
+  const openArtifact = useCallback(
+    async (artifactName: string) => {
+      if (!activeSessionId) {
+        return;
+      }
+      setSessionError(null);
+      setArtifactsBusy(true);
+      try {
+        const doc = await fetchSessionArtifactContent(
+          activeSessionId,
+          artifactName,
+        );
+        setSelectedArtifact(doc);
+      } catch (err: unknown) {
+        setSessionError(
+          err instanceof Error ? err.message : "Failed to read artifact.",
+        );
+      } finally {
+        setArtifactsBusy(false);
       }
     },
     [activeSessionId],
@@ -512,12 +692,17 @@ export function useAcpConnection(): UseAcpConnectionState {
     authenticatingMethodId,
     canLogout,
     defaultCwd,
+    agyAppDataDir,
+    agyProfileDir,
     includeCbiMcp,
     setIncludeCbiMcp,
     sessions,
     nextCursor,
     activeSessionId,
     replayedMessages,
+    sessionArtifacts,
+    selectedArtifact,
+    artifactsBusy,
     sessionCaps,
     sessionBusyId,
     error,
@@ -534,6 +719,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     resumeExistingSession,
     closeActiveSession,
     deleteExistingSession,
+    refreshArtifacts,
+    openArtifact,
+    closeArtifact,
     reconnect,
   };
 }

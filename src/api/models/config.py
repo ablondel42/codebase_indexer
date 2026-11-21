@@ -12,6 +12,7 @@ DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = (
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 )
+DEFAULT_AGY_APP_DATA_DIR: str = "antigravity"
 
 
 class ApiServerConfig(FrozenModel):
@@ -23,6 +24,8 @@ class ApiServerConfig(FrozenModel):
     allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
     agy_command: tuple[str, ...] = ("agy", "acp", "--stdio")
     agy_sandbox: bool = True
+    agy_app_data_dir: str | None = DEFAULT_AGY_APP_DATA_DIR
+    agy_gemini_dir: str | None = None
     workspace_root: Path | None = None
     enable_cbi_mcp: bool = True
     cbi_db_path: Path | None = None
@@ -42,10 +45,13 @@ class HealthStatus(FrozenModel):
     supported_acp_versions: tuple[int, ...] = (1,)
     default_cwd: str = ""
     cbi_mcp_enabled: bool = True
+    agy_app_data_dir: str = DEFAULT_AGY_APP_DATA_DIR
+    agy_profile_dir: str = f"~/.gemini/{DEFAULT_AGY_APP_DATA_DIR}"
 
 
 __all__ = [
     "ApiServerConfig",
+    "DEFAULT_AGY_APP_DATA_DIR",
     "DEFAULT_ALLOWED_ORIGINS",
     "HealthStatus",
 ]

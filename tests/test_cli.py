@@ -187,9 +187,12 @@ def test_cbi_api_parser_and_non_loopback_rejection(
     assert preprocess_argv(["api", "--port", "8001"]) == ["api", "--port", "8001"]
 
     parser = CliParserBuilder().build()
-    parsed = parser.parse_args(["api", "--port", "8001", "--no-agy-sandbox"])
+    parsed = parser.parse_args(
+        ["api", "--port", "8001", "--no-agy-sandbox", "--agy-app-data-dir", "custom-acp"]
+    )
     assert parsed.port == 8001
     assert parsed.no_agy_sandbox is True
+    assert parsed.agy_app_data_dir == "custom-acp"
 
     app = CliApplication(AppConfig(db_path=tmp_path / "cli_api.db"))
     rc = app.run(["api", "--host", "0.0.0.0"])
@@ -200,3 +203,15 @@ def test_cbi_api_parser_and_non_loopback_rejection(
     assert err["ok"] is False
     assert err["error"]["code"] == "acp_error"
     assert "non-loopback" in err["error"]["message"]
+
+    bad_dir_rc = app.run(["api", "--agy-app-data-dir", "/tmp/not-relative"])
+    assert bad_dir_rc == 1
+    bad_dir_err = json.loads(capsys.readouterr().err)
+    assert bad_dir_err["error"]["code"] == "acp_error"
+    assert "relative" in bad_dir_err["error"]["message"]
+
+    bad_gemini_rc = app.run(["api", "--agy-gemini-dir", ".relative-gemini"])
+    assert bad_gemini_rc == 1
+    bad_gemini_err = json.loads(capsys.readouterr().err)
+    assert bad_gemini_err["error"]["code"] == "acp_error"
+    assert "absolute" in bad_gemini_err["error"]["message"]
