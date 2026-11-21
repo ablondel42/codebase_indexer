@@ -1,7 +1,10 @@
 import { RefreshCw, ShieldCheck } from "lucide-react";
 
+import { AcpAuthControls } from "@/components/acp-auth-controls";
 import { Button } from "@/components/ui/button";
 import type {
+  AcpAuthenticateOptions,
+  AcpAuthStatus,
   AcpConnectionStatus,
   AcpInitializeResult,
 } from "@/lib/acp/types";
@@ -9,7 +12,18 @@ import type {
 interface AcpStatusBarProps {
   status: AcpConnectionStatus;
   result: AcpInitializeResult | null;
+  authStatus: AcpAuthStatus;
+  activeMethodId: string | null;
+  authenticatingMethodId: string | null;
+  canLogout: boolean;
   error: string | null;
+  authError: string | null;
+  onClearAuthError: () => void;
+  onAuthenticate: (
+    methodId?: string,
+    options?: AcpAuthenticateOptions,
+  ) => Promise<void>;
+  onLogout: () => Promise<void>;
   onReconnect: () => void;
 }
 
@@ -24,7 +38,15 @@ const STATUS_DOT_STYLES: Record<AcpConnectionStatus, string> = {
 export function AcpStatusBar({
   status,
   result,
+  authStatus,
+  activeMethodId,
+  authenticatingMethodId,
+  canLogout,
   error,
+  authError,
+  onClearAuthError,
+  onAuthenticate,
+  onLogout,
   onReconnect,
 }: AcpStatusBarProps) {
   const agentName =
@@ -32,10 +54,9 @@ export function AcpStatusBar({
   const agentVersion = result?.agentInfo?.version
     ? ` v${result.agentInfo.version}`
     : "";
-  const authCount = result?.authMethods?.length ?? 0;
 
   return (
-    <div className="flex items-center gap-3 text-xs">
+    <div className="flex flex-wrap items-center gap-2.5 text-xs">
       <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1">
         <span
           className={`size-2 rounded-full ${STATUS_DOT_STYLES[status]}`}
@@ -51,18 +72,34 @@ export function AcpStatusBar({
             <span className="rounded bg-background px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
               ACP v{result.protocolVersion}
             </span>
-            <span className="hidden text-muted-foreground sm:inline">
-              {authCount} auth {authCount === 1 ? "method" : "methods"}
-            </span>
           </div>
         ) : status === "error" ? (
-          <span className="max-w-md truncate text-destructive" title={error ?? ""}>
+          <span
+            className="max-w-md truncate text-destructive"
+            title={error ?? ""}
+          >
             {error ?? "ACP connection error"}
           </span>
         ) : (
           <span className="text-muted-foreground">Connecting to ACP…</span>
         )}
       </div>
+
+      {status === "ready" && result && (
+        <AcpAuthControls
+          authStatus={authStatus}
+          authMethods={result.authMethods ?? []}
+          activeMethodId={activeMethodId}
+          authenticatingMethodId={authenticatingMethodId}
+          canLogout={canLogout}
+          authError={authError}
+          onClearAuthError={onClearAuthError}
+          onAuthenticate={onAuthenticate}
+          onLogout={onLogout}
+          onCancelAuth={onReconnect}
+        />
+      )}
+
       <Button
         variant="outline"
         size="sm"

@@ -31,6 +31,15 @@ class AcpConnectionState(StrEnum):
     CLOSED = "closed"
 
 
+class AcpAuthState(StrEnum):
+    """Authentication state tracked across an initialized ACP connection."""
+
+    UNKNOWN = "unknown"
+    AUTHENTICATING = "authenticating"
+    AUTHENTICATED = "authenticated"
+    UNAUTHENTICATED = "unauthenticated"
+
+
 class ImplementationInfo(FrozenModel):
     """Self-reported client or agent name and version metadata."""
 
@@ -181,6 +190,23 @@ class InitializeResult(FrozenModel):
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
+class AuthenticateParams(FrozenModel):
+    """Validated parameters for the ACP ``authenticate`` request."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    method_id: str = Field(alias="methodId", min_length=1, max_length=128)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class LogoutParams(FrozenModel):
+    """Validated parameters for the ACP ``logout`` request."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
 class JsonRpcErrorObject(FrozenModel):
     """JSON-RPC 2.0 error payload."""
 
@@ -208,10 +234,12 @@ __all__ = [
     "ACP_AUTH_REQUIRED",
     "ACP_REQUEST_CANCELLED",
     "ACP_RESOURCE_NOT_FOUND",
+    "AcpAuthState",
     "AcpConnectionState",
     "AgentAuthCapabilities",
     "AgentCapabilities",
     "AuthMethod",
+    "AuthenticateParams",
     "ClientAuthCapabilities",
     "ClientCapabilities",
     "ClientFsCapabilities",
@@ -226,6 +254,7 @@ __all__ = [
     "JsonRpcErrorObject",
     "JsonRpcErrorResponse",
     "LATEST_ACP_VERSION",
+    "LogoutParams",
     "McpCapabilities",
     "PromptCapabilities",
     "SUPPORTED_ACP_VERSIONS",

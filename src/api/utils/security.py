@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from api.models.acp import LATEST_ACP_VERSION, InitializeParams
+from api.models.acp import (
+    LATEST_ACP_VERSION,
+    AuthenticateParams,
+    AuthMethod,
+    InitializeParams,
+)
 from api.models.config import ApiServerConfig
 from core.models.exceptions import AcpError
 from core.utils.logging import get_logger
@@ -218,6 +223,30 @@ def clamp_client_capabilities(params: InitializeParams) -> dict[str, Any]:
     return sanitized
 
 
+def find_advertised_auth_method(
+    method_id: str,
+    auth_methods: Sequence[AuthMethod],
+) -> AuthMethod | None:
+    """Locate ``method_id`` among ``authMethods`` advertised during ``initialize``."""
+    for method in auth_methods:
+        if method.id == method_id:
+            return method
+    return None
+
+
+def sanitize_authenticate_params(params: AuthenticateParams) -> dict[str, Any]:
+    """Scrub ``authenticate`` ``_meta`` while allowing ``apiKey`` for ``gemini-api-key``."""
+    scrubbed_meta = sanitize_meta_dict(params.meta) or {}
+    if params.method_id == "gemini-api-key" and params.meta is not None:
+        raw_key = params.meta.get("apiKey")
+        if isinstance(raw_key, str) and raw_key.strip():
+            scrubbed_meta["apiKey"] = raw_key.strip()
+    sanitized: dict[str, Any] = {"methodId": params.method_id}
+    if scrubbed_meta:
+        sanitized["_meta"] = scrubbed_meta
+    return sanitized
+
+
 __all__ = [
     "FORBIDDEN_META_KEYS",
     "SAFE_ENV_KEYS",
@@ -226,10 +255,12 @@ __all__ = [
     "build_sanitized_agy_env",
     "clamp_client_capabilities",
     "extract_host_name",
+    "find_advertised_auth_method",
     "is_allowed_ws_host",
     "is_allowed_ws_origin",
     "is_loopback_host",
     "normalize_origin",
+    "sanitize_authenticate_params",
     "sanitize_meta_dict",
     "validate_bind_host",
 ]

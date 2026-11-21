@@ -24,10 +24,12 @@ from api.utils.security import (
     build_sanitized_agy_env,
     clamp_client_capabilities,
     extract_host_name,
+    find_advertised_auth_method,
     is_allowed_ws_host,
     is_allowed_ws_origin,
     is_loopback_host,
     normalize_origin,
+    sanitize_authenticate_params,
     sanitize_meta_dict,
     validate_bind_host,
 )
@@ -46,6 +48,7 @@ __all__ = [
     "encode_stdio_line",
     "extract_host_name",
     "extract_request_id",
+    "find_advertised_auth_method",
     "format_jsonrpc_error",
     "format_kv_block",
     "format_raw_frame_for_log",
@@ -56,6 +59,7 @@ __all__ = [
     "normalize_origin",
     "parse_client_frame",
     "redact_for_log",
+    "sanitize_authenticate_params",
     "sanitize_meta_dict",
     "validate_bind_host",
 ]

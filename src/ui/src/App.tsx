@@ -15,7 +15,20 @@ import {
 import { BackgroundVariant } from "@xyflow/react";
 
 function WorkspaceCanvas() {
-  const { status, result, error, reconnect } = useAcpConnection();
+  const {
+    status,
+    result,
+    authStatus,
+    activeMethodId,
+    authenticatingMethodId,
+    canLogout,
+    error,
+    authError,
+    clearAuthError,
+    authenticate,
+    logout,
+    reconnect,
+  } = useAcpConnection();
   const initialNodes = [
     { id: "n1", position: { x: 0, y: 0 }, data: { label: "Node 1" } },
     { id: "n2", position: { x: 0, y: 100 }, data: { label: "Node 2" } },
@@ -60,7 +73,15 @@ function WorkspaceCanvas() {
         <AcpStatusBar
           status={status}
           result={result}
+          authStatus={authStatus}
+          activeMethodId={activeMethodId}
+          authenticatingMethodId={authenticatingMethodId}
+          canLogout={canLogout}
           error={error}
+          authError={authError}
+          onClearAuthError={clearAuthError}
+          onAuthenticate={authenticate}
+          onLogout={logout}
           onReconnect={reconnect}
         />
         <ModeToggle />
