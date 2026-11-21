@@ -33,6 +33,17 @@ from api.utils.security import (
     sanitize_meta_dict,
     validate_bind_host,
 )
+from api.utils.session import (
+    SESSION_METHODS,
+    SRC_ROOT,
+    build_cbi_stdio_mcp_server,
+    check_session_capability,
+    prepare_session_params,
+    sanitize_session_mcp_servers,
+    validate_absolute_dir,
+    validate_additional_dirs,
+    validate_system_prompt_config,
+)
 
 __all__ = [
     "API_CONSOLE_DATEFMT",
@@ -40,8 +51,12 @@ __all__ = [
     "FORBIDDEN_META_KEYS",
     "SAFE_ENV_KEYS",
     "SAFE_ENV_PREFIXES",
+    "SESSION_METHODS",
+    "SRC_ROOT",
     "build_agy_acp_command",
+    "build_cbi_stdio_mcp_server",
     "build_sanitized_agy_env",
+    "check_session_capability",
     "clamp_client_capabilities",
     "configure_api_terminal_logging",
     "describe_jsonrpc_frame",
@@ -58,8 +73,13 @@ __all__ = [
     "is_loopback_host",
     "normalize_origin",
     "parse_client_frame",
+    "prepare_session_params",
     "redact_for_log",
     "sanitize_authenticate_params",
     "sanitize_meta_dict",
+    "sanitize_session_mcp_servers",
+    "validate_absolute_dir",
+    "validate_additional_dirs",
     "validate_bind_host",
+    "validate_system_prompt_config",
 ]

@@ -24,6 +24,8 @@ class ApiServerConfig(FrozenModel):
     agy_command: tuple[str, ...] = ("agy", "acp", "--stdio")
     agy_sandbox: bool = True
     workspace_root: Path | None = None
+    enable_cbi_mcp: bool = True
+    cbi_db_path: Path | None = None
     max_connections: int = Field(default=4, ge=1)
     max_frame_bytes: int = Field(default=1_048_576, ge=4096)
     initialize_timeout_seconds: float = Field(default=15.0, gt=0.0)
@@ -38,6 +40,8 @@ class HealthStatus(FrozenModel):
     app: str
     version: str
     supported_acp_versions: tuple[int, ...] = (1,)
+    default_cwd: str = ""
+    cbi_mcp_enabled: bool = True
 
 
 __all__ = [

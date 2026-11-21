@@ -16,17 +16,34 @@ API_CONSOLE_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 API_CONSOLE_DATEFMT: str = "%H:%M:%S"
 
 
+def _redact_named_pairs(items: list[Any] | tuple[Any, ...]) -> list[Any]:
+    """Redact ``value`` fields in MCP ``env`` or ``headers`` ``{name, value}`` lists."""
+    redacted: list[Any] = []
+    for entry in items:
+        if isinstance(entry, Mapping) and "name" in entry and "value" in entry:
+            copied = {str(k): redact_for_log(v) for k, v in entry.items()}
+            copied["value"] = "[REDACTED]"
+            redacted.append(copied)
+        else:
+            redacted.append(redact_for_log(entry))
+    return redacted
+
+
+def _redact_mapping_entry(key: object, val: Any) -> Any:
+    """Redact a single mapping value based on credential and MCP env/header rules."""
+    if isinstance(key, str):
+        lowered = key.lower()
+        if lowered in FORBIDDEN_META_KEYS:
+            return "[REDACTED]"
+        if lowered in ("env", "headers") and isinstance(val, (list, tuple)):
+            return _redact_named_pairs(val)
+    return redact_for_log(val)
+
+
 def redact_for_log(value: Any) -> Any:
     """Recursively replace sensitive credential/tracing keys with ``'[REDACTED]'``."""
     if isinstance(value, Mapping):
-        return {
-            str(k): (
-                "[REDACTED]"
-                if isinstance(k, str) and k.lower() in FORBIDDEN_META_KEYS
-                else redact_for_log(v)
-            )
-            for k, v in value.items()
-        }
+        return {str(k): _redact_mapping_entry(k, v) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_for_log(item) for item in value]
     if isinstance(value, tuple):

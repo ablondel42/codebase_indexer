@@ -8,12 +8,14 @@ from pydantic import ValidationError as PydanticValidationError
 
 from api.models.acp import (
     ACP_AUTH_REQUIRED,
+    ACP_RESOURCE_NOT_FOUND,
     JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     SUPPORTED_ACP_VERSIONS,
     AcpAuthState,
     AcpConnectionState,
+    AgentCapabilities,
     AuthenticateParams,
     InitializeParams,
     InitializeResult,
@@ -33,6 +35,11 @@ from api.utils.security import (
     find_advertised_auth_method,
     sanitize_authenticate_params,
     sanitize_meta_dict,
+)
+from api.utils.session import (
+    SESSION_METHODS,
+    check_session_capability,
+    prepare_session_params,
 )
 from core.models.exceptions import AcpError
 from core.utils.logging import get_logger
@@ -58,6 +65,7 @@ class AcpConnectionSession:
         self._initialize_result: InitializeResult | None = None
         self._auth_state = AcpAuthState.UNKNOWN
         self._active_auth_method_id: str | None = None
+        self._active_session_ids: set[str] = set()
         self._pending_rpc_methods: dict[int | str, tuple[str, str | None]] = {}
 
     @property
@@ -84,6 +92,11 @@ class AcpConnectionSession:
     def active_auth_method_id(self) -> str | None:
         """Return ``methodId`` used for the active authenticated state, if known."""
         return self._active_auth_method_id
+
+    @property
+    def active_session_ids(self) -> frozenset[str]:
+        """Return set of session IDs currently active on this connection."""
+        return frozenset(self._active_session_ids)
 
     def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
         """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
@@ -402,11 +415,57 @@ class AcpConnectionSession:
         self._pending_rpc_methods[req_id] = ("logout", None)
         return {"jsonrpc": "2.0", "id": req_id, "method": "logout", "params": params_payload}
 
+    def _prepare_session_outbound(
+        self,
+        method: str,
+        req_id: int | str | None,
+        msg: Mapping[str, Any],
+    ) -> dict[str, Any] | SessionStepOutcome:
+        """Enforce capability and parameter security gates for ``session/*`` methods."""
+        if "id" not in msg or req_id is None:
+            return SessionStepOutcome(
+                frames=(
+                    format_jsonrpc_error(
+                        None,
+                        JSONRPC_INVALID_REQUEST,
+                        f"'{method}' must be a JSON-RPC request with a non-null id",
+                    ),
+                )
+            )
+        caps = (
+            self._initialize_result.agent_capabilities
+            if self._initialize_result is not None
+            else AgentCapabilities()
+        )
+        cap_error = check_session_capability(method, caps)
+        if cap_error is not None:
+            return SessionStepOutcome(
+                frames=(format_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND, cap_error),)
+            )
+        try:
+            sanitized_params = prepare_session_params(
+                method,
+                msg.get("params"),
+                caps,
+                self._config,
+            )
+        except (PydanticValidationError, ValueError) as exc:
+            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
+            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
+            return SessionStepOutcome(
+                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
+            )
+
+        target_session = sanitized_params.get("sessionId")
+        tracked_id = target_session if isinstance(target_session, str) else None
+        self._pending_rpc_methods[req_id] = (method, tracked_id)
+        return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized_params}
+
     def _prepare_ready_outbound(
         self,
         msg: Mapping[str, Any],
     ) -> dict[str, Any] | SessionStepOutcome:
-        """Dispatch post-init validation for ``initialize``, ``authenticate``, and ``logout``."""
+        """Dispatch post-init validation for ``initialize``, auth, and ``session/*`` calls."""
         req_id = extract_request_id(msg)
         method = msg.get("method")
         if method == "initialize":
@@ -423,6 +482,8 @@ class AcpConnectionSession:
             return self._prepare_authenticate_outbound(req_id, msg)
         if method == "logout":
             return self._prepare_logout_outbound(req_id, msg)
+        if isinstance(method, str) and method in SESSION_METHODS:
+            return self._prepare_session_outbound(method, req_id, msg)
         return dict(msg)
 
     async def handle_ready_frame(self, raw_text: str) -> SessionStepOutcome:
@@ -452,18 +513,46 @@ class AcpConnectionSession:
         await self._process.send_line(prepared)
         return SessionStepOutcome()
 
+    def _apply_session_rpc_result(
+        self,
+        method_name: str,
+        tracked_session_id: str | None,
+        loaded: Mapping[str, Any],
+    ) -> None:
+        """Update ``active_session_ids`` from completed ``session/*`` responses."""
+        succeeded = "result" in loaded and "error" not in loaded
+        err_obj = loaded.get("error")
+        err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
+
+        if method_name == "session/new" and succeeded:
+            res_obj = loaded.get("result")
+            new_id = res_obj.get("sessionId") if isinstance(res_obj, Mapping) else None
+            if isinstance(new_id, str) and new_id:
+                self._active_session_ids.add(new_id)
+        elif method_name in ("session/load", "session/resume") and succeeded and tracked_session_id:
+            self._active_session_ids.add(tracked_session_id)
+        elif (
+            method_name in ("session/close", "session/delete")
+            and tracked_session_id
+            and (succeeded or err_code == ACP_RESOURCE_NOT_FOUND)
+        ):
+            self._active_session_ids.discard(tracked_session_id)
+
     def _apply_auth_rpc_result(
         self,
         method_name: str,
-        auth_method_id: str | None,
+        target_id: str | None,
         loaded: Mapping[str, Any],
     ) -> None:
-        """Transition ``auth_state`` when a tracked ``authenticate`` or ``logout`` finishes."""
+        """Transition ``auth_state`` or ``active_session_ids`` when tracked RPCs finish."""
+        if method_name in SESSION_METHODS:
+            self._apply_session_rpc_result(method_name, target_id, loaded)
+            return
         succeeded = "result" in loaded and "error" not in loaded
         if method_name == "authenticate":
             if succeeded:
                 self._auth_state = AcpAuthState.AUTHENTICATED
-                self._active_auth_method_id = auth_method_id
+                self._active_auth_method_id = target_id
             else:
                 self._auth_state = AcpAuthState.UNAUTHENTICATED
         elif method_name == "logout" and succeeded:

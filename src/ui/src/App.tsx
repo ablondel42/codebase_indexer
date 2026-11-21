@@ -1,34 +1,25 @@
 import "@xyflow/react/style.css";
+import { useCallback, useState } from "react";
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  MiniMap,
+  ReactFlow,
+  addEdge,
+  type Connection,
+} from "@xyflow/react";
+
+import { AcpSessionsPanel } from "@/components/acp-sessions-panel";
 import { AcpStatusBar } from "@/components/acp-status-bar";
 import { ThemeProvider } from "@/components/theme-provider";
 import { useAcpConnection } from "@/hooks/use-acp-connection";
 import { ModeToggle } from "./components/mode-toggle";
-import { useState, useCallback } from "react";
-import {
-  ReactFlow,
-  addEdge,
-  Background,
-  Controls,
-  MiniMap,
-  type Connection,
-} from "@xyflow/react";
-import { BackgroundVariant } from "@xyflow/react";
 
 function WorkspaceCanvas() {
-  const {
-    status,
-    result,
-    authStatus,
-    activeMethodId,
-    authenticatingMethodId,
-    canLogout,
-    error,
-    authError,
-    clearAuthError,
-    authenticate,
-    logout,
-    reconnect,
-  } = useAcpConnection();
+  const acp = useAcpConnection();
+  const [sessionsPanelOpen, setSessionsPanelOpen] = useState(true);
+
   const initialNodes = [
     { id: "n1", position: { x: 0, y: 0 }, data: { label: "Node 1" } },
     { id: "n2", position: { x: 0, y: 100 }, data: { label: "Node 2" } },
@@ -67,42 +58,73 @@ function WorkspaceCanvas() {
     [],
   );
 
+  const showPanel =
+    acp.status === "ready" &&
+    acp.authStatus === "authenticated" &&
+    sessionsPanelOpen;
+
   return (
     <div className="flex h-screen w-screen flex-col">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-background px-4">
         <AcpStatusBar
-          status={status}
-          result={result}
-          authStatus={authStatus}
-          activeMethodId={activeMethodId}
-          authenticatingMethodId={authenticatingMethodId}
-          canLogout={canLogout}
-          error={error}
-          authError={authError}
-          onClearAuthError={clearAuthError}
-          onAuthenticate={authenticate}
-          onLogout={logout}
-          onReconnect={reconnect}
+          status={acp.status}
+          result={acp.result}
+          authStatus={acp.authStatus}
+          activeMethodId={acp.activeMethodId}
+          authenticatingMethodId={acp.authenticatingMethodId}
+          canLogout={acp.canLogout}
+          sessionCount={acp.sessions.length}
+          activeSessionId={acp.activeSessionId}
+          sessionsPanelOpen={sessionsPanelOpen}
+          onToggleSessionsPanel={() =>
+            setSessionsPanelOpen((current) => !current)
+          }
+          error={acp.error}
+          authError={acp.authError}
+          onClearAuthError={acp.clearAuthError}
+          onAuthenticate={acp.authenticate}
+          onLogout={acp.logout}
+          onReconnect={acp.reconnect}
         />
         <ModeToggle />
       </header>
-      <div className="min-h-0 flex-1">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          fitView
-        >
-          <Controls />
-          <MiniMap />
-          <Background
-            variant={BackgroundVariant.Dots}
-            gap={12}
-            size={1}
+      <div className="flex min-h-0 flex-1">
+        <div className="min-h-0 min-w-0 flex-1">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            fitView
+          >
+            <Controls />
+            <MiniMap />
+            <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
+          </ReactFlow>
+        </div>
+        {showPanel && (
+          <AcpSessionsPanel
+            defaultCwd={acp.defaultCwd}
+            includeCbiMcp={acp.includeCbiMcp}
+            onToggleCbiMcp={acp.setIncludeCbiMcp}
+            sessions={acp.sessions}
+            nextCursor={acp.nextCursor}
+            activeSessionId={acp.activeSessionId}
+            replayedMessages={acp.replayedMessages}
+            sessionCaps={acp.sessionCaps}
+            sessionBusyId={acp.sessionBusyId}
+            sessionError={acp.sessionError}
+            onClearSessionError={acp.clearSessionError}
+            onRefresh={acp.refreshSessions}
+            onLoadMore={acp.loadMoreSessions}
+            onCreateSession={acp.createNewSession}
+            onLoadSession={acp.loadExistingSession}
+            onResumeSession={acp.resumeExistingSession}
+            onCloseSession={acp.closeActiveSession}
+            onDeleteSession={acp.deleteExistingSession}
           />
-        </ReactFlow>
+        )}
       </div>
     </div>
   );
@@ -110,10 +132,7 @@ function WorkspaceCanvas() {
 
 function App() {
   return (
-    <ThemeProvider
-      defaultTheme="dark"
-      storageKey="vite-ui-theme"
-    >
+    <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
       <WorkspaceCanvas />
     </ThemeProvider>
   );

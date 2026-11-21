@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
@@ -29,10 +30,15 @@ class ApiServerRunner:
         engine: IndexerEngine | None = None,
     ) -> None:
         """Initialize the FastAPI server runner with optional injected ``IndexerEngine``."""
-        self._api_config = api_config if api_config is not None else ApiServerConfig()
+        base_api_cfg = api_config if api_config is not None else ApiServerConfig()
         self._app_config = app_config if app_config is not None else AppConfig()
         self._owns_engine = engine is None
         self._engine = engine if engine is not None else IndexerEngine(self._app_config)
+        self._api_config = (
+            base_api_cfg
+            if base_api_cfg.cbi_db_path is not None
+            else base_api_cfg.model_copy(update={"cbi_db_path": self._engine.db_path})
+        )
         self._gateway = AcpWebSocketGateway(self._api_config)
 
     @property
@@ -47,9 +53,12 @@ class ApiServerRunner:
 
     async def _health_endpoint(self) -> HealthStatus:
         """Emit structured FastAPI server and supported ACP protocol status."""
+        default_cwd = str((self._api_config.workspace_root or Path.cwd()).resolve())
         return HealthStatus(
             app=self._app_config.app_name,
             version=APP_VERSION,
+            default_cwd=default_cwd,
+            cbi_mcp_enabled=self._api_config.enable_cbi_mcp,
         )
 
     def create_app(self) -> FastAPI:

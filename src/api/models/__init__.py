@@ -36,6 +36,16 @@ from api.models.config import (
     ApiServerConfig,
     HealthStatus,
 )
+from api.models.session import (
+    SessionCloseParams,
+    SessionDeleteParams,
+    SessionListParams,
+    SessionLoadParams,
+    SessionNewParams,
+    SessionResumeParams,
+    SystemPromptConfig,
+    SystemPromptTextBlock,
+)
 
 __all__ = [
     "ACP_AUTH_REQUIRED",
@@ -69,5 +79,13 @@ __all__ = [
     "PromptCapabilities",
     "SUPPORTED_ACP_VERSIONS",
     "SessionCapabilities",
+    "SessionCloseParams",
+    "SessionDeleteParams",
+    "SessionListParams",
+    "SessionLoadParams",
+    "SessionNewParams",
+    "SessionResumeParams",
     "SessionStepOutcome",
+    "SystemPromptConfig",
+    "SystemPromptTextBlock",
 ]

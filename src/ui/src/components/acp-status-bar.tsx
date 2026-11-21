@@ -1,4 +1,4 @@
-import { RefreshCw, ShieldCheck } from "lucide-react";
+import { PanelRight, RefreshCw, ShieldCheck } from "lucide-react";
 
 import { AcpAuthControls } from "@/components/acp-auth-controls";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,10 @@ interface AcpStatusBarProps {
   activeMethodId: string | null;
   authenticatingMethodId: string | null;
   canLogout: boolean;
+  sessionCount: number;
+  activeSessionId: string | null;
+  sessionsPanelOpen: boolean;
+  onToggleSessionsPanel: () => void;
   error: string | null;
   authError: string | null;
   onClearAuthError: () => void;
@@ -42,6 +46,10 @@ export function AcpStatusBar({
   activeMethodId,
   authenticatingMethodId,
   canLogout,
+  sessionCount,
+  activeSessionId,
+  sessionsPanelOpen,
+  onToggleSessionsPanel,
   error,
   authError,
   onClearAuthError,
@@ -98,6 +106,18 @@ export function AcpStatusBar({
           onLogout={onLogout}
           onCancelAuth={onReconnect}
         />
+      )}
+
+      {status === "ready" && authStatus === "authenticated" && (
+        <Button
+          variant={sessionsPanelOpen ? "secondary" : "outline"}
+          size="sm"
+          onClick={onToggleSessionsPanel}
+        >
+          <PanelRight className="size-3.5" />
+          Sessions ({sessionCount})
+          {activeSessionId ? " · Active" : ""}
+        </Button>
       )}
 
       <Button
