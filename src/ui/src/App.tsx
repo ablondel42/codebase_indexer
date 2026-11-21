@@ -1,8 +1,15 @@
+import "@xyflow/react/style.css";
 import { ThemeProvider } from "@/components/theme-provider";
 import { ModeToggle } from "./components/mode-toggle";
 import { useState, useCallback } from "react";
-import { ReactFlow, addEdge } from "@xyflow/react";
-import "@xyflow/react/style.css";
+import {
+  ReactFlow,
+  addEdge,
+  Background,
+  Controls,
+  MiniMap,
+} from "@xyflow/react";
+import { BackgroundVariant } from "@xyflow/react";
 
 function App() {
   const initialNodes = [
@@ -57,7 +64,15 @@ function App() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           fitView
-        />
+        >
+          <Controls />
+          <MiniMap />
+          <Background
+            variant={BackgroundVariant.Dots}
+            gap={12}
+            size={1}
+          />
+        </ReactFlow>
       </div>
     </ThemeProvider>
   );
