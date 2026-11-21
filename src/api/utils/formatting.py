@@ -1,10 +1,12 @@
 """Stateless terminal log formatting and secret-redacted JSON indentation helpers."""
 
+import difflib
 import json
 import logging
 import sys
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from api.utils.security import FORBIDDEN_META_KEYS
@@ -68,9 +70,101 @@ def describe_jsonrpc_frame(payload: Mapping[str, Any]) -> str:
     return "frame"
 
 
+def _build_unified_diff_text(old_text: str, new_text: str, raw_path: object) -> str:
+    """Compute a compact unified diff string between ``old_text`` and ``new_text``."""
+    label = Path(raw_path).name if isinstance(raw_path, str) and raw_path else "file"
+    diff_lines = list(
+        difflib.unified_diff(
+            old_text.splitlines(),
+            new_text.splitlines(),
+            fromfile=f"a/{label}",
+            tofile=f"b/{label}",
+            lineterm="",
+        )
+    )
+    return "\n".join(diff_lines) if diff_lines else "(no textual changes)"
+
+
+def _collapse_diff_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Replace full-file ``oldText``/``newText`` diff pairs with ``unifiedDiff``."""
+    old_text = mapping.get("oldText")
+    new_text = mapping.get("newText")
+    if mapping.get("type") != "diff" or not (
+        isinstance(old_text, str) and isinstance(new_text, str)
+    ):
+        return {str(k): v for k, v in mapping.items()}
+
+    collapsed = {
+        str(key): val
+        for key, val in mapping.items()
+        if key not in ("oldText", "newText")
+    }
+    collapsed["unifiedDiff"] = _build_unified_diff_text(
+        old_text,
+        new_text,
+        mapping.get("path"),
+    )
+    return collapsed
+
+
+def _format_multiline_str(text: str, depth: int) -> str:
+    """Render a multiline string as an indented ``|`` block with real line breaks."""
+    child_pad = "  " * (depth + 1)
+    lines = text.splitlines() or [""]
+    body = "\n".join(f"{child_pad}{line}" if line else "" for line in lines)
+    return f"|\n{body}"
+
+
+def _format_mapping_for_log(mapping: Mapping[str, Any], depth: int) -> str:
+    """Render a mapping with 2-space indentation and multiline string blocks."""
+    prepared = _collapse_diff_mapping(mapping)
+    if not prepared:
+        return "{}"
+    pad = "  " * depth
+    child_pad = "  " * (depth + 1)
+    items = list(prepared.items())
+    lines: list[str] = ["{"]
+    for idx, (key, val) in enumerate(items):
+        key_json = json.dumps(str(key), ensure_ascii=False)
+        rendered = _format_value_for_log(val, depth + 1)
+        is_block = isinstance(val, str) and "\n" in val
+        suffix = "" if (idx == len(items) - 1 or is_block) else ","
+        lines.append(f"{child_pad}{key_json}: {rendered}{suffix}")
+    lines.append(f"{pad}}}")
+    return "\n".join(lines)
+
+
+def _format_sequence_for_log(items: Sequence[Any], depth: int) -> str:
+    """Render a list or tuple with 2-space indentation and multiline string blocks."""
+    if not items:
+        return "[]"
+    pad = "  " * depth
+    child_pad = "  " * (depth + 1)
+    lines: list[str] = ["["]
+    for idx, val in enumerate(items):
+        rendered = _format_value_for_log(val, depth + 1)
+        is_block = isinstance(val, str) and "\n" in val
+        suffix = "" if (idx == len(items) - 1 or is_block) else ","
+        lines.append(f"{child_pad}{rendered}{suffix}")
+    lines.append(f"{pad}]")
+    return "\n".join(lines)
+
+
+def _format_value_for_log(value: Any, depth: int) -> str:
+    """Dispatch ``value`` to scalar JSON, multiline block, list, or dict formatting."""
+    if isinstance(value, Mapping):
+        return _format_mapping_for_log(value, depth)
+    if isinstance(value, (list, tuple)):
+        return _format_sequence_for_log(value, depth)
+    if isinstance(value, str) and "\n" in value:
+        return _format_multiline_str(value, depth)
+    return json.dumps(value, ensure_ascii=False)
+
+
 def indent_json_payload(payload: Any, *, indent_spaces: int = 2) -> str:
-    """Pretty-print ``payload`` as 2-space JSON with secrets redacted and block-indented."""
-    pretty = json.dumps(redact_for_log(payload), indent=2, ensure_ascii=False)
+    """Pretty-print ``payload`` with redacted secrets, multiline blocks, and diffs."""
+    redacted = redact_for_log(payload)
+    pretty = _format_value_for_log(redacted, 0)
     return textwrap.indent(pretty, " " * indent_spaces)
 
 
