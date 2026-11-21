@@ -8,7 +8,8 @@ from fastapi import FastAPI
 
 from api.models.config import ApiServerConfig, HealthStatus
 from api.services.gateway import AcpWebSocketGateway
-from api.utils.security import validate_bind_host
+from api.utils.formatting import configure_api_terminal_logging, format_kv_block
+from api.utils.security import build_agy_acp_command, validate_bind_host
 from core.models.config import AppConfig
 from core.models.enums import APP_VERSION
 from core.utils.logging import get_logger
@@ -81,12 +82,18 @@ class ApiServerRunner:
 
     def run(self) -> None:
         """Start the Uvicorn ASGI server and close owned ``IndexerEngine`` on exit."""
+        configure_api_terminal_logging(debug=self._app_config.debug)
         app = self.create_app()
         logger.info(
-            "Starting FastAPI ACP bridge on %s:%d (sandbox=%s)",
-            self._api_config.host,
-            self._api_config.port,
-            self._api_config.agy_sandbox,
+            "Starting FastAPI ACP bridge\n%s",
+            format_kv_block(
+                {
+                    "bind": f"{self._api_config.host}:{self._api_config.port}",
+                    "agy_command": " ".join(build_agy_acp_command(self._api_config)),
+                    "allowed_origins": ", ".join(self._api_config.allowed_origins),
+                    "max_connections": self._api_config.max_connections,
+                }
+            ),
         )
         try:
             uvicorn.run(

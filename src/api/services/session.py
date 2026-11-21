@@ -17,6 +17,11 @@ from api.models.acp import (
 )
 from api.models.config import ApiServerConfig
 from api.services.process import AgyAcpProcess
+from api.utils.formatting import (
+    describe_jsonrpc_frame,
+    format_raw_frame_for_log,
+    indent_json_payload,
+)
 from api.utils.jsonrpc import extract_request_id, format_jsonrpc_error, parse_client_frame
 from api.utils.security import clamp_client_capabilities
 from core.models.exceptions import AcpError
@@ -56,6 +61,13 @@ class AcpConnectionSession:
     def initialize_result(self) -> InitializeResult | None:
         """Return validated ``InitializeResult`` once handshake reaches ``READY``."""
         return self._initialize_result
+
+    def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
+        """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
+        for frame in outcome.frames:
+            label, pretty = format_raw_frame_for_log(frame)
+            logger.warning("[%s] Bridge -> UI (%s)\n%s", self._connection_id, label, pretty)
+        return outcome
 
     def _validate_init_params(
         self,
@@ -167,7 +179,9 @@ class AcpConnectionSession:
         agent_msg: Mapping[str, Any],
     ) -> SessionStepOutcome:
         """Validate ``agy`` initialize response, enforce version match, and enter ``READY``."""
+        label, pretty = format_raw_frame_for_log(raw_line)
         if "error" in agent_msg or "result" not in agent_msg:
+            logger.warning("[%s] agy -> UI (%s)\n%s", self._connection_id, label, pretty)
             await self.close()
             return SessionStepOutcome(frames=(raw_line,), close_code=1002)
 
@@ -184,15 +198,17 @@ class AcpConnectionSession:
                 JSONRPC_INVALID_PARAMS,
                 f"Unsupported ACP protocolVersion: {parsed_result.protocol_version}",
             )
-            return SessionStepOutcome(frames=(err,), close_code=1002)
+            return self._log_rejection_outcome(
+                SessionStepOutcome(frames=(err,), close_code=1002)
+            )
 
         self._initialize_result = parsed_result
         self._state = AcpConnectionState.READY
         logger.info(
-            "ACP session %s initialized (protocolVersion=%s, agent=%s)",
+            "[%s] agy -> UI (%s · initialize)\n%s",
             self._connection_id,
-            parsed_result.protocol_version,
-            parsed_result.agent_info.name if parsed_result.agent_info else "unknown",
+            label,
+            pretty,
         )
         return SessionStepOutcome(frames=(raw_line,))
 
@@ -210,6 +226,12 @@ class AcpConnectionSession:
             "method": "initialize",
             "params": clamp_client_capabilities(init_params),
         }
+        logger.info(
+            "[%s] Bridge -> agy (request #%s · clamped initialize)\n%s",
+            self._connection_id,
+            req_id,
+            indent_json_payload(outbound),
+        )
         await self._process.send_line(outbound)
         raw_line, agent_msg = await self._await_agent_init_response(req_id)
         return await self._finalize_init_response(req_id, raw_line, agent_msg)
@@ -218,11 +240,17 @@ class AcpConnectionSession:
         """Process one incoming WebSocket frame while waiting for ``initialize``."""
         msg, parse_err = parse_client_frame(raw_text, max_bytes=self._config.max_frame_bytes)
         if parse_err is not None or msg is None:
-            return SessionStepOutcome(frames=(parse_err or "",))
+            return self._log_rejection_outcome(SessionStepOutcome(frames=(parse_err or "",)))
 
+        logger.info(
+            "[%s] UI -> Bridge (%s)\n%s",
+            self._connection_id,
+            describe_jsonrpc_frame(msg),
+            indent_json_payload(msg),
+        )
         parsed = self._parse_init_request(msg)
         if isinstance(parsed, SessionStepOutcome):
-            return parsed
+            return self._log_rejection_outcome(parsed)
         req_id, init_params = parsed
         return await self._execute_agent_initialize(req_id, init_params)
 
@@ -230,17 +258,24 @@ class AcpConnectionSession:
         """Validate and forward a post-initialization JSON-RPC frame to ``agy acp``."""
         msg, parse_err = parse_client_frame(raw_text, max_bytes=self._config.max_frame_bytes)
         if parse_err is not None or msg is None:
-            return SessionStepOutcome(frames=(parse_err or "",))
+            return self._log_rejection_outcome(SessionStepOutcome(frames=(parse_err or "",)))
+
+        frame_label = describe_jsonrpc_frame(msg)
+        pretty_msg = indent_json_payload(msg)
+        logger.info("[%s] UI -> Bridge (%s)\n%s", self._connection_id, frame_label, pretty_msg)
         if msg.get("method") == "initialize":
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        extract_request_id(msg),
-                        JSONRPC_INVALID_REQUEST,
-                        "Connection already initialized",
-                    ),
+            return self._log_rejection_outcome(
+                SessionStepOutcome(
+                    frames=(
+                        format_jsonrpc_error(
+                            extract_request_id(msg),
+                            JSONRPC_INVALID_REQUEST,
+                            "Connection already initialized",
+                        ),
+                    )
                 )
             )
+        logger.info("[%s] Bridge -> agy (%s)\n%s", self._connection_id, frame_label, pretty_msg)
         await self._process.send_line(msg)
         return SessionStepOutcome()
 

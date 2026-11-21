@@ -13,6 +13,7 @@ from api.models.acp import (
 )
 from api.models.config import ApiServerConfig
 from api.services.session import AcpConnectionSession
+from api.utils.formatting import format_kv_block, format_raw_frame_for_log
 from api.utils.jsonrpc import format_jsonrpc_error
 from api.utils.security import is_allowed_ws_host, is_allowed_ws_origin
 from core.models.exceptions import AcpError
@@ -45,11 +46,13 @@ class AcpWebSocketGateway:
         origin_ok = is_allowed_ws_origin(origin_header, self._config.allowed_origins)
         if not host_ok or not origin_ok:
             logger.warning(
-                "Rejected /acp WebSocket upgrade (host=%r host_ok=%s origin=%r origin_ok=%s)",
-                host_header,
-                host_ok,
-                origin_header,
-                origin_ok,
+                "Rejected /acp WebSocket upgrade\n%s",
+                format_kv_block(
+                    {
+                        "host": f"{host_header!r} (allowed={host_ok})",
+                        "origin": f"{origin_header!r} (allowed={origin_ok})",
+                    }
+                ),
             )
             return False
         return True
@@ -113,9 +116,11 @@ class AcpWebSocketGateway:
         while True:
             frame = await session.read_agent_frame()
             if frame is None:
-                logger.info("ACP agent stdout EOF on %s", session.connection_id)
+                logger.info("[%s] agy stdout closed (EOF)", session.connection_id)
                 break
             if frame:
+                label, pretty = format_raw_frame_for_log(frame)
+                logger.info("[%s] agy -> UI (%s)\n%s", session.connection_id, label, pretty)
                 await websocket.send_text(frame)
 
     async def _run_ready_relay(
@@ -161,7 +166,7 @@ class AcpWebSocketGateway:
             if should_relay:
                 await self._run_ready_relay(websocket, session)
         except WebSocketDisconnect as exc:
-            logger.debug("ACP client %s disconnected (code=%s)", session.connection_id, exc.code)
+            logger.info("[%s] WebSocket disconnected (code=%s)", session.connection_id, exc.code)
         except TimeoutError as exc:
             logger.warning("ACP initialization timed out for %s: %s", session.connection_id, exc)
             err = format_jsonrpc_error(None, JSONRPC_INVALID_REQUEST, "ACP initialization timeout")
@@ -194,6 +199,17 @@ class AcpWebSocketGateway:
         try:
             await websocket.accept(
                 headers=[(b"acp-connection-id", connection_id.encode("ascii"))]
+            )
+            logger.info(
+                "[%s] WebSocket connected\n%s",
+                connection_id,
+                format_kv_block(
+                    {
+                        "host": websocket.headers.get("host") or "(none)",
+                        "origin": websocket.headers.get("origin") or "(none)",
+                        "active": f"{len(self._active_sessions)}/{self._config.max_connections}",
+                    }
+                ),
             )
             await self._drive_session(websocket, session)
         finally:

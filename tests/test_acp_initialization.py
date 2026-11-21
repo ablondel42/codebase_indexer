@@ -1,6 +1,7 @@
 """Security, protocol-state, and lifecycle tests for FastAPI ``/acp`` initialization."""
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -20,8 +21,10 @@ from api.models.acp import (
 )
 from api.models.config import ApiServerConfig
 from api.services.server import ApiServerRunner
+from api.utils.formatting import configure_api_terminal_logging
 from core.models.config import AppConfig
 from core.models.exceptions import AcpError
+from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
 
 VALID_ORIGIN_HEADERS: dict[str, str] = {
     "host": "127.0.0.1:8000",
@@ -325,6 +328,40 @@ def test_acp_rejects_unsupported_agent_protocol_version_and_cleans_up(tmp_path: 
 
     child_pid = int(pid_path.read_text(encoding="utf-8"))
     _assert_pid_exited(child_pid)
+
+
+def test_acp_terminal_logging_indents_json_and_redacts_secrets(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``configure_api_terminal_logging`` emits indented ACP JSON to stderr without secrets."""
+    script = _write_fake_acp_script(tmp_path / "log_acp.py")
+    root_logger = logging.getLogger(ROOT_LOGGER_NAME)
+    reset_logging()
+    root_logger.addHandler(logging.NullHandler())
+
+    try:
+        configure_api_terminal_logging(debug=False)
+        with (
+            _make_test_client(tmp_path, script) as client,
+            client.websocket_connect("/acp", headers=VALID_ORIGIN_HEADERS) as ws,
+        ):
+            ws.send_json(
+                _initialize_payload(
+                    req_id=7,
+                    meta={"authorization": "Bearer super-secret-token", "theme": "dark"},
+                )
+            )
+            assert ws.receive_json()["id"] == 7
+
+        err_out = capsys.readouterr().err
+        assert "UI -> Bridge (request #7 · initialize)\n  {\n    \"jsonrpc\": \"2.0\"" in err_out
+        assert "Bridge -> agy (request #7 · clamped initialize)\n  {" in err_out
+        assert "agy -> UI (response #7 · initialize)\n  {" in err_out
+        assert "\"authorization\": \"[REDACTED]\"" in err_out
+        assert "super-secret-token" not in err_out
+    finally:
+        reset_logging()
 
 
 @pytest.mark.skipif(shutil.which("agy") is None, reason="agy CLI not installed")

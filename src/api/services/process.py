@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from api.models.config import ApiServerConfig
+from api.utils.formatting import format_kv_block
 from api.utils.jsonrpc import encode_stdio_line
 from api.utils.security import build_agy_acp_command, build_sanitized_agy_env
 from core.models.exceptions import AcpError
@@ -95,7 +96,16 @@ class AgyAcpProcess:
             raise AcpError("ACP subprocess failed to attach stdio pipes.")
 
         self._stderr_task = asyncio.create_task(self._drain_stderr(proc.stderr))
-        logger.info("Spawned ACP subprocess pid=%s cmd=%s", proc.pid, list(cmd))
+        logger.info(
+            "Spawned ACP subprocess\n%s",
+            format_kv_block(
+                {
+                    "pid": proc.pid,
+                    "command": " ".join(cmd),
+                    "cwd": cwd or "(inherited)",
+                }
+            ),
+        )
 
     async def send_line(self, payload: Mapping[str, Any]) -> None:
         """Write one UTF-8 newline-delimited JSON-RPC message to ``agy acp`` ``stdin``."""
@@ -136,10 +146,14 @@ class AgyAcpProcess:
         if proc is None:
             return
 
-        self._close_stdin(proc)
+        await self._close_stdin(proc)
         await self._terminate_and_reap(proc)
         await self._stop_stderr_task(stderr_task)
-        logger.debug("Stopped and reaped ACP subprocess pid=%s", proc.pid)
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            transport.close()
+        await asyncio.sleep(0)
+        logger.info("Stopped ACP subprocess (pid=%s, returncode=%s)", proc.pid, proc.returncode)
 
     async def _drain_stderr(self, stderr: asyncio.StreamReader) -> None:
         """Continuously drain child ``stderr`` lines into bounded memory history."""
@@ -155,13 +169,14 @@ class AgyAcpProcess:
             logger.debug("ACP stderr reader stopped cleanly: %s", exc)
 
     @staticmethod
-    def _close_stdin(proc: asyncio.subprocess.Process) -> None:
+    async def _close_stdin(proc: asyncio.subprocess.Process) -> None:
         """Close child ``stdin`` pipe cleanly, logging expected pipe teardown errors."""
         if proc.stdin is None or proc.stdin.is_closing():
             return
         try:
             proc.stdin.close()
-        except OSError as exc:
+            await proc.stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             logger.debug("Ignoring ACP stdin close error during teardown: %s", exc)
 
     async def _terminate_and_reap(self, proc: asyncio.subprocess.Process) -> None:
