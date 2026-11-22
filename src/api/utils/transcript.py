@@ -181,15 +181,51 @@ def _round_elapsed_seconds(start_ts: float | None, end_ts: float | None) -> floa
     return max(0.1, round(delta, 1)) if delta >= 0.05 else 0.0
 
 
+def _format_read_line_range(args: Mapping[str, Any]) -> str:
+    """Return ``' #Lstart-end'`` suffix when ``read_file`` / ``view_file`` specifies bounds."""
+    raw_start = args.get("StartLine")
+    raw_end = args.get("EndLine")
+    start = (
+        raw_start
+        if isinstance(raw_start, int) and not isinstance(raw_start, bool) and raw_start >= 1
+        else None
+    )
+    end = (
+        raw_end
+        if isinstance(raw_end, int) and not isinstance(raw_end, bool) and raw_end >= 1
+        else None
+    )
+    if start is not None and end is not None:
+        return f" #L{start}-{end}"
+    if start is not None:
+        return f" #L{start}"
+    if end is not None:
+        return f" #L1-{end}"
+    return ""
+
+
 def _describe_file_tool(name: str, args: Mapping[str, Any]) -> tuple[str, str, tuple[str, ...]]:
     """Map file read/edit/write tool calls into UI kind, title, and locations."""
     raw_path = args.get("Path") or args.get("path")
     path_str = str(raw_path)[:260] if isinstance(raw_path, str) and raw_path else ""
     basename = Path(path_str).name if path_str else name
+    locs = (path_str,) if path_str else ()
     if name in ("read_file", "view_file"):
-        return ("read", f"Read {basename}"[:160], (path_str,) if path_str else ())
-    verb = "Write" if name == "write_file" else "Edit"
-    return ("edit", f"{verb} {basename}"[:160], (path_str,) if path_str else ())
+        range_suffix = _format_read_line_range(args)
+        return ("read", f"Read {basename}{range_suffix}"[:160], locs)
+    if name == "write_file":
+        return ("write", f"Write {basename}"[:160], locs)
+    return ("edit", f"Edit {basename}"[:160], locs)
+
+
+def _describe_run_command(args: Mapping[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    """Map ``run_command`` tool calls using ``toolSummary`` for multi-line scripts."""
+    cmd = str(args.get("CommandLine") or args.get("command") or "command")
+    summary = args.get("toolSummary")
+    if "\n" in cmd and isinstance(summary, str) and summary.strip():
+        return ("execute", summary.strip()[:160], ())
+    first_line = cmd.splitlines()[0] if cmd.splitlines() else "command"
+    return ("execute", first_line[:160], ())
 
 
 def _describe_tool_call(raw_call: object) -> tuple[str, str, tuple[str, ...]]:
@@ -199,12 +235,11 @@ def _describe_tool_call(raw_call: object) -> tuple[str, str, tuple[str, ...]]:
     name = str(raw_call.get("name") or "tool")
     raw_args = raw_call.get("args")
     args: Mapping[str, Any] = raw_args if isinstance(raw_args, Mapping) else {}
-    result: tuple[str, str, tuple[str, ...]] = ("other", f"Run {name}"[:160], ())
+    result: tuple[str, str, tuple[str, ...]] = ("other", name[:160], ())
     if name in ("read_file", "view_file", "edit_file", "write_file"):
         result = _describe_file_tool(name, args)
     elif name == "run_command":
-        cmd = str(args.get("CommandLine") or args.get("command") or "command")
-        result = ("execute", cmd.splitlines()[0][:160], ())
+        result = _describe_run_command(args)
     elif name == "call_mcp_tool":
         tool_name = str(args.get("ToolName") or "mcp")
         kind = "search" if tool_name in _SEARCH_MCP_TOOLS else "fetch"

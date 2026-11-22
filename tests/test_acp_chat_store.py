@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from api.models.config import ApiServerConfig
 from api.services.server import ApiServerRunner
-from api.utils.transcript import classify_profile_watch_path
+from api.utils.transcript import classify_profile_watch_path, read_transcript_delta
 from core.models.chat import (
     ChatItemRole,
     ChatPageQuery,
@@ -1194,3 +1194,41 @@ def test_background_task_resolution_and_parser_version_self_heal(tmp_path: Path)
     assert "52 passed" in done_tool["text"]
 
     _assert_parser_version_self_heal(gemini_root, profile_root, tmp_path, sid)
+
+
+def test_transcript_tool_metadata_formatting(tmp_path: Path) -> None:
+    """Formats read line ranges, multi-line command summaries, writes, and generic tools."""
+    transcript = tmp_path / "transcript_meta.jsonl"
+    _append_jsonl(
+        transcript,
+        {
+            "step_index": 0,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:00:00Z",
+            "tool_calls": [
+                {
+                    "name": "read_file",
+                    "args": {"Path": "/repo/test_watch_mode.py", "StartLine": 1, "EndLine": 120},
+                },
+                {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "venv/bin/python - <<'PY'\nprint('hi')\nPY",
+                        "toolSummary": "Inspect watcher timings",
+                    },
+                },
+                {"name": "write_file", "args": {"Path": "/repo/plan.md"}},
+                {"name": "exit_plan_mode", "args": {"plan": "..."}},
+            ],
+        },
+    )
+    parsed = read_transcript_delta(transcript, start_offset=0, last_step_index=None)
+    titles = [(u.tool_kind, u.tool_title) for u in parsed.upserts]
+    assert titles == [
+        ("read", "Read test_watch_mode.py #L1-120"),
+        ("execute", "Inspect watcher timings"),
+        ("write", "Write plan.md"),
+        ("other", "exit_plan_mode"),
+    ]

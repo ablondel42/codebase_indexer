@@ -22,11 +22,13 @@ import {
   PromptSuggestions,
   SessionPromptInput,
 } from "@/components/ai-elements/prompt-composer";
+import { ReasoningGroup } from "@/components/ai-elements/reasoning-trace";
 import {
-  ChainOfThoughtGroup,
-  ReasoningGroup,
-} from "@/components/ai-elements/reasoning-trace";
-import { ToolRow } from "@/components/ai-elements/tool-trace";
+  FileEditRow,
+  FileReadRow,
+  TerminalGroup,
+  ToolRow,
+} from "@/components/ai-elements/tool-trace";
 import {
   CheckpointMarker,
   ContextUsageHoverCard,
@@ -63,7 +65,7 @@ import {
   DEFAULT_PROMPT_SUGGESTIONS,
   estimateContextUsage,
   groupMessagesIntoTurns,
-  isResearchStep,
+  type AssistantTurnBlock,
 } from "@/lib/acp/turn-grouping";
 import type {
   AcpActiveSessionMode,
@@ -77,68 +79,131 @@ import type {
   AcpSessionUsage,
 } from "@/lib/acp/types";
 
-function renderAssistantTraceSteps(steps: AcpReplayedMessage[]) {
+function renderOtherStep(step: AcpReplayedMessage): React.ReactNode {
+  if (step.role === "plan" && step.planSteps && step.planSteps.length > 0) {
+    return (
+      <PlanRow
+        key={step.id}
+        title={step.planTitle || "Execution plan"}
+        steps={step.planSteps}
+      />
+    );
+  }
+  if (step.task) {
+    return <TaskRow key={step.id} task={step.task} />;
+  }
+  if (step.subagent) {
+    return <SubagentRow key={step.id} subagent={step.subagent} />;
+  }
+  if (step.role === "tool") {
+    return <ToolRow key={step.id} step={step} />;
+  }
+  return null;
+}
+
+function renderAssistantBlocks({
+  blocks,
+  isLastTurn,
+  liveTurnActive,
+  isLiveThinking,
+  liveTurnStartedAtMs,
+  liveItemIds,
+}: {
+  blocks: AssistantTurnBlock[];
+  isLastTurn: boolean;
+  liveTurnActive: boolean;
+  isLiveThinking: boolean;
+  liveTurnStartedAtMs: number | null;
+  liveItemIds: ReadonlySet<string>;
+}): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  let idx = 0;
+  let traceBatch: React.ReactNode[] = [];
+  let traceIdx = 0;
 
-  while (idx < steps.length) {
-    const step = steps[idx]!;
-
-    // Group >=2 consecutive read/search/fetch tools into ChainOfThoughtGroup
-    if (isResearchStep(step)) {
-      const batch: AcpReplayedMessage[] = [step];
-      let nextIdx = idx + 1;
-      while (nextIdx < steps.length && isResearchStep(steps[nextIdx]!)) {
-        batch.push(steps[nextIdx]!);
-        nextIdx += 1;
-      }
-
-      if (batch.length >= 2) {
-        const files = Array.from(
-          new Set(batch.flatMap((item) => item.locations ?? [])),
-        );
-        const failedCount = batch.filter(
-          (item) => item.toolStatus === "error",
-        ).length;
-        const anyRunning = batch.some((item) => item.toolStatus === "running");
-
-        nodes.push(
-          <ChainOfThoughtGroup
-            key={`cot-${step.id}`}
-            stepCount={batch.length}
-            failedCount={failedCount}
-            running={anyRunning}
-            files={files}
-          >
-            {batch.map((item) => (
-              <ToolRow key={item.id} step={item} />
-            ))}
-          </ChainOfThoughtGroup>,
-        );
-        idx = nextIdx;
-        continue;
-      }
+  const flushTraceBatch = () => {
+    if (traceBatch.length === 0) {
+      return;
     }
+    nodes.push(<Trace key={`trace-${traceIdx}`}>{traceBatch}</Trace>);
+    traceIdx += 1;
+    traceBatch = [];
+  };
 
-    if (step.role === "plan" && step.planSteps && step.planSteps.length > 0) {
+  blocks.forEach((block, blockIdx) => {
+    if (block.kind === "message") {
+      flushTraceBatch();
+      const isStreamingMsg =
+        isLastTurn && block.itemIds.some((id) => liveItemIds.has(id));
       nodes.push(
-        <PlanRow
-          key={step.id}
-          title={step.planTitle || "Execution plan"}
-          steps={step.planSteps}
+        <SessionMessageBody
+          key={block.id}
+          text={block.text}
+          streaming={isStreamingMsg}
         />,
       );
-    } else if (step.task) {
-      nodes.push(<TaskRow key={step.id} task={step.task} />);
-    } else if (step.subagent) {
-      nodes.push(<SubagentRow key={step.id} subagent={step.subagent} />);
-    } else if (step.role === "tool") {
-      nodes.push(<ToolRow key={step.id} step={step} />);
+      return;
     }
 
-    idx += 1;
+    if (block.kind === "thought_group") {
+      const isTail = blockIdx === blocks.length - 1;
+      const isStreamingThought =
+        isLastTurn && block.thoughts.some((item) => liveItemIds.has(item.id));
+      const isThinkingHere =
+        isLastTurn &&
+        isTail &&
+        (isLiveThinking || (liveTurnActive && isStreamingThought));
+      traceBatch.push(
+        <ReasoningGroup
+          key={block.id}
+          thoughts={block.thoughts}
+          running={isThinkingHere}
+          startedAtMs={isThinkingHere ? liveTurnStartedAtMs : null}
+          streaming={isStreamingThought}
+        />,
+      );
+      return;
+    }
+
+    if (block.kind === "terminal_group") {
+      traceBatch.push(
+        <TerminalGroup key={block.id} commands={block.commands} />,
+      );
+      return;
+    }
+
+    if (block.kind === "file_edit") {
+      traceBatch.push(<FileEditRow key={block.edit.id} edit={block.edit} />);
+      return;
+    }
+
+    if (block.kind === "file_read") {
+      traceBatch.push(<FileReadRow key={block.read.id} read={block.read} />);
+      return;
+    }
+
+    const otherNode = renderOtherStep(block.step);
+    if (otherNode) {
+      traceBatch.push(otherNode);
+    }
+  });
+
+  const lastBlock = blocks[blocks.length - 1];
+  if (
+    isLastTurn &&
+    (isLiveThinking || (liveTurnActive && blocks.length === 0)) &&
+    lastBlock?.kind !== "thought_group"
+  ) {
+    traceBatch.push(
+      <ReasoningGroup
+        key="__live_tail_thinking__"
+        thoughts={[]}
+        running
+        startedAtMs={liveTurnStartedAtMs}
+      />,
+    );
   }
 
+  flushTraceBatch();
   return nodes;
 }
 
@@ -332,39 +397,21 @@ function SessionTimelineScroller({
               const isLastTurn = turnIdx === turns.length - 1;
               const isTurnActive =
                 isLastTurn && (liveTurnActive || isLiveThinking);
-              const isThinkingNow =
-                isLastTurn &&
-                (isLiveThinking ||
-                  (liveTurnActive && !turn.replyText && turn.thoughts.length > 0));
-              const isReasoningStreaming =
-                isLastTurn &&
-                turn.thoughts.some((item) => liveItemIds.has(item.id));
-              const isReplyStreaming =
-                isLastTurn &&
-                turn.replyItemIds.some((id) => liveItemIds.has(id));
-              const hasReasoning = turn.thoughts.length > 0 || isThinkingNow;
-              const traceNodes = renderAssistantTraceSteps(turn.steps);
+              const orderedNodes = renderAssistantBlocks({
+                blocks: turn.blocks,
+                isLastTurn,
+                liveTurnActive,
+                isLiveThinking,
+                liveTurnStartedAtMs,
+                liveItemIds,
+              });
 
               return (
                 <React.Fragment key={turn.id}>
                   <MessageScrollerItem messageId={turn.id}>
                     <Message>
                       <MessageContent className="gap-3">
-                        {(hasReasoning || traceNodes.length > 0) && (
-                          <Trace>
-                            {hasReasoning && (
-                              <ReasoningGroup
-                                thoughts={turn.thoughts}
-                                running={isThinkingNow}
-                                startedAtMs={
-                                  isThinkingNow ? liveTurnStartedAtMs : null
-                                }
-                                streaming={isReasoningStreaming}
-                              />
-                            )}
-                            {traceNodes}
-                          </Trace>
-                        )}
+                        {orderedNodes}
                         {turn.todos.length > 0 && (
                           <TodoQueue todos={turn.todos} />
                         )}
@@ -374,12 +421,6 @@ function SessionTimelineScroller({
                             confirmation={conf}
                           />
                         ))}
-                        {turn.replyText && (
-                          <SessionMessageBody
-                            text={turn.replyText}
-                            streaming={isReplyStreaming}
-                          />
-                        )}
                         {turn.sources.length > 0 && (
                           <SourcesList sources={turn.sources} />
                         )}

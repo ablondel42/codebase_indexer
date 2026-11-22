@@ -5,9 +5,11 @@ import {
   CircleDashedIcon,
   CircleXIcon,
   FileCodeIcon,
+  FilePenIcon,
   FileTextIcon,
   FlaskConicalIcon,
   LayersIcon,
+  LoaderCircleIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -35,6 +37,8 @@ import {
 import {
   formatDurationSec,
   parseStackTrace,
+  type FileEditSummary,
+  type FileReadSummary,
   type ParsedStackTrace,
 } from "@/lib/acp/turn-grouping";
 import type {
@@ -292,8 +296,208 @@ export function TerminalRow({
   );
 }
 
+export function TerminalGroup({
+  commands,
+}: {
+  commands: AcpReplayedMessage[];
+}) {
+  const [open, setOpen] = React.useState<boolean>();
+
+  if (commands.length === 0) {
+    return null;
+  }
+
+  if (commands.length === 1) {
+    const cmd = commands[0]!;
+    return (
+      <TerminalRow
+        command={cmd.toolTitle || "command"}
+        output={cmd.text}
+        running={cmd.toolStatus === "running"}
+        exitCode={cmd.exitCode}
+        failed={cmd.toolStatus === "error"}
+        durationSec={cmd.durationSec}
+      />
+    );
+  }
+
+  const anyRunning = commands.some((c) => c.toolStatus === "running");
+  const failedCount = commands.filter(
+    (c) =>
+      c.toolStatus !== "running" &&
+      (c.toolStatus === "error" ||
+        (c.exitCode !== undefined && c.exitCode !== null && c.exitCode !== 0)),
+  ).length;
+  const totalDuration = commands.reduce(
+    (acc, c) => acc + (c.durationSec ?? 0),
+    0,
+  );
+  const status: "running" | "error" | undefined = anyRunning
+    ? "running"
+    : failedCount > 0
+      ? "error"
+      : undefined;
+  const title = anyRunning
+    ? `Running ${commands.length} commands`
+    : failedCount > 0
+      ? `Ran ${commands.length} commands, ${failedCount} failed`
+      : `Ran ${commands.length} commands`;
+
+  return (
+    <TraceCollapsible open={open ?? anyRunning} onOpenChange={setOpen}>
+      <TraceCollapsibleTrigger>
+        <TraceLine status={status}>
+          <TraceIcon>
+            <TerminalIcon />
+          </TraceIcon>
+          <TraceTitle>{title}</TraceTitle>
+          {!anyRunning && totalDuration >= 0.05 && (
+            <TraceDescription>
+              · {formatDurationSec(totalDuration)}
+            </TraceDescription>
+          )}
+        </TraceLine>
+      </TraceCollapsibleTrigger>
+      <TraceCollapsibleContent className="flex flex-col gap-2">
+        <Trace>
+          {commands.map((cmd) => (
+            <TerminalRow
+              key={cmd.id}
+              command={cmd.toolTitle || "command"}
+              output={cmd.text}
+              running={cmd.toolStatus === "running"}
+              exitCode={cmd.exitCode}
+              failed={cmd.toolStatus === "error"}
+              durationSec={cmd.durationSec}
+            />
+          ))}
+        </Trace>
+      </TraceCollapsibleContent>
+    </TraceCollapsible>
+  );
+}
+
+export function FileEditRow({ edit }: { edit: FileEditSummary }) {
+  const running = edit.status === "running";
+  const failed = edit.status === "error";
+  const isWrite = edit.verb === "write";
+  const title = running
+    ? `${isWrite ? "Writing" : "Editing"} ${edit.fileName}`
+    : failed
+      ? `Failed to ${isWrite ? "write" : "edit"} ${edit.fileName}`
+      : `${isWrite ? "Wrote" : "Edited"} ${edit.fileName}`;
+
+  const line = (
+    <TraceLine status={running ? "running" : failed ? "error" : undefined}>
+      <TraceIcon>
+        {running ? (
+          <LoaderCircleIcon className="animate-spin" />
+        ) : failed ? (
+          <CircleXIcon />
+        ) : (
+          <FilePenIcon />
+        )}
+      </TraceIcon>
+      <TraceTitle>{title}</TraceTitle>
+      {!running &&
+        edit.hasDiffCounts &&
+        (edit.addedLines > 0 || edit.removedLines > 0) && (
+          <span className="inline-flex shrink-0 items-center gap-1.5 font-mono text-xs tabular-nums">
+            <span className="text-emerald-500">+{edit.addedLines}</span>
+            <span className="text-rose-500">-{edit.removedLines}</span>
+          </span>
+        )}
+      {!running && edit.durationSec !== undefined && edit.durationSec >= 0.05 && (
+        <TraceDescription>
+          · {formatDurationSec(edit.durationSec)}
+        </TraceDescription>
+      )}
+    </TraceLine>
+  );
+
+  if (!running && edit.output.trim().length > 0) {
+    return (
+      <Sheet>
+        <SheetTrigger>{line}</SheetTrigger>
+        <SheetContent className="sm:max-w-xl">
+          <SheetHeader>
+            <SheetTitle className="font-mono text-sm">
+              {edit.filePath}
+            </SheetTitle>
+            <SheetDescription>{title}</SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 overflow-auto px-4 pb-4">
+            <CodeBlock size="sm" variant={failed ? "destructive" : "default"}>
+              <CodeBlockContent wrap>{edit.output}</CodeBlockContent>
+            </CodeBlock>
+          </div>
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return line;
+}
+
+export function FileReadRow({ read }: { read: FileReadSummary }) {
+  const running = read.status === "running";
+  const failed = read.status === "error";
+  const title = `${running ? "Reading" : failed ? "Failed to read" : "Read"} ${read.fileName}`;
+
+  const line = (
+    <TraceLine status={running ? "running" : failed ? "error" : undefined}>
+      <TraceIcon>
+        {running ? (
+          <LoaderCircleIcon className="animate-spin" />
+        ) : failed ? (
+          <CircleXIcon />
+        ) : (
+          <FileTextIcon />
+        )}
+      </TraceIcon>
+      <TraceTitle>{title}</TraceTitle>
+      {read.lineRangeLabel && (
+        <TraceDescription className="font-mono text-xs">
+          {read.lineRangeLabel}
+        </TraceDescription>
+      )}
+      {!running && read.durationSec !== undefined && read.durationSec >= 0.05 && (
+        <TraceDescription>
+          · {formatDurationSec(read.durationSec)}
+        </TraceDescription>
+      )}
+    </TraceLine>
+  );
+
+  if (!running && read.output.trim().length > 0) {
+    return (
+      <Sheet>
+        <SheetTrigger>{line}</SheetTrigger>
+        <SheetContent className="sm:max-w-xl">
+          <SheetHeader>
+            <SheetTitle className="font-mono text-sm">
+              {read.filePath}
+            </SheetTitle>
+            <SheetDescription>
+              {read.lineRangeLabel ? `Lines ${read.lineRangeLabel}` : title}
+            </SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 flex-1 overflow-auto px-4 pb-4">
+            <CodeBlock size="sm" variant={failed ? "destructive" : "default"}>
+              <CodeBlockContent lineNumbers>{read.output}</CodeBlockContent>
+            </CodeBlock>
+          </div>
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return line;
+}
+
 export function ToolRow({ step }: { step: AcpReplayedMessage }) {
-  const label = step.toolTitle || step.toolKind || "tool call";
+  const rawLabel = step.toolTitle || step.toolKind || "tool call";
+  const label = rawLabel.replace(/^Run\s+/i, "") || rawLabel;
   const running = step.toolStatus === "running";
   const denied = step.toolStatus === "denied";
   const failed = step.toolStatus === "error";
@@ -319,14 +523,10 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
     );
   }
 
-  if (failed && step.text) {
-    const parsedStack = parseStackTrace(step.text);
-    if (parsedStack) {
-      return <StackTraceRow parsed={parsedStack} />;
-    }
-  }
-
-  if (step.toolKind === "execute" || step.exitCode !== undefined) {
+  if (
+    step.toolKind === "execute" ||
+    (step.exitCode !== undefined && step.exitCode !== null)
+  ) {
     return (
       <TerminalRow
         command={label}
@@ -337,6 +537,13 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
         durationSec={step.durationSec}
       />
     );
+  }
+
+  if (failed && step.text) {
+    const parsedStack = parseStackTrace(step.text);
+    if (parsedStack) {
+      return <StackTraceRow parsed={parsedStack} />;
+    }
   }
 
   const durationBadge =
@@ -351,7 +558,9 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
       : step.toolStatus === "pending"
         ? "Pending"
         : "Ran";
-  const formattedTitle = label.match(/^(Ran|Running|Read|Reading|Searched|Searching)\b/i)
+  const formattedTitle = label.match(
+    /^(Ran|Running|Read|Reading|Edited|Editing|Wrote|Writing|Searched|Searching|Analyzed|Analyzing)\b/i,
+  )
     ? label
     : `${titlePrefix} ${label}`;
 
