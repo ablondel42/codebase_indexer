@@ -15,9 +15,15 @@ from api.models.acp import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_METHOD_NOT_FOUND,
 )
-from api.models.config import ApiServerConfig
+from api.models.config import (
+    AcpServerConfig,
+    AgentConfig,
+    LogFormat,
+    LoggingConfig,
+    McpPolicyConfig,
+)
+from api.services.logging import AcpLoggingConfigurator
 from api.services.server import ApiServerRunner
-from api.utils.formatting import configure_api_terminal_logging
 from core.models.config import AppConfig
 from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
 
@@ -319,11 +325,19 @@ def _write_session_agent_script(
     return script_path
 
 
-def _make_session_client(tmp_path: Path, script_path: Path) -> TestClient:
+def _make_session_client(
+    tmp_path: Path,
+    script_path: Path,
+    *,
+    mcp: McpPolicyConfig | None = None,
+) -> TestClient:
     """Create a ``TestClient`` configured with ``workspace_root=tmp_path``."""
-    api_cfg = ApiServerConfig(
-        agy_command=(sys.executable, "-u", str(script_path)),
-        workspace_root=tmp_path,
+    api_cfg = AcpServerConfig(
+        agent=AgentConfig(
+            command=(sys.executable, "-u", str(script_path)),
+            workspace_root=tmp_path,
+        ),
+        mcp=mcp if mcp is not None else McpPolicyConfig(),
     )
     app_cfg = AppConfig(db_path=tmp_path / "session_test.db")
     return TestClient(
@@ -346,15 +360,14 @@ def _init_msg() -> dict[str, Any]:
     }
 
 
-def test_healthz_exposes_resolved_default_cwd(tmp_path: Path) -> None:
-    """``GET /healthz`` exposes ``default_cwd`` matching ``workspace_root``."""
+def test_zero_http_routes_mounted_on_pure_ws_server(tmp_path: Path) -> None:
+    """Pure WebSocket gateway returns ``404`` for legacy HTTP wrapper routes."""
     script = _write_session_agent_script(tmp_path / "health_agent.py")
     with _make_session_client(tmp_path, script) as client:
-        resp = client.get("/healthz")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["default_cwd"] == str(tmp_path.resolve())
-        assert body["cbi_mcp_enabled"] is True
+        assert client.get("/healthz").status_code == 404
+        assert client.get("/api/sessions/sess-1/state").status_code == 404
+        assert client.get("/api/sessions/sess-1/artifacts").status_code == 404
+        assert client.get("/api/sessions/sess-1/messages").status_code == 404
 
 
 def test_session_new_injects_curated_cbi_mcp_and_redacts_env_in_logs(
@@ -375,7 +388,7 @@ def test_session_new_injects_curated_cbi_mcp_and_redacts_env_in_logs(
     root_logger.addHandler(logging.NullHandler())
 
     try:
-        configure_api_terminal_logging(debug=False)
+        AcpLoggingConfigurator(LoggingConfig(format=LogFormat.PRETTY, level="INFO")).configure()
         with (
             _make_session_client(tmp_path, script) as client,
             client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws,
@@ -581,111 +594,57 @@ def test_session_capability_and_path_security_gates(tmp_path: Path) -> None:
     assert forwarded == ["initialize"]
 
 
-def test_session_artifacts_endpoints_list_read_and_enforce_containment(tmp_path: Path) -> None:
-    """Artifact HTTP endpoints list/read ``brain/<sessionId>/*.md`` & block traversal/rebinding."""
-    script = _write_session_agent_script(tmp_path / "artifacts_agent.py")
-    gemini_root = tmp_path / "gemini_store"
-    session_brain = gemini_root / "antigravity" / "brain" / "sess-123"
-    session_brain.mkdir(parents=True)
-
-    (session_brain / "walkthrough.md").write_text("# Walkthrough\nAll green.\n", encoding="utf-8")
-    (session_brain / "walkthrough.md.metadata.json").write_text(
-        json.dumps(
+def test_session_allowlisted_client_stdio_mcp_permitted(tmp_path: Path) -> None:
+    """Explicit ``McpPolicyConfig.allowed_stdio_commands`` permits matching client stdio MCP."""
+    capture_path = tmp_path / "stdio_allowed_capture.jsonl"
+    script = _write_session_agent_script(
+        tmp_path / "stdio_allowed_agent.py",
+        capture_path=capture_path,
+    )
+    with (
+        _make_session_client(
+            tmp_path,
+            script,
+            mcp=McpPolicyConfig(allowed_stdio_commands=("/bin/echo",)),
+        ) as client,
+        client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws,
+    ):
+        ws.send_json(_init_msg())
+        ws.receive_json()
+        ws.send_json(
             {
-                "summary": "Verified ACP walkthrough.",
-                "updatedAt": "2026-11-21T22:00:00Z",
-                "userFacing": True,
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [
+                        {"name": "ok-stdio", "command": "/bin/echo", "args": ["ready"]}
+                    ],
+                },
             }
-        ),
-        encoding="utf-8",
-    )
-    (session_brain / "plan.md").write_text("# Plan\nStep 1.\n", encoding="utf-8")
-    (session_brain / ".hidden.md").write_text("secret", encoding="utf-8")
-    sys_dir = session_brain / ".system_generated"
-    sys_dir.mkdir()
-    (sys_dir / "internal.md").write_text("internal", encoding="utf-8")
-    outside_secret = tmp_path / "outside.md"
-    outside_secret.write_text("outside", encoding="utf-8")
-    (session_brain / "escape.md").symlink_to(outside_secret)
-
-    api_cfg = ApiServerConfig(
-        agy_command=(sys.executable, "-u", str(script)),
-        agy_gemini_dir=str(gemini_root.resolve()),
-        workspace_root=tmp_path,
-    )
-    app = ApiServerRunner(api_cfg, AppConfig(db_path=tmp_path / "art.db")).create_app()
-
-    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
-        rebind = client.get(
-            "/api/sessions/sess-123/artifacts",
-            headers={"host": "attacker.example:8000"},
         )
-        assert rebind.status_code == 403
-
-        bad_origin = client.get(
-            "/api/sessions/sess-123/artifacts",
-            headers={"host": "127.0.0.1:8000", "origin": "https://evil.example"},
+        assert ws.receive_json() == {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"sessionId": "sess_created_1"},
+        }
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [{"name": "blocked", "command": "/bin/sh", "args": []}],
+                },
+            }
         )
-        assert bad_origin.status_code == 403
-
-        listed = client.get(
-            "/api/sessions/sess-123/artifacts",
-            headers={"host": "127.0.0.1:8000"},
-        )
-        assert listed.status_code == 200
-        names = [item["name"] for item in listed.json()["artifacts"]]
-        assert set(names) == {"walkthrough.md", "plan.md"}
-
-        doc = client.get(
-            "/api/sessions/sess-123/artifacts/walkthrough.md",
-            headers={"host": "127.0.0.1:8000"},
-        )
-        assert doc.status_code == 200
-        body = doc.json()
-        assert body["summary"] == "Verified ACP walkthrough."
-        assert body["content"] == "# Walkthrough\nAll green.\n"
-
-        empty_sess = client.get(
-            "/api/sessions/sess-empty/artifacts",
-            headers={"host": "127.0.0.1:8000"},
-        )
-        assert empty_sess.status_code == 200
-        assert empty_sess.json()["artifacts"] == []
-
-        assert (
-            client.get(
-                "/api/sessions/sess-123/artifacts/escape.md",
-                headers={"host": "127.0.0.1:8000"},
-            ).status_code
-            == 404
-        )
-        assert (
-            client.get(
-                "/api/sessions/sess-123/artifacts/.hidden.md",
-                headers={"host": "127.0.0.1:8000"},
-            ).status_code
-            == 400
-        )
-        assert (
-            client.get(
-                "/api/sessions/sess-123/artifacts/walkthrough.md.metadata.json",
-                headers={"host": "127.0.0.1:8000"},
-            ).status_code
-            == 400
-        )
-        assert (
-            client.get(
-                "/api/sessions/..%2Fescape/artifacts",
-                headers={"host": "127.0.0.1:8000"},
-            ).status_code
-            in (400, 404)
-        )
+        assert ws.receive_json()["error"]["code"] == JSONRPC_INVALID_PARAMS
 
 
-def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
-    tmp_path: Path,
-) -> None:
-    """Collects ``models``, ``modes``, ``configOptions``, ``tier``, commands, & ``usage_update``."""
+def test_session_runtime_state_tracking_via_ws(tmp_path: Path) -> None:
+    """Tracks session lifecycle, config option updates, mode switches, & post-close errors."""
     capture_path = tmp_path / "runtime_state_capture.jsonl"
     script = _write_session_agent_script(
         tmp_path / "runtime_state_agent.py",
@@ -724,31 +683,6 @@ def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
         usage_notif = ws.receive_json()
         assert cmd_notif["params"]["update"]["sessionUpdate"] == "available_commands_update"
         assert usage_notif["params"]["update"]["sessionUpdate"] == "usage_update"
-
-        assert (
-            client.get(
-                f"/api/sessions/{sid}/state",
-                headers={"host": "attacker.example:8000"},
-            ).status_code
-            == 403
-        )
-
-        state_resp = client.get(
-            f"/api/sessions/{sid}/state",
-            headers={"host": "127.0.0.1:8000"},
-        )
-        assert state_resp.status_code == 200
-        state = state_resp.json()
-        assert state["models"]["currentModelId"] == "gemini-4-neon-high"
-        assert state["modes"]["currentModeId"] == "default"
-        assert [c["id"] for c in state["config_options"]] == ["model", "thought_level", "mode"]
-        assert state["tier"] == {
-            "id": "g1-ultra-lite-tier",
-            "name": "Google AI Ultra",
-            "upgradeUri": "https://antigravity.google/g1-upgrade",
-        }
-        assert [cmd["name"] for cmd in state["available_commands"]] == ["plan", "grill-me"]
-        assert state["usage"] == {"used": 0, "size": 1048576, "cost": None}
 
         ws.send_json(
             {
@@ -791,14 +725,6 @@ def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
         )
         assert ws.receive_json() == {"jsonrpc": "2.0", "id": 6, "result": {}}
 
-        updated_state = client.get(
-            f"/api/sessions/{sid}/state",
-            headers={"host": "127.0.0.1:8000"},
-        ).json()
-        assert updated_state["config_options"][0]["currentValue"] == "gemini-4-carbon"
-        assert updated_state["modes"]["currentModeId"] == "plan"
-        assert updated_state["config_options"][2]["currentValue"] == "plan"
-
         ws.send_json(
             {
                 "jsonrpc": "2.0",
@@ -815,24 +741,20 @@ def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
         assert orch_resp["id"] == 7
         assert orch_resp["result"]["configOptions"][0]["currentValue"] == "gemini-pro-orchestrator"
 
-        orch_state = client.get(
-            f"/api/sessions/{sid}/state",
-            headers={"host": "127.0.0.1:8000"},
-        ).json()
-        assert orch_state["config_options"][0]["currentValue"] == "gemini-pro-orchestrator"
-        assert orch_state["models"]["currentModelId"] == "gemini-pro-orchestrator"
-
         ws.send_json(
             {"jsonrpc": "2.0", "id": 8, "method": "session/close", "params": {"sessionId": sid}}
         )
         assert ws.receive_json()["id"] == 8
-        assert (
-            client.get(
-                f"/api/sessions/{sid}/state",
-                headers={"host": "127.0.0.1:8000"},
-            ).status_code
-            == 404
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "default"},
+            }
         )
+        assert ws.receive_json()["error"]["code"] == ACP_RESOURCE_NOT_FOUND
 
     captured = [
         json.loads(line)

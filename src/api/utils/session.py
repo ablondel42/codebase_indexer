@@ -1,22 +1,31 @@
-"""Stateless validation and curated MCP injection helpers for ACP session lifecycle."""
+"""Stateless validation, MCP policy enforcement, and root-set extraction for sessions."""
 
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+from pydantic import ValidationError as PydanticValidationError
 
 from api.models.acp import AgentCapabilities
-from api.models.config import ApiServerConfig
+from api.models.config import AcpServerConfig, McpPolicyConfig
 from api.models.session import (
+    McpServerHttp,
+    McpServerSse,
+    McpServerStdio,
     SessionCloseParams,
     SessionDeleteParams,
     SessionListParams,
     SessionLoadParams,
     SessionNewParams,
     SessionResumeParams,
+    SessionRootSet,
     SystemPromptConfig,
 )
+from api.utils.errors import pydantic_error_to_acp_error
 from api.utils.security import sanitize_meta_dict
+from core.models.exceptions import AcpInvalidParamsError, AcpMethodNotFoundError, AcpSecurityError
 
 SRC_ROOT: Path = Path(__file__).resolve().parents[2]
 
@@ -32,8 +41,8 @@ SESSION_METHODS: frozenset[str] = frozenset(
 )
 
 
-def check_session_capability(method: str, caps: AgentCapabilities) -> str | None:
-    """Return ``None`` when ``method`` is supported by ``caps``, or a denial message."""
+def check_session_capability(method: str, caps: AgentCapabilities) -> None:
+    """Verify ``method`` is advertised by ``caps``, raising ``-32601`` otherwise."""
     sc = caps.session_capabilities
     support_by_method: dict[str, bool] = {
         "session/new": True,
@@ -43,19 +52,18 @@ def check_session_capability(method: str, caps: AgentCapabilities) -> str | None
         "session/close": sc.close is not None,
         "session/delete": sc.delete is not None,
     }
-    if support_by_method.get(method, True):
-        return None
-    return f"Agent did not advertise capability support for '{method}'"
+    if not support_by_method.get(method, True):
+        raise AcpMethodNotFoundError(f"Agent did not advertise capability support for '{method}'")
 
 
 def validate_absolute_dir(raw_path: str, *, label: str) -> str:
     """Verify ``raw_path`` is an absolute path to an existing directory on disk."""
     candidate = Path(raw_path)
     if not candidate.is_absolute():
-        raise ValueError(f"{label} must be an absolute path: {raw_path!r}")
+        raise AcpInvalidParamsError(f"{label} must be an absolute path: {raw_path!r}")
     resolved = candidate.resolve()
     if not resolved.exists() or not resolved.is_dir():
-        raise ValueError(f"{label} directory does not exist: {raw_path!r}")
+        raise AcpInvalidParamsError(f"{label} directory does not exist: {raw_path!r}")
     return str(resolved)
 
 
@@ -67,7 +75,9 @@ def validate_additional_dirs(
     if dirs is None:
         return None
     if caps.session_capabilities.additional_directories is None:
-        raise ValueError("Agent did not advertise sessionCapabilities.additionalDirectories")
+        raise AcpInvalidParamsError(
+            "Agent did not advertise sessionCapabilities.additionalDirectories"
+        )
     return [validate_absolute_dir(entry, label="additionalDirectories") for entry in dirs]
 
 
@@ -80,16 +90,14 @@ def validate_system_prompt_config(
         return None
     sys_cap = caps.session_capabilities.system_prompt
     if sys_cap is None:
-        raise ValueError("Agent did not advertise sessionCapabilities.systemPrompt")
-    modes = sys_cap.get("mode") if isinstance(sys_cap, Mapping) else None
+        raise AcpInvalidParamsError("Agent did not advertise sessionCapabilities.systemPrompt")
+    if prompt.mode == "append":
+        return prompt.model_dump(by_alias=True, exclude_none=True)
     if prompt.mode == "override":
-        if not isinstance(modes, Mapping) or modes.get("override") is None:
-            raise ValueError("Agent did not advertise systemPrompt override mode")
-    elif prompt.mode != "append" and (
-        not isinstance(modes, Mapping) or modes.get(prompt.mode) is None
-    ):
-        raise ValueError(f"Unsupported systemPrompt mode: {prompt.mode!r}")
-    return prompt.model_dump(by_alias=True)
+        if sys_cap.mode is None or sys_cap.mode.override is None:
+            raise AcpInvalidParamsError("Agent did not advertise systemPrompt override mode")
+        return prompt.model_dump(by_alias=True, exclude_none=True)
+    raise AcpInvalidParamsError(f"Unsupported systemPrompt mode: {prompt.mode!r}")
 
 
 def build_cbi_stdio_mcp_server(db_path: Path) -> dict[str, Any]:
@@ -102,42 +110,93 @@ def build_cbi_stdio_mcp_server(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _validate_stdio_mcp_entry(
+    entry: Mapping[str, Any],
+    mcp_policy: McpPolicyConfig,
+) -> dict[str, Any]:
+    """Validate and enforce fail-closed policy for client-supplied stdio MCP servers."""
+    try:
+        parsed = McpServerStdio.model_validate(entry)
+    except PydanticValidationError as exc:
+        raise pydantic_error_to_acp_error(exc, label="stdio MCP server") from exc
+
+    cmd_path = Path(parsed.command)
+    if not cmd_path.is_absolute():
+        raise AcpInvalidParamsError("Stdio MCP server 'command' must be an absolute path")
+
+    allowed_cmds = set(mcp_policy.allowed_stdio_commands)
+    is_allowed = mcp_policy.allow_client_stdio or (
+        parsed.command in allowed_cmds or cmd_path.name in allowed_cmds
+    )
+    if not is_allowed:
+        raise AcpSecurityError("Client-supplied stdio MCP servers are blocked by security policy")
+    return parsed.model_dump(by_alias=True, exclude_none=True)
+
+
+def _validate_remote_mcp_url(url: str, *, allow_insecure_http: bool) -> None:
+    """Validate remote MCP endpoint scheme and reject embedded credentials."""
+    try:
+        parsed = urlsplit(url.strip())
+    except ValueError as exc:
+        raise AcpInvalidParamsError(f"Invalid MCP server URL: {exc}") from exc
+    scheme = parsed.scheme.lower()
+    allowed = ("https", "http") if allow_insecure_http else ("https",)
+    if scheme not in allowed or not parsed.netloc:
+        raise AcpSecurityError("Remote MCP server URL must use an allowed HTTPS scheme and host")
+    if parsed.username or parsed.password:
+        raise AcpSecurityError("Remote MCP server URL must not embed credentials")
+
+
+def _select_remote_mcp_model(
+    transport: object,
+    caps: AgentCapabilities,
+    mcp_policy: McpPolicyConfig,
+) -> type[McpServerHttp] | type[McpServerSse]:
+    """Verify HTTP/SSE MCP transport policy & capabilities and return model class."""
+    if transport == "http":
+        if not mcp_policy.allow_http:
+            raise AcpSecurityError("HTTP MCP servers are disabled by server policy")
+        if not caps.mcp_capabilities.http:
+            raise AcpInvalidParamsError("Agent did not advertise mcpCapabilities.http")
+        return McpServerHttp
+    if transport == "sse":
+        if not mcp_policy.allow_sse:
+            raise AcpSecurityError("SSE MCP servers are disabled by server policy")
+        if not caps.mcp_capabilities.sse:
+            raise AcpInvalidParamsError("Agent did not advertise mcpCapabilities.sse")
+        return McpServerSse
+    raise AcpInvalidParamsError(f"Unsupported MCP transport type: {transport!r}")
+
+
 def _validate_remote_mcp_entry(
     entry: Mapping[str, Any],
     caps: AgentCapabilities,
+    mcp_policy: McpPolicyConfig,
 ) -> dict[str, Any]:
-    """Reject client-supplied stdio servers and validate HTTP/SSE MCP transport support."""
+    """Validate HTTP/SSE/stdio MCP server transport, agent capabilities, and URL hygiene."""
     transport = entry.get("type", "stdio")
     if transport == "stdio":
-        raise ValueError("Client-supplied stdio MCP servers are blocked for security")
-    if transport == "http" and not caps.mcp_capabilities.http:
-        raise ValueError("Agent did not advertise mcpCapabilities.http")
-    if transport == "sse" and not caps.mcp_capabilities.sse:
-        raise ValueError("Agent did not advertise mcpCapabilities.sse")
-    if transport not in ("http", "sse"):
-        raise ValueError(f"Unsupported MCP transport type: {transport!r}")
-
-    name = entry.get("name")
-    url = entry.get("url")
-    headers = entry.get("headers")
-    if not isinstance(name, str) or not name or not isinstance(url, str) or not url:
-        raise ValueError("Remote MCP server requires non-empty 'name' and 'url'")
-    if not isinstance(headers, list):
-        raise ValueError("Remote MCP server requires 'headers' array")
-    return {"type": transport, "name": name, "url": url, "headers": headers}
+        return _validate_stdio_mcp_entry(entry, mcp_policy)
+    model_cls = _select_remote_mcp_model(transport, caps, mcp_policy)
+    try:
+        parsed = model_cls.model_validate(entry)
+    except PydanticValidationError as exc:
+        raise pydantic_error_to_acp_error(exc, label="remote MCP server") from exc
+    _validate_remote_mcp_url(parsed.url, allow_insecure_http=mcp_policy.allow_insecure_http_urls)
+    return parsed.model_dump(by_alias=True, exclude_none=True)
 
 
 def sanitize_session_mcp_servers(
     raw_servers: Sequence[Mapping[str, Any]],
     caps: AgentCapabilities,
+    mcp_policy: McpPolicyConfig,
     *,
-    include_cbi_mcp: bool,
-    cbi_db_path: Path | None,
+    include_cbi_mcp: bool = False,
 ) -> list[dict[str, Any]]:
-    """Validate remote MCP entries and optionally inject curated ``codebase-indexer`` MCP."""
-    validated = [_validate_remote_mcp_entry(srv, caps) for srv in raw_servers]
-    if include_cbi_mcp and cbi_db_path is not None:
-        validated.append(build_cbi_stdio_mcp_server(cbi_db_path))
+    """Validate MCP servers against ``mcp_policy`` and optionally inject curated CBI MCP."""
+    validated = [_validate_remote_mcp_entry(srv, caps, mcp_policy) for srv in raw_servers]
+    if include_cbi_mcp and mcp_policy.enable_cbi_mcp and mcp_policy.cbi_db_path is not None:
+        validated.append(build_cbi_stdio_mcp_server(mcp_policy.cbi_db_path))
     return validated
 
 
@@ -158,36 +217,39 @@ def _extract_meta_with_cbi_flag(
 def _build_workspace_session_params(
     parsed: SessionNewParams | SessionLoadParams | SessionResumeParams,
     caps: AgentCapabilities,
-    config: ApiServerConfig,
-) -> dict[str, Any]:
-    """Assemble sanitized outbound payload for ``session/new``, ``load``, or ``resume``."""
+    mcp_policy: McpPolicyConfig,
+) -> tuple[dict[str, Any], SessionRootSet]:
+    """Assemble sanitized payload and ``SessionRootSet`` for ``new``/``load``/``resume``."""
     include_cbi, scrubbed_meta = _extract_meta_with_cbi_flag(
         parsed.meta,
-        enable_cbi_mcp=config.enable_cbi_mcp,
+        enable_cbi_mcp=mcp_policy.enable_cbi_mcp,
     )
+    resolved_cwd = validate_absolute_dir(parsed.cwd, label="cwd")
+    extra_dirs = validate_additional_dirs(parsed.additional_directories, caps)
     payload: dict[str, Any] = {
-        "cwd": validate_absolute_dir(parsed.cwd, label="cwd"),
+        "cwd": resolved_cwd,
         "mcpServers": sanitize_session_mcp_servers(
             parsed.mcp_servers,
             caps,
+            mcp_policy,
             include_cbi_mcp=include_cbi,
-            cbi_db_path=config.cbi_db_path,
         ),
     }
     if isinstance(parsed, (SessionLoadParams, SessionResumeParams)):
         payload["sessionId"] = parsed.session_id
-
-    extra_dirs = validate_additional_dirs(parsed.additional_directories, caps)
     if extra_dirs is not None:
         payload["additionalDirectories"] = extra_dirs
-
     sys_prompt = validate_system_prompt_config(parsed.system_prompt, caps)
     if sys_prompt is not None:
         payload["systemPrompt"] = sys_prompt
-
     if scrubbed_meta is not None:
         payload["_meta"] = scrubbed_meta
-    return payload
+
+    root_set = SessionRootSet(
+        cwd=resolved_cwd,
+        additional_directories=tuple(extra_dirs or ()),
+    )
+    return payload, root_set
 
 
 def _build_list_params(raw_params: Mapping[str, Any]) -> dict[str, Any]:
@@ -204,51 +266,52 @@ def _build_list_params(raw_params: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _parse_setup_model(
+    method: str,
+    params_map: Mapping[str, Any],
+) -> SessionNewParams | SessionLoadParams | SessionResumeParams:
+    """Validate ``session/new``, ``session/load``, or ``session/resume`` request params."""
+    if method == "session/new":
+        return SessionNewParams.model_validate(params_map)
+    if method == "session/load":
+        return SessionLoadParams.model_validate(params_map)
+    return SessionResumeParams.model_validate(params_map)
+
+
 def prepare_session_params(
     method: str,
     raw_params: object,
     caps: AgentCapabilities,
-    config: ApiServerConfig,
-) -> dict[str, Any]:
-    """Validate and sanitize parameters for any ``session/*`` setup, list, or delete call."""
+    config: AcpServerConfig,
+) -> tuple[dict[str, Any], SessionRootSet | None]:
+    """Validate capability & params for ``session/*`` calls, returning ``(payload, root_set)``."""
+    check_session_capability(method, caps)
     if raw_params is None:
         params_map: Mapping[str, Any] = {}
     elif isinstance(raw_params, Mapping):
         params_map = raw_params
     else:
-        raise ValueError(f"Invalid {method} params: expected JSON object")
+        raise AcpInvalidParamsError(f"Invalid {method} params: expected JSON object")
 
-    if method == "session/new":
-        return _build_workspace_session_params(
-            SessionNewParams.model_validate(params_map),
-            caps,
-            config,
+    try:
+        if method in ("session/new", "session/load", "session/resume"):
+            parsed_setup = _parse_setup_model(method, params_map)
+            return _build_workspace_session_params(parsed_setup, caps, config.mcp)
+        if method == "session/list":
+            return _build_list_params(params_map), None
+        parsed_id = (
+            SessionCloseParams.model_validate(params_map)
+            if method == "session/close"
+            else SessionDeleteParams.model_validate(params_map)
         )
-    if method == "session/load":
-        return _build_workspace_session_params(
-            SessionLoadParams.model_validate(params_map),
-            caps,
-            config,
-        )
-    if method == "session/resume":
-        return _build_workspace_session_params(
-            SessionResumeParams.model_validate(params_map),
-            caps,
-            config,
-        )
-    if method == "session/list":
-        return _build_list_params(params_map)
+    except PydanticValidationError as exc:
+        raise pydantic_error_to_acp_error(exc, label=method) from exc
 
-    parsed_id = (
-        SessionCloseParams.model_validate(params_map)
-        if method == "session/close"
-        else SessionDeleteParams.model_validate(params_map)
-    )
     out: dict[str, Any] = {"sessionId": parsed_id.session_id}
     scrubbed_meta = sanitize_meta_dict(parsed_id.meta)
     if scrubbed_meta is not None:
         out["_meta"] = scrubbed_meta
-    return out
+    return out, None
 
 
 __all__ = [

@@ -1,13 +1,13 @@
-"""Stateless parsers, patchers, and validators for ACP per-session runtime metadata."""
+"""Stateless parsers, patchers, and validators for ACP session runtime metadata."""
 
+import json
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlsplit
 
 from pydantic import ValidationError as PydanticValidationError
 
+from api.models.acp import ClientCapabilities
 from api.models.session import (
-    AntigravityTierInfo,
     AvailableCommand,
     SessionConfigOption,
     SessionConfigSelectChoice,
@@ -19,41 +19,12 @@ from api.models.session import (
     SessionSetModeParams,
     SessionUsageSnapshot,
 )
+from api.utils.errors import pydantic_error_to_acp_error
 from api.utils.security import sanitize_meta_dict
+from core.models.exceptions import AcpInvalidParamsError
 from core.utils.logging import get_logger
 
 logger = get_logger("api.utils.session_state")
-
-
-def sanitize_https_uri(raw_uri: str | None) -> str | None:
-    """Return trimmed ``https://`` URL or ``None`` for non-HTTPS/malformed URIs."""
-    if not raw_uri:
-        return None
-    cleaned = raw_uri.strip()
-    try:
-        parsed = urlsplit(cleaned)
-    except ValueError as exc:
-        logger.debug("Dropping malformed tier upgradeUri %r: %s", raw_uri, exc)
-        return None
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        return None
-    return cleaned
-
-
-def extract_antigravity_tier(raw_meta: object) -> AntigravityTierInfo | None:
-    """Extract and sanitize ``_meta.antigravity.tier`` from an ACP result payload."""
-    if not isinstance(raw_meta, Mapping):
-        return None
-    agy_meta = raw_meta.get("antigravity")
-    raw_tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
-    if not isinstance(raw_tier, Mapping):
-        return None
-    try:
-        parsed = AntigravityTierInfo.model_validate(raw_tier)
-    except PydanticValidationError as exc:
-        logger.debug("Ignoring malformed _meta.antigravity.tier: %s", exc)
-        return None
-    return parsed.model_copy(update={"upgrade_uri": sanitize_https_uri(parsed.upgrade_uri)})
 
 
 def _parse_models_state(raw_models: object) -> SessionModelsState | None:
@@ -158,7 +129,6 @@ def apply_session_setup_result(
         if has_options
         else base.config_options
     )
-    tier = extract_antigravity_tier(result.get("_meta")) or base.tier
     next_models = (
         models if models is not None else _sync_models_with_options(base.models, config_options)
     )
@@ -168,7 +138,6 @@ def apply_session_setup_result(
             "models": next_models,
             "modes": next_modes,
             "config_options": config_options,
-            "tier": tier,
         }
     )
 
@@ -256,6 +225,72 @@ def apply_session_update_to_state(
     return patched
 
 
+def _supports_boolean_config_options(ws_caps: ClientCapabilities) -> bool:
+    """Return ``True`` when the client advertised ``session.configOptions.boolean``."""
+    return bool(
+        ws_caps.session is not None
+        and ws_caps.session.config_options is not None
+        and ws_caps.session.config_options.boolean is not None
+    )
+
+
+def _strip_boolean_options_list(options: object) -> tuple[list[Any], bool]:
+    """Filter out ``type == 'boolean'`` entries and return ``(filtered, changed)``."""
+    if not isinstance(options, list):
+        return [], False
+    filtered = [
+        item for item in options
+        if not (isinstance(item, Mapping) and item.get("type") == "boolean")
+    ]
+    return filtered, len(filtered) != len(options)
+
+
+def _rewrite_update_config_options(
+    loaded: Mapping[str, Any],
+    params_obj: Mapping[str, Any],
+    update_obj: Mapping[str, Any],
+) -> str | None:
+    """Strip boolean options from ``session/update`` ``config_option_update`` if needed."""
+    filtered, changed = _strip_boolean_options_list(update_obj.get("configOptions"))
+    if not changed:
+        return None
+    rewritten_update = {**update_obj, "configOptions": filtered}
+    rewritten_params = {**params_obj, "update": rewritten_update}
+    return json.dumps(
+        {**loaded, "params": rewritten_params},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def filter_boolean_config_options(
+    raw_line: str,
+    loaded: Mapping[str, Any],
+    ws_caps: ClientCapabilities,
+) -> str:
+    """Strip unadvertised ``type: 'boolean'`` config options from outbound frames."""
+    if _supports_boolean_config_options(ws_caps):
+        return raw_line
+    result_obj = loaded.get("result")
+    if isinstance(result_obj, Mapping) and "configOptions" in result_obj:
+        filtered, changed = _strip_boolean_options_list(result_obj.get("configOptions"))
+        if changed:
+            rewritten = {**loaded, "result": {**result_obj, "configOptions": filtered}}
+            return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False)
+        return raw_line
+    params_obj = loaded.get("params")
+    update_obj = params_obj.get("update") if isinstance(params_obj, Mapping) else None
+    if (
+        isinstance(params_obj, Mapping)
+        and isinstance(update_obj, Mapping)
+        and "configOptions" in update_obj
+    ):
+        rewritten = _rewrite_update_config_options(loaded, params_obj, update_obj)
+        if rewritten is not None:
+            return rewritten
+    return raw_line
+
+
 def _collect_select_values(option: SessionConfigOption) -> frozenset[str]:
     """Flatten allowed string values across flat or grouped ``SessionConfigOption`` choices."""
     allowed: set[str] = set()
@@ -275,32 +310,54 @@ def _validate_against_known_option(
     """Verify ``value`` and optional ``type`` match ``option``'s advertised schema."""
     if option.type == "boolean":
         if not isinstance(value, bool):
-            raise ValueError(f"Config option '{option.id}' requires a boolean value")
+            raise AcpInvalidParamsError(f"Config option '{option.id}' requires a boolean value")
         return
     if declared_type == "boolean" or isinstance(value, bool):
-        raise ValueError(f"Config option '{option.id}' requires a string select value")
+        raise AcpInvalidParamsError(
+            f"Config option '{option.id}' requires a string select value"
+        )
     allowed = _collect_select_values(option)
     if allowed and value not in allowed:
-        raise ValueError(f"Unsupported value {value!r} for config option '{option.id}'")
+        raise AcpInvalidParamsError(
+            f"Unsupported value {value!r} for config option '{option.id}'"
+        )
+
+
+def _validate_config_option_value(
+    parsed: SessionSetConfigOptionParams,
+    state: SessionRuntimeState | None,
+    *,
+    allow_boolean: bool,
+) -> None:
+    """Validate ``parsed.value`` against boolean capability and advertised ``configOptions``."""
+    if isinstance(parsed.value, bool) and not allow_boolean:
+        raise AcpInvalidParamsError("Boolean config options were not advertised")
+    if isinstance(parsed.value, str) and not parsed.value:
+        raise AcpInvalidParamsError("Config option value cannot be empty")
+    if state is not None and state.config_options:
+        matched = next((opt for opt in state.config_options if opt.id == parsed.config_id), None)
+        if matched is None:
+            raise AcpInvalidParamsError(f"Unknown session configId: '{parsed.config_id}'")
+        _validate_against_known_option(matched, parsed.value, parsed.type)
 
 
 def prepare_set_config_option_params(
     raw_params: object,
     state: SessionRuntimeState | None,
+    *,
+    allow_boolean: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Validate ``session/set_config_option`` against ``configOptions`` and scrub ``_meta``."""
     if not isinstance(raw_params, Mapping):
-        raise ValueError("Invalid session/set_config_option params: expected JSON object")
-    parsed = SessionSetConfigOptionParams.model_validate(raw_params)
-    if isinstance(parsed.value, str) and not parsed.value:
-        raise ValueError("Config option value cannot be empty")
+        raise AcpInvalidParamsError(
+            "Invalid session/set_config_option params: expected JSON object"
+        )
+    try:
+        parsed = SessionSetConfigOptionParams.model_validate(raw_params)
+    except PydanticValidationError as exc:
+        raise pydantic_error_to_acp_error(exc, label="session/set_config_option") from exc
 
-    if state is not None and state.config_options:
-        matched = next((opt for opt in state.config_options if opt.id == parsed.config_id), None)
-        if matched is None:
-            raise ValueError(f"Unknown session configId: '{parsed.config_id}'")
-        _validate_against_known_option(matched, parsed.value, parsed.type)
-
+    _validate_config_option_value(parsed, state, allow_boolean=allow_boolean)
     payload: dict[str, Any] = {
         "sessionId": parsed.session_id,
         "configId": parsed.config_id,
@@ -322,12 +379,16 @@ def prepare_set_mode_params(
 ) -> tuple[str, dict[str, Any]]:
     """Validate ``session/set_mode`` against advertised ``availableModes`` and scrub ``_meta``."""
     if not isinstance(raw_params, Mapping):
-        raise ValueError("Invalid session/set_mode params: expected JSON object")
-    parsed = SessionSetModeParams.model_validate(raw_params)
+        raise AcpInvalidParamsError("Invalid session/set_mode params: expected JSON object")
+    try:
+        parsed = SessionSetModeParams.model_validate(raw_params)
+    except PydanticValidationError as exc:
+        raise pydantic_error_to_acp_error(exc, label="session/set_mode") from exc
+
     if state is not None and state.modes is not None and state.modes.available_modes:
         allowed_ids = {mode.id for mode in state.modes.available_modes}
         if parsed.mode_id not in allowed_ids:
-            raise ValueError(f"Unknown session modeId: '{parsed.mode_id}'")
+            raise AcpInvalidParamsError(f"Unknown session modeId: '{parsed.mode_id}'")
 
     payload: dict[str, Any] = {
         "sessionId": parsed.session_id,
@@ -344,8 +405,7 @@ __all__ = [
     "apply_mode_change",
     "apply_session_setup_result",
     "apply_session_update_to_state",
-    "extract_antigravity_tier",
+    "filter_boolean_config_options",
     "prepare_set_config_option_params",
     "prepare_set_mode_params",
-    "sanitize_https_uri",
 ]

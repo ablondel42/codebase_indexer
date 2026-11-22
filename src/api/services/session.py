@@ -1,7 +1,8 @@
-"""ACP connection initialization state machine and agent bridge session."""
+"""Pure ACP v1 connection state machine, capability negotiation, and agent bridge."""
 
 import json
-from collections.abc import Awaitable, Callable, Mapping
+import time
+from collections.abc import Mapping
 from typing import Any
 
 from pydantic import ValidationError as PydanticValidationError
@@ -9,9 +10,6 @@ from pydantic import ValidationError as PydanticValidationError
 from api.models.acp import (
     ACP_AUTH_REQUIRED,
     ACP_RESOURCE_NOT_FOUND,
-    JSONRPC_INVALID_PARAMS,
-    JSONRPC_INVALID_REQUEST,
-    JSONRPC_METHOD_NOT_FOUND,
     SUPPORTED_ACP_VERSIONS,
     AcpAuthState,
     AcpConnectionState,
@@ -24,80 +22,89 @@ from api.models.acp import (
     PromptCapabilities,
     SessionStepOutcome,
 )
-from api.models.config import ApiServerConfig
-from api.models.session import SessionRuntimeState
-from api.services.chat import SessionChatRecorder
-from api.services.process import AgyAcpProcess
+from api.models.config import AcpServerConfig, LogFormat
+from api.models.session import SessionRootSet, SessionRuntimeState
+from api.services.logging import AcpAuditLogger, AcpLogContext
+from api.services.process import AcpSubprocessTransport
 from api.services.prompt import PromptTurnManager
-from api.utils.chat import extract_hydrate_only_flag, extract_metadata_only_flag
+from api.utils.errors import exception_to_jsonrpc_frame, pydantic_error_to_acp_error
 from api.utils.formatting import (
     describe_jsonrpc_frame,
     format_raw_frame_for_log,
     indent_json_payload,
 )
-from api.utils.jsonrpc import extract_request_id, format_jsonrpc_error, parse_client_frame
-from api.utils.prompt import scrub_outbound_message_meta
+from api.utils.jsonrpc import extract_request_id, parse_client_frame
+from api.utils.prompt import is_valid_extension_method, scrub_outbound_message_meta
 from api.utils.security import (
-    build_effective_client_capabilities,
-    clamp_client_capabilities,
+    extract_traceparent,
     find_advertised_auth_method,
+    negotiate_client_capabilities,
     sanitize_authenticate_params,
     sanitize_meta_dict,
 )
-from api.utils.session import (
-    SESSION_METHODS,
-    check_session_capability,
-    prepare_session_params,
-)
+from api.utils.session import SESSION_METHODS, prepare_session_params
 from api.utils.session_state import (
     apply_config_options_result,
     apply_mode_change,
     apply_session_setup_result,
     apply_session_update_to_state,
+    filter_boolean_config_options,
     prepare_set_config_option_params,
     prepare_set_mode_params,
 )
-from core.models.exceptions import AcpError
-from core.ports.chat import ChatStoreProtocol
+from core.models.exceptions import (
+    AcpError,
+    AcpInvalidParamsError,
+    AcpInvalidRequestError,
+    AcpMethodNotFoundError,
+    AcpTransportError,
+)
 from core.utils.logging import get_logger
 
 logger = get_logger("api.services.session")
 
 
 class AcpConnectionSession:
-    """Enforces ACP initialization ordering, capability clamping, and agent bridging."""
+    """Enforces ACP v1 initialization, capability gates, security policy, and bridging."""
 
     def __init__(
         self,
         connection_id: str,
-        config: ApiServerConfig,
+        config: AcpServerConfig,
         *,
-        process: AgyAcpProcess | None = None,
-        chat_store: ChatStoreProtocol | None = None,
-        pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None,
-        on_prompt_finished: Callable[[str], Awaitable[None]] | None = None,
+        process: AcpSubprocessTransport | None = None,
+        audit: AcpAuditLogger | None = None,
     ) -> None:
         """Create a new uninitialized session bound to ``connection_id``."""
         self._connection_id = connection_id
         self._config = config
-        self._process = process if process is not None else AgyAcpProcess(config)
+        self._audit = (
+            audit
+            if audit is not None
+            else AcpAuditLogger(enabled=config.logging.log_audit_events)
+        )
+        self._process = process if process is not None else AcpSubprocessTransport(config)
         self._state = AcpConnectionState.UNINITIALIZED
         self._initialize_result: InitializeResult | None = None
-        self._client_capabilities = ClientCapabilities()
+        self._agent_capabilities = ClientCapabilities()
+        self._ws_client_capabilities = ClientCapabilities()
         self._auth_state = AcpAuthState.UNKNOWN
         self._active_auth_method_id: str | None = None
         self._active_session_ids: set[str] = set()
         self._session_states: dict[str, SessionRuntimeState] = {}
-        self._pending_rpc_methods: dict[int | str, tuple[str, str | None]] = {}
+        self._pending_rpc_methods: dict[int | str, tuple[str, str | None, float]] = {}
+        self._pending_root_sets: dict[int | str, SessionRootSet] = {}
         self._pending_mode_targets: dict[int | str, str] = {}
-        self._turns = PromptTurnManager(connection_id)
-        self._chat = SessionChatRecorder(connection_id, chat_store)
-        self._pre_setup_sync = pre_setup_sync
-        self._on_prompt_finished = on_prompt_finished
+        self._turns = PromptTurnManager(
+            connection_id,
+            config,
+            self._audit,
+            self._send_bridge_payload_to_agent,
+        )
 
     @property
     def connection_id(self) -> str:
-        """Return server-assigned ``Acp-Connection-Id`` for this WebSocket."""
+        """Return server-assigned connection identifier for this WebSocket."""
         return self._connection_id
 
     @property
@@ -112,8 +119,13 @@ class AcpConnectionSession:
 
     @property
     def client_capabilities(self) -> ClientCapabilities:
-        """Return clamped ``ClientCapabilities`` negotiated during ``initialize``."""
-        return self._client_capabilities
+        """Return effective agent-facing ``ClientCapabilities`` negotiated during ``initialize``."""
+        return self._agent_capabilities
+
+    @property
+    def ws_client_capabilities(self) -> ClientCapabilities:
+        """Return effective capabilities advertised by the connected WebSocket client."""
+        return self._ws_client_capabilities
 
     @property
     def auth_state(self) -> AcpAuthState:
@@ -127,7 +139,7 @@ class AcpConnectionSession:
 
     @property
     def active_session_ids(self) -> frozenset[str]:
-        """Return set of session IDs currently active on this connection."""
+        """Return set of root session IDs currently active on this connection."""
         return frozenset(self._active_session_ids)
 
     @property
@@ -139,6 +151,11 @@ class AcpConnectionSession:
     def pending_permission_ids(self) -> frozenset[int | str]:
         """Return pending ``session/request_permission`` JSON-RPC request IDs."""
         return self._turns.pending_permission_ids
+
+    @property
+    def pending_elicitation_ids(self) -> frozenset[int | str]:
+        """Return pending ``elicitation/create`` JSON-RPC request IDs."""
+        return self._turns.pending_elicitation_ids
 
     @property
     def child_session_ids(self) -> frozenset[str]:
@@ -154,117 +171,114 @@ class AcpConnectionSession:
         """Return collected ``SessionRuntimeState`` for ``session_id``, or ``None``."""
         return self._session_states.get(session_id)
 
-    async def flush_session_chat(self, session_id: str) -> None:
-        """Persist any pending buffered live chat chunks for ``session_id``."""
-        await self._chat.flush_session(session_id)
+    def _is_debug_errors(self) -> bool:
+        """Expose detailed internal error text only in DEV pretty-log DEBUG mode."""
+        return (
+            self._config.logging.format == LogFormat.PRETTY
+            and self._config.logging.level == "DEBUG"
+        )
 
-    def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
-        """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
-        for frame in outcome.frames:
-            label, pretty = format_raw_frame_for_log(frame)
-            logger.warning("[%s] Bridge -> UI (%s)\n%s", self._connection_id, label, pretty)
-        return outcome
-
-    def _validate_init_params(
+    def _error_outcome(
         self,
-        req_id: int | str,
-        raw_params: object,
-    ) -> InitializeParams | SessionStepOutcome:
-        """Validate ``initialize`` parameters or return a JSON-RPC ``-32602`` error outcome."""
-        if not isinstance(raw_params, Mapping):
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        "Invalid initialize params: expected JSON object",
-                    ),
-                )
-            )
-        try:
-            return InitializeParams.model_validate(raw_params)
-        except PydanticValidationError as exc:
-            logger.debug("Invalid initialize params on %s: %s", self._connection_id, exc)
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        "Invalid initialize params",
-                    ),
-                )
-            )
-
-    def _check_pre_init_gate(
-        self,
-        msg: Mapping[str, Any],
+        exc: AcpError,
         req_id: int | str | None,
-    ) -> SessionStepOutcome | None:
-        """Return a rejection outcome if state or method is invalid before ``initialize``."""
+        *,
+        is_notification: bool = False,
+        close_code: int | None = None,
+    ) -> SessionStepOutcome:
+        """Map an ``AcpError`` to a logged ``SessionStepOutcome`` respecting silence rules."""
+        if exc.audit_event:
+            self._audit.record(
+                exc.audit_event,
+                outcome="blocked",
+                details={"error_code": exc.error_code, "message": exc.message},
+            )
+        frame = exception_to_jsonrpc_frame(
+            exc,
+            req_id,
+            is_notification=is_notification,
+            debug=self._is_debug_errors(),
+        )
+        if frame is None:
+            return SessionStepOutcome(close_code=close_code)
+        label, pretty = format_raw_frame_for_log(frame)
+        logger.warning(
+            "[%s] Bridge -> UI (%s)\n%s",
+            self._connection_id,
+            label,
+            pretty,
+            extra={"jsonrpc_code": exc.jsonrpc_code},
+        )
+        return SessionStepOutcome(frames=(frame,), close_code=close_code)
+
+    def _log_inbound_frame(self, msg: Mapping[str, Any]) -> None:
+        """Log inbound client JSON-RPC frame respecting ``effective_log_payloads``."""
+        label = describe_jsonrpc_frame(msg)
+        if self._config.logging.effective_log_payloads:
+            logger.info(
+                "[%s] UI -> Bridge (%s)\n%s",
+                self._connection_id,
+                label,
+                indent_json_payload(msg),
+            )
+        else:
+            logger.info("[%s] UI -> Bridge (%s)", self._connection_id, label)
+
+    def _log_outbound_agent_frame(self, payload: Mapping[str, Any]) -> None:
+        """Log outbound bridge->agent JSON-RPC frame respecting ``effective_log_payloads``."""
+        label = describe_jsonrpc_frame(payload)
+        if self._config.logging.effective_log_payloads:
+            logger.info(
+                "[%s] Bridge -> Agent (%s)\n%s",
+                self._connection_id,
+                label,
+                indent_json_payload(payload),
+            )
+        else:
+            logger.info("[%s] Bridge -> Agent (%s)", self._connection_id, label)
+
+    def _parse_init_request(self, msg: Mapping[str, Any]) -> tuple[int | str, InitializeParams]:
+        """Validate pre-initialization request ordering and ``InitializeParams``."""
+        req_id = extract_request_id(msg)
         if self._state != AcpConnectionState.UNINITIALIZED:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_REQUEST,
-                        "Connection initialization already in progress or completed",
-                    ),
-                )
+            raise AcpInvalidRequestError(
+                "Connection initialization already in progress or completed"
             )
         if msg.get("method") != "initialize":
             if "id" not in msg:
-                return SessionStepOutcome()
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_REQUEST,
-                        "Connection not initialized; first request must be 'initialize'",
-                    ),
-                )
+                raise AcpInvalidRequestError("Notification rejected before initialize")
+            raise AcpInvalidRequestError(
+                "Connection not initialized; first request must be 'initialize'"
             )
         if "id" not in msg or req_id is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        "'initialize' must be a JSON-RPC request with a non-null id",
-                    ),
-                )
+            raise AcpInvalidRequestError(
+                "'initialize' must be a JSON-RPC request with a non-null id"
             )
-        return None
-
-    def _parse_init_request(
-        self,
-        msg: Mapping[str, Any],
-    ) -> tuple[int | str, InitializeParams] | SessionStepOutcome:
-        """Enforce pre-initialization request rules prior to launching ``agy``."""
-        req_id = extract_request_id(msg)
-        rejection = self._check_pre_init_gate(msg, req_id)
-        if rejection is not None:
-            return rejection
-        assert req_id is not None
-        validated = self._validate_init_params(req_id, msg.get("params"))
-        if isinstance(validated, SessionStepOutcome):
-            return validated
-        return req_id, validated
+        raw_params = msg.get("params")
+        if not isinstance(raw_params, Mapping):
+            raise AcpInvalidParamsError("Invalid initialize params: expected JSON object")
+        try:
+            return req_id, InitializeParams.model_validate(raw_params)
+        except PydanticValidationError as exc:
+            raise pydantic_error_to_acp_error(exc, label="initialize") from exc
 
     async def _await_agent_init_response(
         self,
         req_id: int | str,
     ) -> tuple[str, dict[str, Any]]:
-        """Read NDJSON lines from ``agy`` stdout until matching ``initialize`` response arrives."""
+        """Read NDJSON lines from subprocess stdout until matching ``initialize`` response."""
         while True:
             raw_line = await self._process.read_line()
             if raw_line is None:
-                raise AcpError("ACP agent closed stdout before responding to initialize.")
+                raise AcpTransportError("ACP agent closed stdout before responding to initialize.")
             if not raw_line:
                 continue
             try:
                 loaded = json.loads(raw_line)
             except json.JSONDecodeError as exc:
-                raise AcpError(f"ACP agent returned invalid JSON during initialize: {exc}") from exc
+                raise AcpTransportError(
+                    f"ACP agent returned invalid JSON during initialize: {exc}"
+                ) from exc
             if isinstance(loaded, dict) and loaded.get("id") == req_id:
                 return raw_line, loaded
 
@@ -274,38 +288,33 @@ class AcpConnectionSession:
         raw_line: str,
         agent_msg: Mapping[str, Any],
     ) -> SessionStepOutcome:
-        """Validate ``agy`` initialize response, enforce version match, and enter ``READY``."""
+        """Validate agent initialize response, enforce version match, and enter ``READY``."""
         label, pretty = format_raw_frame_for_log(raw_line)
         if "error" in agent_msg or "result" not in agent_msg:
-            logger.warning("[%s] agy -> UI (%s)\n%s", self._connection_id, label, pretty)
+            logger.warning("[%s] Agent -> UI (%s)\n%s", self._connection_id, label, pretty)
             await self.close()
             return SessionStepOutcome(frames=(raw_line,), close_code=1002)
-
         try:
             parsed_result = InitializeResult.model_validate(agent_msg["result"])
         except PydanticValidationError as exc:
             await self.close()
-            raise AcpError(f"ACP agent returned malformed initialize result: {exc}") from exc
+            raise AcpTransportError(
+                f"ACP agent returned malformed initialize result: {exc}"
+            ) from exc
 
         if parsed_result.protocol_version not in SUPPORTED_ACP_VERSIONS:
             await self.close()
-            err = format_jsonrpc_error(
+            return self._error_outcome(
+                AcpInvalidParamsError(
+                    f"Unsupported ACP protocolVersion: {parsed_result.protocol_version}"
+                ),
                 req_id,
-                JSONRPC_INVALID_PARAMS,
-                f"Unsupported ACP protocolVersion: {parsed_result.protocol_version}",
-            )
-            return self._log_rejection_outcome(
-                SessionStepOutcome(frames=(err,), close_code=1002)
+                close_code=1002,
             )
 
         self._initialize_result = parsed_result
         self._state = AcpConnectionState.READY
-        logger.info(
-            "[%s] agy -> UI (%s · initialize)\n%s",
-            self._connection_id,
-            label,
-            pretty,
-        )
+        logger.info("[%s] Agent -> UI (%s · initialize)", self._connection_id, label)
         return SessionStepOutcome(frames=(raw_line,))
 
     async def _execute_agent_initialize(
@@ -313,122 +322,101 @@ class AcpConnectionSession:
         req_id: int | str,
         init_params: InitializeParams,
     ) -> SessionStepOutcome:
-        """Lazily spawn ``agy``, forward sanitized ``initialize``, and validate response."""
+        """Lazily spawn subprocess, forward negotiated ``initialize``, and validate reply."""
         self._state = AcpConnectionState.INITIALIZING
         await self._process.start()
+        sanitized_params, agent_caps, ws_caps = negotiate_client_capabilities(
+            init_params,
+            self._config.capabilities,
+        )
         outbound = {
             "jsonrpc": "2.0",
             "id": req_id,
             "method": "initialize",
-            "params": clamp_client_capabilities(init_params),
+            "params": sanitized_params,
         }
-        logger.info(
-            "[%s] Bridge -> agy (request #%s · clamped initialize)\n%s",
-            self._connection_id,
-            req_id,
-            indent_json_payload(outbound),
-        )
+        self._log_outbound_agent_frame(outbound)
         await self._process.send_line(outbound)
         raw_line, agent_msg = await self._await_agent_init_response(req_id)
         outcome = await self._finalize_init_response(req_id, raw_line, agent_msg)
         if self._state == AcpConnectionState.READY:
-            self._client_capabilities = build_effective_client_capabilities(init_params)
+            self._agent_capabilities = agent_caps
+            self._ws_client_capabilities = ws_caps
         return outcome
 
     async def handle_init_frame(self, raw_text: str) -> SessionStepOutcome:
         """Process one incoming WebSocket frame while waiting for ``initialize``."""
-        msg, parse_err = parse_client_frame(raw_text, max_bytes=self._config.max_frame_bytes)
-        if parse_err is not None or msg is None:
-            return self._log_rejection_outcome(SessionStepOutcome(frames=(parse_err or "",)))
-
-        logger.info(
-            "[%s] UI -> Bridge (%s)\n%s",
-            self._connection_id,
-            describe_jsonrpc_frame(msg),
-            indent_json_payload(msg),
+        msg, parse_err = parse_client_frame(
+            raw_text,
+            max_bytes=self._config.transport.max_frame_bytes,
         )
-        parsed = self._parse_init_request(msg)
-        if isinstance(parsed, SessionStepOutcome):
-            return self._log_rejection_outcome(parsed)
-        req_id, init_params = parsed
-        return await self._execute_agent_initialize(req_id, init_params)
+        if parse_err is not None or msg is None:
+            label, pretty = format_raw_frame_for_log(parse_err or "")
+            logger.warning("[%s] Bridge -> UI (%s)\n%s", self._connection_id, label, pretty)
+            return SessionStepOutcome(frames=(parse_err or "",))
 
-    def _check_auth_method_allowed(
+        req_id = extract_request_id(msg)
+        traceparent = extract_traceparent(
+            msg.get("params", {}).get("_meta") if isinstance(msg.get("params"), Mapping) else None
+        )
+        with AcpLogContext.bind(
+            connection_id=self._connection_id,
+            request_id=req_id,
+            method=msg.get("method") if isinstance(msg.get("method"), str) else None,
+            traceparent=traceparent,
+        ):
+            self._log_inbound_frame(msg)
+            try:
+                req_id_val, init_params = self._parse_init_request(msg)
+            except AcpError as exc:
+                logger.debug("[%s] Invalid initialize frame: %s", self._connection_id, exc.message)
+                is_notif = "method" in msg and "id" not in msg
+                return self._error_outcome(exc, req_id, is_notification=is_notif)
+            return await self._execute_agent_initialize(req_id_val, init_params)
+
+    def _register_pending_rpc(
         self,
         req_id: int | str,
-        method_id: str,
-    ) -> SessionStepOutcome | None:
-        """Verify ``method_id`` is an advertised protocol-driven (non-terminal) method."""
-        advertised = self._initialize_result.auth_methods if self._initialize_result else ()
-        matched = find_advertised_auth_method(method_id, advertised)
-        if matched is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        f"Unknown authentication methodId: '{method_id}'",
-                    ),
-                )
-            )
-        if matched.type == "terminal":
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        f"Terminal authentication method '{method_id}' cannot use 'authenticate'",
-                    ),
-                )
-            )
-        return None
+        method: str,
+        target_id: str | None,
+    ) -> None:
+        """Track an in-flight Client -> Agent RPC up to ``max_pending_client_requests``."""
+        if req_id in self._pending_rpc_methods:
+            raise AcpInvalidRequestError(f"Duplicate in-flight request id: {req_id!r}")
+        if len(self._pending_rpc_methods) >= self._config.limits.max_pending_client_requests:
+            self._audit.record("pending_client_limit_exceeded", outcome="denied")
+            raise AcpInvalidRequestError("Maximum concurrent in-flight requests exceeded")
+        self._pending_rpc_methods[req_id] = (method, target_id, time.monotonic())
 
     def _prepare_authenticate_outbound(
         self,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome:
+    ) -> dict[str, Any]:
         """Validate ``authenticate`` request against advertised ``authMethods``."""
         if "id" not in msg or req_id is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        "'authenticate' must be a JSON-RPC request with a non-null id",
-                    ),
-                )
-            )
+            raise AcpInvalidRequestError("'authenticate' must be a JSON-RPC request with an id")
         raw_params = msg.get("params")
         if not isinstance(raw_params, Mapping):
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        "Invalid authenticate params: expected JSON object",
-                    ),
-                )
-            )
+            raise AcpInvalidParamsError("Invalid authenticate params: expected JSON object")
         try:
             auth_params = AuthenticateParams.model_validate(raw_params)
         except PydanticValidationError as exc:
-            logger.debug("Invalid authenticate params on %s: %s", self._connection_id, exc)
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_PARAMS,
-                        "Invalid authenticate params",
-                    ),
-                )
-            )
-        rejection = self._check_auth_method_allowed(req_id, auth_params.method_id)
-        if rejection is not None:
-            return rejection
+            raise pydantic_error_to_acp_error(exc, label="authenticate") from exc
 
+        advertised = self._initialize_result.auth_methods if self._initialize_result else ()
+        matched = find_advertised_auth_method(auth_params.method_id, advertised)
+        if matched is None:
+            raise AcpInvalidParamsError(
+                f"Unknown authentication methodId: '{auth_params.method_id}'"
+            )
+        if matched.type == "terminal":
+            raise AcpInvalidParamsError(
+                f"Terminal auth method '{auth_params.method_id}' cannot use 'authenticate'"
+            )
+
+        self._register_pending_rpc(req_id, "authenticate", auth_params.method_id)
         self._auth_state = AcpAuthState.AUTHENTICATING
-        self._pending_rpc_methods[req_id] = ("authenticate", auth_params.method_id)
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -440,156 +428,69 @@ class AcpConnectionSession:
         self,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome:
+    ) -> dict[str, Any]:
         """Enforce ``agentCapabilities.auth.logout`` capability gate before ``logout``."""
         if "id" not in msg or req_id is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        "'logout' must be a JSON-RPC request with a non-null id",
-                    ),
-                )
-            )
+            raise AcpInvalidRequestError("'logout' must be a JSON-RPC request with an id")
         auth_caps = (
             self._initialize_result.agent_capabilities.auth if self._initialize_result else None
         )
         if auth_caps is None or auth_caps.logout is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_METHOD_NOT_FOUND,
-                        "Agent did not advertise agentCapabilities.auth.logout",
-                    ),
-                )
-            )
+            raise AcpMethodNotFoundError("Agent did not advertise agentCapabilities.auth.logout")
         raw_params = msg.get("params", {})
         if raw_params is not None and not isinstance(raw_params, Mapping):
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, "Invalid logout params"),
-                )
-            )
-        logout_params = LogoutParams.model_validate(raw_params or {})
+            raise AcpInvalidParamsError("Invalid logout params: expected JSON object")
+        try:
+            logout_params = LogoutParams.model_validate(raw_params or {})
+        except PydanticValidationError as exc:
+            raise pydantic_error_to_acp_error(exc, label="logout") from exc
         scrubbed = sanitize_meta_dict(logout_params.meta)
         params_payload: dict[str, Any] = {"_meta": scrubbed} if scrubbed is not None else {}
-        self._pending_rpc_methods[req_id] = ("logout", None)
+        self._register_pending_rpc(req_id, "logout", None)
         return {"jsonrpc": "2.0", "id": req_id, "method": "logout", "params": params_payload}
-
-    def _resolve_session_setup_target(
-        self,
-        method: str,
-        raw_params: object,
-        caps: AgentCapabilities,
-    ) -> tuple[str, object, tuple[str, bool, bool]]:
-        """Route ``metadataOnly``/``hydrateOnly`` setup requests against chat hydration state."""
-        if method == "session/load":
-            metadata_only, meta_cleaned = extract_metadata_only_flag(raw_params)
-            if metadata_only:
-                return "session/load", meta_cleaned, ("metadata", True, False)
-        hydrate_only, cleaned_params = extract_hydrate_only_flag(raw_params)
-        if not hydrate_only or method not in ("session/load", "session/resume"):
-            return method, cleaned_params, ("none", False, False)
-        raw_sid = (
-            cleaned_params.get("sessionId")
-            if isinstance(cleaned_params, Mapping)
-            else None
-        )
-        if not isinstance(raw_sid, str) or not raw_sid:
-            return method, cleaned_params, ("hydrate", False, False)
-        outbound, suppress_replay, hydrate_reset = self._chat.resolve_setup_routing(
-            method,
-            raw_sid,
-            caps,
-            hydrate_only=True,
-        )
-        return outbound, cleaned_params, ("hydrate", suppress_replay, hydrate_reset)
-
-    def _validate_and_sanitize_session_params(
-        self,
-        req_id: int | str,
-        method: str,
-        raw_params: object,
-        caps: AgentCapabilities,
-    ) -> dict[str, Any] | SessionStepOutcome:
-        """Validate ``method`` capability and sanitize outbound session parameters."""
-        cap_error = check_session_capability(method, caps)
-        if cap_error is not None:
-            return SessionStepOutcome(
-                frames=(format_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND, cap_error),)
-            )
-        try:
-            return prepare_session_params(method, raw_params, caps, self._config)
-        except (PydanticValidationError, ValueError) as exc:
-            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
-            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
-            return SessionStepOutcome(
-                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
-            )
 
     def _prepare_session_outbound(
         self,
         method: str,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome:
-        """Enforce capability, child-session, and parameter gates for ``session/*`` methods."""
+    ) -> dict[str, Any]:
+        """Enforce capability, session limits, MCP policy, and params for ``session/*``."""
         if "id" not in msg or req_id is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        f"'{method}' must be a JSON-RPC request with a non-null id",
-                    ),
-                )
-            )
-        target_gate = self._turns.check_session_target_allowed(
-            method,
-            req_id,
-            msg,
-            self.active_session_ids,
-        )
-        if target_gate is not None:
-            return target_gate
-
+            raise AcpInvalidRequestError(f"'{method}' must be a JSON-RPC request with an id")
+        self._turns.check_session_target_allowed(method, req_id, msg, self.active_session_ids)
         caps = (
             self._initialize_result.agent_capabilities
             if self._initialize_result is not None
             else AgentCapabilities()
         )
-        route = self._resolve_session_setup_target(method, msg.get("params"), caps)
-        sanitized = self._validate_and_sanitize_session_params(
-            req_id,
-            route[0],
-            route[1],
-            caps,
-        )
-        if isinstance(sanitized, SessionStepOutcome):
-            return sanitized
+        max_sessions = self._config.limits.max_active_sessions_per_connection
+        if (
+            method in ("session/new", "session/load", "session/resume")
+            and len(self._active_session_ids) >= max_sessions
+        ):
+            raw_p = msg.get("params")
+            cand_id = raw_p.get("sessionId") if isinstance(raw_p, Mapping) else None
+            if not (isinstance(cand_id, str) and cand_id in self._active_session_ids):
+                self._audit.record("session_limit_exceeded", outcome="denied")
+                raise AcpInvalidRequestError("Maximum active sessions per connection exceeded")
 
+        sanitized, root_set = prepare_session_params(method, msg.get("params"), caps, self._config)
         target_session = sanitized.get("sessionId")
         tracked_id = target_session if isinstance(target_session, str) else None
-        self._pending_rpc_methods[req_id] = (route[0], tracked_id)
-        if route[2][0] == "metadata" and tracked_id is not None:
-            self._chat.register_metadata_only_load(req_id, tracked_id)
-        elif route[2][0] == "hydrate" and tracked_id is not None:
-            self._chat.register_pending_setup(
-                req_id,
-                tracked_id,
-                suppress_replay=route[2][1],
-                hydrate_reset=route[2][2],
-            )
-        return {"jsonrpc": "2.0", "id": req_id, "method": route[0], "params": sanitized}
+        self._register_pending_rpc(req_id, method, tracked_id)
+        if root_set is not None:
+            self._pending_root_sets[req_id] = root_set
+        if method in ("session/load", "session/resume") and tracked_id is not None:
+            self._turns.begin_session_load(tracked_id, is_replay=(method == "session/load"))
+        return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized}
 
     def _prepare_prompt_or_cancel(
         self,
         method: str,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome | None:
+    ) -> dict[str, Any] | None:
         """Dispatch ``session/prompt``, ``session/cancel``, and ``$/cancel_request`` frames."""
         if method == "session/prompt":
             prompt_caps = (
@@ -612,122 +513,95 @@ class AcpConnectionSession:
         method: str,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome:
-        """Validate ``session/set_config_option`` or ``session/set_mode`` against session state."""
+    ) -> dict[str, Any]:
+        """Validate ``session/set_config_option`` or ``session/set_mode`` against state."""
         if "id" not in msg or req_id is None:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        None,
-                        JSONRPC_INVALID_REQUEST,
-                        f"'{method}' must be a JSON-RPC request with a non-null id",
-                    ),
-                )
-            )
-        target_gate = self._turns.check_session_target_allowed(
-            method,
-            req_id,
-            msg,
-            self.active_session_ids,
-        )
-        if target_gate is not None:
-            return target_gate
-
+            raise AcpInvalidRequestError(f"'{method}' must be a JSON-RPC request with an id")
+        self._turns.check_session_target_allowed(method, req_id, msg, self.active_session_ids)
         raw_params = msg.get("params")
         raw_sid = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
         current_state = self._session_states.get(raw_sid) if isinstance(raw_sid, str) else None
-        try:
-            session_id, sanitized = (
-                prepare_set_config_option_params(raw_params, current_state)
-                if method == "session/set_config_option"
-                else prepare_set_mode_params(raw_params, current_state)
-            )
-        except (PydanticValidationError, ValueError) as exc:
-            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
-            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
-            return SessionStepOutcome(
-                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
-            )
-
-        self._pending_rpc_methods[req_id] = (method, session_id)
+        allow_bool = bool(
+            self._ws_client_capabilities.session is not None
+            and self._ws_client_capabilities.session.config_options is not None
+            and self._ws_client_capabilities.session.config_options.boolean is not None
+        )
+        session_id, sanitized = (
+            prepare_set_config_option_params(raw_params, current_state, allow_boolean=allow_bool)
+            if method == "session/set_config_option"
+            else prepare_set_mode_params(raw_params, current_state)
+        )
+        self._register_pending_rpc(req_id, method, session_id)
         if method == "session/set_mode":
             self._pending_mode_targets[req_id] = str(sanitized["modeId"])
         return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized}
+
+    def _dispatch_extension_method(
+        self,
+        method: str,
+        req_id: int | str | None,
+        msg: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Gate and scrub ``_*`` extension requests and notifications."""
+        if not is_valid_extension_method(method, self._config.capabilities):
+            self._audit.record("extension_denied", outcome="denied", details={"method": method})
+            if "id" in msg and req_id is not None:
+                raise AcpMethodNotFoundError("Method not found")
+            return None
+        if "id" in msg and req_id is not None:
+            self._register_pending_rpc(req_id, method, None)
+        return scrub_outbound_message_meta(msg)
 
     def _dispatch_ready_method(
         self,
         method: str,
         req_id: int | str | None,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome | None:
-        """Route a validated post-initialization JSON-RPC ``method`` call or notification."""
-        if method in ("authenticate", "logout"):
-            return (
-                self._prepare_authenticate_outbound(req_id, msg)
-                if method == "authenticate"
-                else self._prepare_logout_outbound(req_id, msg)
-            )
-        if method in ("session/prompt", "session/cancel", "$/cancel_request"):
-            return self._prepare_prompt_or_cancel(method, req_id, msg)
-        if method in ("session/set_config_option", "session/set_mode"):
-            return self._prepare_config_or_mode_outbound(method, req_id, msg)
+    ) -> dict[str, Any] | None:
+        """Route a validated post-initialization JSON-RPC method or notification."""
+        handlers: dict[str, Any] = {
+            "authenticate": lambda: self._prepare_authenticate_outbound(req_id, msg),
+            "logout": lambda: self._prepare_logout_outbound(req_id, msg),
+            "session/prompt": lambda: self._prepare_prompt_or_cancel(method, req_id, msg),
+            "session/cancel": lambda: self._prepare_prompt_or_cancel(method, req_id, msg),
+            "$/cancel_request": lambda: self._prepare_prompt_or_cancel(method, req_id, msg),
+            "session/set_config_option": lambda: self._prepare_config_or_mode_outbound(
+                method, req_id, msg
+            ),
+            "session/set_mode": lambda: self._prepare_config_or_mode_outbound(
+                method, req_id, msg
+            ),
+        }
+        handler = handlers.get(method)
+        if handler is not None:
+            return handler()
         if method in SESSION_METHODS:
             return self._prepare_session_outbound(method, req_id, msg)
+        if method.startswith("_"):
+            return self._dispatch_extension_method(method, req_id, msg)
+        if "id" in msg and req_id is not None:
+            raise AcpMethodNotFoundError(f"Unsupported ACP method: '{method}'")
+        logger.debug("[%s] Ignoring unknown client notification '%s'", self._connection_id, method)
+        return None
 
-        target_gate = self._turns.check_session_target_allowed(
-            method,
-            req_id,
-            msg,
-            self.active_session_ids,
-        )
-        return target_gate if target_gate is not None else scrub_outbound_message_meta(msg)
-
-    def _prepare_ready_outbound(
-        self,
-        msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome | None:
+    def _prepare_ready_outbound(self, msg: Mapping[str, Any]) -> dict[str, Any] | None:
         """Dispatch post-init validation for requests, notifications, and client responses."""
         if "method" not in msg:
             return self._turns.prepare_client_response(msg)
-
         req_id = extract_request_id(msg)
-        method = msg.get("method")
-        if not isinstance(method, str) or not method:
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_REQUEST,
-                        "Invalid JSON-RPC method",
-                    ),
-                )
-            )
+        method = str(msg.get("method"))
         if method == "initialize":
-            return SessionStepOutcome(
-                frames=(
-                    format_jsonrpc_error(
-                        req_id,
-                        JSONRPC_INVALID_REQUEST,
-                        "Connection already initialized",
-                    ),
-                )
-            )
+            raise AcpInvalidRequestError("Connection already initialized")
         return self._dispatch_ready_method(method, req_id, msg)
 
     async def _send_bridge_payload_to_agent(self, payload: Mapping[str, Any]) -> None:
-        """Log and write one bridge-generated or sanitized JSON-RPC payload to ``agy``."""
-        out_label = describe_jsonrpc_frame(payload)
-        logger.info(
-            "[%s] Bridge -> agy (%s)\n%s",
-            self._connection_id,
-            out_label,
-            indent_json_payload(payload),
-        )
+        """Log and write one validated JSON-RPC payload to the agent subprocess."""
+        self._log_outbound_agent_frame(payload)
         await self._process.send_line(payload)
 
     async def _flush_turn_teardown(self, session_id: str | None = None) -> None:
-        """Best-effort send cancelled permission outcomes and turn cancellations to ``agy``."""
-        messages = self._turns.drain_teardown_messages(session_id)
+        """Cancel permissions, elicitations, turns, and host terminals for ``session_id``."""
+        messages = await self._turns.drain_teardown_messages(session_id)
         if not messages or not self._process.is_alive:
             return
         for item in messages:
@@ -741,64 +615,63 @@ class AcpConnectionSession:
                 )
                 break
 
-    async def _maybe_pre_sync_hydrate(self, msg: Mapping[str, Any]) -> None:
-        """Pre-sync external transcript logs before ``hydrateOnly`` setup routing."""
-        method = msg.get("method")
-        if self._pre_setup_sync is None or method not in ("session/load", "session/resume"):
-            return
-        if method == "session/load" and extract_metadata_only_flag(msg.get("params"))[0]:
-            return
-        hydrate_only, cleaned = extract_hydrate_only_flag(msg.get("params"))
-        raw_sid = cleaned.get("sessionId") if isinstance(cleaned, Mapping) else None
-        if hydrate_only and isinstance(raw_sid, str) and raw_sid:
-            await self._pre_setup_sync(raw_sid)
-
-    async def handle_ready_frame(self, raw_text: str) -> SessionStepOutcome:
-        """Validate and forward a post-initialization JSON-RPC frame to ``agy acp``."""
-        msg, parse_err = parse_client_frame(raw_text, max_bytes=self._config.max_frame_bytes)
-        if parse_err is not None or msg is None:
-            return self._log_rejection_outcome(SessionStepOutcome(frames=(parse_err or "",)))
-
-        frame_label = describe_jsonrpc_frame(msg)
-        logger.info(
-            "[%s] UI -> Bridge (%s)\n%s",
-            self._connection_id,
-            frame_label,
-            indent_json_payload(msg),
-        )
-        await self._maybe_pre_sync_hydrate(msg)
-        prepared = self._prepare_ready_outbound(msg)
-        if isinstance(prepared, SessionStepOutcome):
-            return self._log_rejection_outcome(prepared)
+    async def _process_validated_ready_msg(
+        self,
+        msg: Mapping[str, Any],
+        req_id: int | str | None,
+    ) -> SessionStepOutcome:
+        """Validate, log, and forward a parsed post-initialization frame."""
+        is_notif = "method" in msg and "id" not in msg
+        self._log_inbound_frame(msg)
+        try:
+            prepared = self._prepare_ready_outbound(msg)
+        except AcpError as exc:
+            logger.debug("[%s] Rejected inbound frame: %s", self._connection_id, exc.message)
+            return self._error_outcome(exc, req_id, is_notification=is_notif)
         if prepared is None:
             return SessionStepOutcome()
-
-        method = prepared.get("method")
-        if method in ("session/close", "session/delete"):
-            raw_params = prepared.get("params")
-            sess_id = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
+        if prepared.get("method") in ("session/close", "session/delete"):
+            p_map = prepared.get("params")
+            sess_id = p_map.get("sessionId") if isinstance(p_map, Mapping) else None
             if isinstance(sess_id, str):
                 await self._flush_turn_teardown(sess_id)
-                await self._chat.flush_session(sess_id)
-        elif method == "session/prompt":
-            await self._record_outbound_prompt(prepared)
-
         await self._send_bridge_payload_to_agent(prepared)
         return SessionStepOutcome()
 
-    async def _record_outbound_prompt(self, prepared: Mapping[str, Any]) -> None:
-        """Persist outbound ``session/prompt`` user turn before waiting for streamed reply."""
-        req_id = extract_request_id(prepared)
-        raw_params = prepared.get("params")
-        if req_id is None or not isinstance(raw_params, Mapping):
-            return
-        sess_id = raw_params.get("sessionId")
-        if isinstance(sess_id, str) and sess_id:
-            await self._chat.record_prompt_sent(sess_id, req_id, raw_params)
+    async def handle_ready_frame(self, raw_text: str) -> SessionStepOutcome:
+        """Validate and forward a post-initialization JSON-RPC frame to the ACP agent."""
+        msg, parse_err = parse_client_frame(
+            raw_text,
+            max_bytes=self._config.transport.max_frame_bytes,
+        )
+        if parse_err is not None or msg is None:
+            label, pretty = format_raw_frame_for_log(parse_err or "")
+            logger.warning("[%s] Bridge -> UI (%s)\n%s", self._connection_id, label, pretty)
+            return SessionStepOutcome(frames=(parse_err or "",))
 
-    def _record_setup_state(self, session_id: str, res_obj: object) -> None:
-        """Activate ``session_id`` and merge setup metadata into ``_session_states``."""
+        req_id = extract_request_id(msg)
+        raw_params = msg.get("params")
+        raw_sid = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
+        raw_meta = raw_params.get("_meta") if isinstance(raw_params, Mapping) else None
+        with AcpLogContext.bind(
+            connection_id=self._connection_id,
+            session_id=raw_sid if isinstance(raw_sid, str) else None,
+            request_id=req_id,
+            method=msg.get("method") if isinstance(msg.get("method"), str) else None,
+            traceparent=extract_traceparent(raw_meta),
+        ):
+            return await self._process_validated_ready_msg(msg, req_id)
+
+    def _record_setup_state(
+        self,
+        session_id: str,
+        res_obj: object,
+        root_set: SessionRootSet | None,
+    ) -> None:
+        """Activate ``session_id``, merge setup metadata, and bind effective root set."""
         self._active_session_ids.add(session_id)
+        if root_set is not None:
+            self._turns.register_session_root_set(session_id, root_set)
         payload = res_obj if isinstance(res_obj, Mapping) else {}
         self._session_states[session_id] = apply_session_setup_result(
             self._session_states.get(session_id),
@@ -811,60 +684,77 @@ class AcpConnectionSession:
         method_name: str,
         tracked_session_id: str | None,
         loaded: Mapping[str, Any],
-        pending_mode_id: str | None = None,
+        extra: tuple[str | None, SessionRootSet | None],
     ) -> None:
-        """Update ``active_session_ids`` and ``_session_states`` from ``session/*`` responses."""
+        """Update active sessions, root sets, and runtime metadata from ``session/*`` replies."""
+        pending_mode_id, pending_root_set = extra
         succeeded = "result" in loaded and "error" not in loaded
         res_obj = loaded.get("result")
         err_obj = loaded.get("error")
         err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
 
-        if method_name == "session/new" and succeeded and isinstance(res_obj, Mapping):
+        if method_name == "session/load" and tracked_session_id is not None:
+            self._turns.finish_session_load(tracked_session_id)
+        if method_name in ("session/close", "session/delete"):
+            if tracked_session_id and (succeeded or err_code == ACP_RESOURCE_NOT_FOUND):
+                self._active_session_ids.discard(tracked_session_id)
+                self._session_states.pop(tracked_session_id, None)
+                self._turns.clear_completed_session(tracked_session_id)
+            return
+        if not succeeded:
+            return
+        self._apply_successful_session_rpc(
+            method_name,
+            tracked_session_id,
+            res_obj,
+            (pending_mode_id, pending_root_set),
+        )
+
+    def _apply_successful_session_rpc(
+        self,
+        method_name: str,
+        tracked_session_id: str | None,
+        res_obj: object,
+        extra: tuple[str | None, SessionRootSet | None],
+    ) -> None:
+        """Apply succeeded ``new``/``load``/``resume``/``set_config_option``/``set_mode``."""
+        pending_mode_id, pending_root_set = extra
+        if method_name == "session/new" and isinstance(res_obj, Mapping):
             new_id = res_obj.get("sessionId")
             if isinstance(new_id, str) and new_id:
-                self._record_setup_state(new_id, res_obj)
-        elif method_name in ("session/load", "session/resume") and succeeded and tracked_session_id:
-            self._record_setup_state(tracked_session_id, res_obj)
-        elif method_name == "session/set_config_option" and succeeded and tracked_session_id:
-            if isinstance(res_obj, Mapping):
-                self._session_states[tracked_session_id] = apply_config_options_result(
-                    self._session_states.get(tracked_session_id),
-                    tracked_session_id,
-                    res_obj,
-                )
+                self._record_setup_state(new_id, res_obj, pending_root_set)
+        elif method_name in ("session/load", "session/resume") and tracked_session_id:
+            self._record_setup_state(tracked_session_id, res_obj, pending_root_set)
         elif (
-            method_name == "session/set_mode"
-            and succeeded
+            method_name == "session/set_config_option"
             and tracked_session_id
-            and pending_mode_id
+            and isinstance(res_obj, Mapping)
         ):
+            self._session_states[tracked_session_id] = apply_config_options_result(
+                self._session_states.get(tracked_session_id),
+                tracked_session_id,
+                res_obj,
+            )
+        elif method_name == "session/set_mode" and tracked_session_id and pending_mode_id:
             self._session_states[tracked_session_id] = apply_mode_change(
                 self._session_states.get(tracked_session_id),
                 tracked_session_id,
                 pending_mode_id,
             )
-        elif (
-            method_name in ("session/close", "session/delete")
-            and tracked_session_id
-            and (succeeded or err_code == ACP_RESOURCE_NOT_FOUND)
-        ):
-            self._active_session_ids.discard(tracked_session_id)
-            self._session_states.pop(tracked_session_id, None)
-            self._turns.clear_completed_session(tracked_session_id)
 
     def _apply_auth_rpc_result(
         self,
         method_name: str,
         target_id: str | None,
         loaded: Mapping[str, Any],
-        pending_mode_id: str | None = None,
+        extra: tuple[str | None, SessionRootSet | None],
     ) -> None:
-        """Transition ``auth_state`` or ``active_session_ids`` when tracked RPCs finish."""
+        """Transition ``auth_state`` or delegate ``session/*`` state updates."""
         if method_name in SESSION_METHODS or method_name in (
             "session/set_config_option",
             "session/set_mode",
         ):
-            self._apply_session_rpc_result(method_name, target_id, loaded, pending_mode_id)
+            self._apply_session_rpc_result(method_name, target_id, loaded, extra)
             return
         succeeded = "result" in loaded and "error" not in loaded
         if method_name == "authenticate":
@@ -877,44 +767,46 @@ class AcpConnectionSession:
             self._auth_state = AcpAuthState.UNAUTHENTICATED
             self._active_auth_method_id = None
 
-    def _observe_agent_frame(
-        self,
-        raw_line: str,
-    ) -> tuple[Mapping[str, Any] | None, tuple[int | str, str, str | None, bool] | None]:
-        """Update tracked auth/session state and return parsed frame plus completed RPC."""
+    def _observe_agent_frame(self, raw_line: str) -> Mapping[str, Any] | None:
+        """Update tracked RPC, auth, and latency metrics from an agent stdout frame."""
         try:
             loaded = json.loads(raw_line)
         except json.JSONDecodeError as exc:
-            logger.debug("Skipping non-JSON agent frame in auth observer: %s", exc)
-            return None, None
+            logger.debug("Skipping non-JSON agent frame in observer: %s", exc)
+            return None
         if not isinstance(loaded, Mapping):
-            return None, None
+            return None
 
         err_obj = loaded.get("error")
         if isinstance(err_obj, Mapping) and err_obj.get("code") == ACP_AUTH_REQUIRED:
             self._auth_state = AcpAuthState.UNAUTHENTICATED
             self._active_auth_method_id = None
 
-        completed_rpc: tuple[int | str, str, str | None, bool] | None = None
         resp_id = extract_request_id(loaded)
         if resp_id is not None and resp_id in self._pending_rpc_methods:
-            method_name, target_id = self._pending_rpc_methods.pop(resp_id)
+            method_name, target_id, started = self._pending_rpc_methods.pop(resp_id)
             mode_id = self._pending_mode_targets.pop(resp_id, None)
-            self._apply_auth_rpc_result(method_name, target_id, loaded, mode_id)
-            succeeded = "result" in loaded and "error" not in loaded
-            completed_rpc = (resp_id, method_name, target_id, succeeded)
-        return loaded, completed_rpc
+            root_set = self._pending_root_sets.pop(resp_id, None)
+            self._apply_auth_rpc_result(method_name, target_id, loaded, (mode_id, root_set))
+            duration_ms = (time.monotonic() - started) * 1000.0
+            logger.info(
+                "[%s] Completed RPC %s (#%s)",
+                self._connection_id,
+                method_name,
+                resp_id,
+                extra={"duration_ms": duration_ms},
+            )
+        return loaded
 
-    def _observe_forwarded_session_update(self, loaded: Mapping[str, Any]) -> bool:
-        """Record real-time timeline updates, patch runtime state, and check suppression."""
+    def _observe_forwarded_session_update(self, loaded: Mapping[str, Any]) -> None:
+        """Patch local ``SessionRuntimeState`` from forwarded ``session/update`` frames."""
         if loaded.get("method") != "session/update" or "id" in loaded:
-            return True
+            return
         params = loaded.get("params")
         update = params.get("update") if isinstance(params, Mapping) else None
         raw_sid = params.get("sessionId") if isinstance(params, Mapping) else None
         if not isinstance(raw_sid, str) or not raw_sid or not isinstance(update, Mapping):
-            return True
-        should_forward = self._chat.observe_session_update(raw_sid, update)
+            return
         next_state = apply_session_update_to_state(
             self._session_states.get(raw_sid),
             raw_sid,
@@ -922,80 +814,40 @@ class AcpConnectionSession:
         )
         if next_state is not None:
             self._session_states[raw_sid] = next_state
-        return should_forward
-
-    async def _finalize_chat_rpc_effect(
-        self,
-        completed_rpc: tuple[int | str, str, str | None, bool],
-        forward_frame: str,
-        loaded: Mapping[str, Any],
-    ) -> str:
-        """Apply chat persistence side effects and ``_meta.cbiChat`` hydration enrichment."""
-        resp_id, method_name, target_id, succeeded = completed_rpc
-        if method_name == "session/new" and succeeded:
-            res_obj = loaded.get("result")
-            new_id = res_obj.get("sessionId") if isinstance(res_obj, Mapping) else None
-            if isinstance(new_id, str) and new_id:
-                await self._chat.mark_new_session(new_id)
-        elif method_name in ("session/load", "session/resume"):
-            return await self._chat.complete_setup_response(
-                resp_id,
-                forward_frame,
-                loaded,
-                succeeded=succeeded,
-            )
-        elif method_name == "session/close" and target_id:
-            await self._chat.flush_session(target_id)
-        elif method_name == "session/delete" and target_id:
-            err_obj = loaded.get("error")
-            err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
-            if succeeded or err_code == ACP_RESOURCE_NOT_FOUND:
-                await self._chat.delete_session(target_id)
-        return forward_frame
 
     async def read_agent_frame(self) -> str | None:
-        """Read, validate, persist, and filter the next outbound NDJSON frame from ``agy``."""
+        """Read, inspect, filter, and return the next outbound NDJSON frame from agent."""
         raw_line = await self._process.read_line()
         if not raw_line:
             return raw_line
-        loaded, completed_rpc = self._observe_agent_frame(raw_line)
+        loaded = self._observe_agent_frame(raw_line)
         if loaded is None:
             return raw_line
-        resp_id = extract_request_id(loaded)
-        prompt_session_id = (
-            self._turns.session_id_for_prompt_request(resp_id)
-            if resp_id is not None
-            else None
-        )
+
         decision = self._turns.inspect_agent_frame(
             raw_line,
             loaded,
-            self._client_capabilities,
+            self._ws_client_capabilities,
         )
         if decision.agent_reply is not None:
             await self._send_bridge_payload_to_agent(decision.agent_reply)
         forward_frame = decision.forward_frame
-        if forward_frame and not self._observe_forwarded_session_update(loaded):
-            forward_frame = ""
-        if prompt_session_id is not None:
-            await self._chat.flush_session(prompt_session_id, finalize_active=True)
-            if self._on_prompt_finished is not None:
-                await self._on_prompt_finished(prompt_session_id)
-        if completed_rpc is not None:
-            forward_frame = await self._finalize_chat_rpc_effect(
-                completed_rpc,
+        if forward_frame:
+            forward_frame = filter_boolean_config_options(
                 forward_frame,
                 loaded,
+                self._ws_client_capabilities,
             )
+            self._observe_forwarded_session_update(loaded)
         return forward_frame
 
     async def close(self) -> None:
-        """Cancel pending permissions/turns, flush chat history, and stop ``agy acp``."""
+        """Cancel pending permissions/elicitations/turns, release terminals, and stop agent."""
         self._state = AcpConnectionState.CLOSED
         await self._flush_turn_teardown()
-        await self._chat.flush_all()
         self._session_states.clear()
         self._pending_mode_targets.clear()
+        self._pending_root_sets.clear()
         await self._process.stop()
 
 

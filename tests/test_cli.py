@@ -188,11 +188,30 @@ def test_cbi_api_parser_and_non_loopback_rejection(
 
     parser = CliParserBuilder().build()
     parsed = parser.parse_args(
-        ["api", "--port", "8001", "--no-agy-sandbox", "--agy-app-data-dir", "custom-acp"]
+        [
+            "api",
+            "--port",
+            "8001",
+            "--no-agy-sandbox",
+            "--agy-app-data-dir",
+            "custom-acp",
+            "--fs-read",
+            "host",
+            "--terminal",
+            "relay",
+            "--log-format",
+            "json",
+            "--auth-token",
+            "secret-tok",
+        ]
     )
     assert parsed.port == 8001
     assert parsed.no_agy_sandbox is True
     assert parsed.agy_app_data_dir == "custom-acp"
+    assert parsed.fs_read == "host"
+    assert parsed.terminal == "relay"
+    assert parsed.log_format == "json"
+    assert parsed.auth_token == "secret-tok"
 
     app = CliApplication(AppConfig(db_path=tmp_path / "cli_api.db"))
     rc = app.run(["api", "--host", "0.0.0.0"])
@@ -201,17 +220,17 @@ def test_cbi_api_parser_and_non_loopback_rejection(
     assert captured.out == ""
     err = json.loads(captured.err)
     assert err["ok"] is False
-    assert err["error"]["code"] == "acp_error"
+    assert err["error"]["code"] == "acp_config_error"
     assert "non-loopback" in err["error"]["message"]
 
     bad_dir_rc = app.run(["api", "--agy-app-data-dir", "/tmp/not-relative"])
     assert bad_dir_rc == 1
     bad_dir_err = json.loads(capsys.readouterr().err)
-    assert bad_dir_err["error"]["code"] == "acp_error"
+    assert bad_dir_err["error"]["code"] == "acp_config_error"
     assert "relative" in bad_dir_err["error"]["message"]
 
     bad_gemini_rc = app.run(["api", "--agy-gemini-dir", ".relative-gemini"])
     assert bad_gemini_rc == 1
     bad_gemini_err = json.loads(capsys.readouterr().err)
-    assert bad_gemini_err["error"]["code"] == "acp_error"
+    assert bad_gemini_err["error"]["code"] == "acp_config_error"
     assert "absolute" in bad_gemini_err["error"]["message"]

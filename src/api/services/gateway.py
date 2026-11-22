@@ -1,8 +1,7 @@
-"""Hardened WebSocket gateway enforcing Origin, Host, limits, and ACP session lifecycle."""
+"""Hardened pure-ACP WebSocket gateway enforcing Host, Origin, Bearer auth, and limits."""
 
 import asyncio
 import secrets
-from collections.abc import Awaitable, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -12,103 +11,84 @@ from api.models.acp import (
     AcpConnectionState,
     SessionStepOutcome,
 )
-from api.models.config import ApiServerConfig
-from api.models.session import SessionRuntimeState
+from api.models.config import AcpServerConfig, LogFormat
+from api.services.logging import AcpAuditLogger, AcpLogContext
 from api.services.session import AcpConnectionSession
+from api.utils.errors import exception_to_jsonrpc_frame, format_jsonrpc_error
 from api.utils.formatting import format_kv_block, format_raw_frame_for_log
-from api.utils.jsonrpc import format_jsonrpc_error
-from api.utils.security import is_allowed_ws_host, is_allowed_ws_origin
+from api.utils.security import verify_ws_upgrade
 from core.models.exceptions import AcpError
-from core.ports.chat import ChatStoreProtocol
 from core.utils.logging import get_logger
 
 logger = get_logger("api.services.gateway")
 
 
 class AcpWebSocketGateway:
-    """FastAPI ``/acp`` WebSocket handler enforcing CSWSH, Host, and connection limits."""
+    """Pure JSON-RPC 2.0 ACP v1 WebSocket gateway with fail-closed upgrade security."""
 
-    def __init__(
-        self,
-        config: ApiServerConfig,
-        *,
-        chat_store: ChatStoreProtocol | None = None,
-    ) -> None:
-        """Initialize the WebSocket gateway with immutable server security configuration."""
+    def __init__(self, config: AcpServerConfig) -> None:
+        """Initialize the WebSocket gateway with immutable server configuration."""
         self._config = config
-        self._chat_store = chat_store
+        self._audit = AcpAuditLogger(enabled=config.logging.log_audit_events)
         self._active_sessions: set[AcpConnectionSession] = set()
         self._socket_entries: dict[AcpConnectionSession, tuple[WebSocket, asyncio.Lock]] = {}
-        self._pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None
-        self._on_prompt_finished: Callable[[str], Awaitable[None]] | None = None
-
-    def set_sync_callbacks(
-        self,
-        *,
-        pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None,
-        on_prompt_finished: Callable[[str], Awaitable[None]] | None = None,
-    ) -> None:
-        """Attach optional external profile sync hooks used during setup and prompt end."""
-        self._pre_setup_sync = pre_setup_sync
-        self._on_prompt_finished = on_prompt_finished
 
     @property
     def active_connection_count(self) -> int:
-        """Return number of currently open ``/acp`` WebSocket connections."""
+        """Return number of currently open ACP WebSocket connections."""
         return len(self._active_sessions)
 
-    def has_active_prompt(self, session_id: str) -> bool:
-        """Return ``True`` when any active socket is executing a prompt for ``session_id``."""
-        return any(
-            session_id in conn.active_prompt_session_ids
-            for conn in tuple(self._active_sessions)
+    def _is_debug_errors(self) -> bool:
+        """Return ``True`` when DEV pretty DEBUG mode permits detailed error messages."""
+        return (
+            self._config.logging.format == LogFormat.PRETTY
+            and self._config.logging.level == "DEBUG"
         )
-
-    def get_session_state(self, session_id: str) -> SessionRuntimeState | None:
-        """Look up live ``SessionRuntimeState`` for ``session_id`` across active connections."""
-        for conn in tuple(self._active_sessions):
-            state = conn.get_session_state(session_id)
-            if state is not None:
-                return state
-        return None
-
-    async def flush_session_chat(self, session_id: str) -> None:
-        """Flush buffered real-time chat chunks for ``session_id`` across active connections."""
-        for conn in tuple(self._active_sessions):
-            await conn.flush_session_chat(session_id)
 
     def _is_authorized_upgrade(self, websocket: WebSocket) -> bool:
-        """Verify HTTP ``Host`` (anti-DNS-rebinding) and ``Origin`` (anti-CSWSH)."""
-        host_header = websocket.headers.get("host")
-        origin_header = websocket.headers.get("origin")
-        host_ok = is_allowed_ws_host(
-            host_header,
-            allow_non_loopback=self._config.allow_non_loopback,
-        )
-        origin_ok = is_allowed_ws_origin(origin_header, self._config.allowed_origins)
-        if not host_ok or not origin_ok:
+        """Verify HTTP ``Host``, hybrid ``Origin``, and optional Bearer token."""
+        headers = {key.lower(): val for key, val in websocket.headers.items()}
+        authorized, reason = verify_ws_upgrade(headers, self._config.transport)
+        if not authorized:
+            self._audit.record(
+                "ws_upgrade_rejected",
+                outcome="rejected",
+                details={
+                    "reason": reason,
+                    "host": websocket.headers.get("host") or "(none)",
+                    "origin": websocket.headers.get("origin") or "(none)",
+                },
+            )
             logger.warning(
-                "Rejected /acp WebSocket upgrade\n%s",
+                "Rejected %s WebSocket upgrade (%s)\n%s",
+                self._config.transport.ws_path,
+                reason,
                 format_kv_block(
                     {
-                        "host": f"{host_header!r} (allowed={host_ok})",
-                        "origin": f"{origin_header!r} (allowed={origin_ok})",
+                        "reason": reason,
+                        "host": websocket.headers.get("host") or "(none)",
+                        "origin": websocket.headers.get("origin") or "(none)",
                     }
                 ),
             )
             return False
+        self._audit.record(
+            "ws_upgrade_accepted",
+            outcome="allowed",
+            details={"reason": reason},
+        )
         return True
 
     @staticmethod
-    async def _receive_text_frame(websocket: WebSocket) -> str | None:
-        """Read next ASGI WebSocket event, returning text payload or ``None`` for binary."""
+    async def _receive_text_frame(websocket: WebSocket) -> str:
+        """Read next ASGI WebSocket event, rejecting binary frames with close ``1003``."""
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
             raise WebSocketDisconnect(code=int(message.get("code", 1000)))
         raw_text = message.get("text")
         if raw_text is None:
-            logger.debug("Ignoring non-text frame on /acp WebSocket")
-            return None
+            await websocket.close(code=1003)
+            raise WebSocketDisconnect(code=1003)
         return str(raw_text)
 
     async def _send_text_locked(
@@ -124,24 +104,6 @@ class AcpWebSocketGateway:
             return
         async with entry[1]:
             await websocket.send_text(frame)
-
-    async def broadcast_notification(self, frame: str) -> None:
-        """Push one serialized notification frame to all ready ``/acp`` WebSockets."""
-        targets = [
-            (sess, ws, lock)
-            for sess, (ws, lock) in list(self._socket_entries.items())
-            if sess.state == AcpConnectionState.READY
-        ]
-        for sess, ws, lock in targets:
-            async with lock:
-                try:
-                    await ws.send_text(frame)
-                except (WebSocketDisconnect, RuntimeError, OSError) as exc:
-                    logger.debug(
-                        "[%s] Skipping notification push on closed WebSocket: %s",
-                        sess.connection_id,
-                        exc,
-                    )
 
     async def _emit_outcome(
         self,
@@ -165,8 +127,6 @@ class AcpWebSocketGateway:
         """Drive client messages until ACP initialization succeeds or closes."""
         while session.state == AcpConnectionState.UNINITIALIZED:
             raw_text = await self._receive_text_frame(websocket)
-            if raw_text is None:
-                continue
             outcome = await session.handle_init_frame(raw_text)
             if not await self._emit_outcome(session, websocket, outcome):
                 return False
@@ -180,8 +140,6 @@ class AcpWebSocketGateway:
         """Forward authenticated client JSON-RPC frames to the initialized subprocess."""
         while True:
             raw_text = await self._receive_text_frame(websocket)
-            if raw_text is None:
-                continue
             outcome = await session.handle_ready_frame(raw_text)
             if not await self._emit_outcome(session, websocket, outcome):
                 break
@@ -191,15 +149,24 @@ class AcpWebSocketGateway:
         websocket: WebSocket,
         session: AcpConnectionSession,
     ) -> None:
-        """Relay ``agy acp`` stdout NDJSON messages back over the WebSocket."""
+        """Relay agent stdout NDJSON messages back over the WebSocket."""
         while True:
             frame = await session.read_agent_frame()
             if frame is None:
-                logger.info("[%s] agy stdout closed (EOF)", session.connection_id)
+                logger.info("[%s] Agent stdout closed (EOF)", session.connection_id)
                 break
             if frame:
-                label, pretty = format_raw_frame_for_log(frame)
-                logger.info("[%s] agy -> UI (%s)\n%s", session.connection_id, label, pretty)
+                if self._config.logging.effective_log_payloads:
+                    label, pretty = format_raw_frame_for_log(frame)
+                    logger.info(
+                        "[%s] Agent -> UI (%s)\n%s",
+                        session.connection_id,
+                        label,
+                        pretty,
+                    )
+                else:
+                    label, _ = format_raw_frame_for_log(frame)
+                    logger.info("[%s] Agent -> UI (%s)", session.connection_id, label)
                 await self._send_text_locked(session, websocket, frame)
 
     async def _run_ready_relay(
@@ -240,7 +207,7 @@ class AcpWebSocketGateway:
     ) -> None:
         """Execute timeout-guarded init and post-init relay within error boundary."""
         try:
-            async with asyncio.timeout(self._config.initialize_timeout_seconds):
+            async with asyncio.timeout(self._config.agent.initialize_timeout_seconds):
                 should_relay = await self._run_init_phase(websocket, session)
             if should_relay:
                 await self._run_ready_relay(websocket, session)
@@ -252,11 +219,19 @@ class AcpWebSocketGateway:
             await self._send_error_and_close(websocket, err, 1008)
         except AcpError as exc:
             logger.warning("ACP protocol error on %s: %s", session.connection_id, exc)
-            err = format_jsonrpc_error(None, JSONRPC_INTERNAL_ERROR, str(exc))
+            err = (
+                exception_to_jsonrpc_frame(
+                    exc,
+                    None,
+                    debug=self._is_debug_errors(),
+                )
+                or format_jsonrpc_error(None, JSONRPC_INTERNAL_ERROR, "Internal error")
+            )
             await self._send_error_and_close(websocket, err, 1011)
         except Exception as exc:
             logger.exception("Unhandled ACP gateway error on %s", session.connection_id)
-            err = format_jsonrpc_error(None, JSONRPC_INTERNAL_ERROR, f"Internal ACP error: {exc}")
+            detail = f"Internal ACP error: {exc}" if self._is_debug_errors() else "Internal error"
+            err = format_jsonrpc_error(None, JSONRPC_INTERNAL_ERROR, detail)
             await self._send_error_and_close(websocket, err, 1011)
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
@@ -264,44 +239,44 @@ class AcpWebSocketGateway:
         if not self._is_authorized_upgrade(websocket):
             await websocket.close(code=1008)
             return
-        if len(self._active_sessions) >= self._config.max_connections:
+        if len(self._active_sessions) >= self._config.transport.max_connections:
+            self._audit.record("max_connections_reached", outcome="rejected")
             logger.warning(
-                "Rejecting /acp connection: max_connections=%d reached",
-                self._config.max_connections,
+                "Rejecting %s connection: max_connections=%d reached",
+                self._config.transport.ws_path,
+                self._config.transport.max_connections,
             )
             await websocket.close(code=1013)
             return
 
         connection_id = f"acp_{secrets.token_urlsafe(18)}"
-        session = AcpConnectionSession(
-            connection_id,
-            self._config,
-            chat_store=self._chat_store,
-            pre_setup_sync=self._pre_setup_sync,
-            on_prompt_finished=self._on_prompt_finished,
-        )
+        session = AcpConnectionSession(connection_id, self._config, audit=self._audit)
         self._active_sessions.add(session)
         self._socket_entries[session] = (websocket, asyncio.Lock())
-        try:
-            await websocket.accept(
-                headers=[(b"acp-connection-id", connection_id.encode("ascii"))]
-            )
-            logger.info(
-                "[%s] WebSocket connected\n%s",
-                connection_id,
-                format_kv_block(
-                    {
-                        "host": websocket.headers.get("host") or "(none)",
-                        "origin": websocket.headers.get("origin") or "(none)",
-                        "active": f"{len(self._active_sessions)}/{self._config.max_connections}",
-                    }
-                ),
-            )
-            await self._drive_session(websocket, session)
-        finally:
-            self._socket_entries.pop(session, None)
-            self._active_sessions.discard(session)
-            await session.close()
+        with AcpLogContext.bind(connection_id=connection_id):
+            try:
+                await websocket.accept(
+                    headers=[(b"acp-connection-id", connection_id.encode("ascii"))]
+                )
+                logger.info(
+                    "[%s] WebSocket connected\n%s",
+                    connection_id,
+                    format_kv_block(
+                        {
+                            "host": websocket.headers.get("host") or "(none)",
+                            "origin": websocket.headers.get("origin") or "(none)",
+                            "active": (
+                                f"{len(self._active_sessions)}/"
+                                f"{self._config.transport.max_connections}"
+                            ),
+                        }
+                    ),
+                )
+                await self._drive_session(websocket, session)
+            finally:
+                self._socket_entries.pop(session, None)
+                self._active_sessions.discard(session)
+                await session.close()
 
     async def close_all(self) -> None:
         """Terminate all active ACP sessions during FastAPI shutdown."""

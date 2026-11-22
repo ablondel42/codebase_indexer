@@ -1,4 +1,4 @@
-"""ACP v1 session setup, discovery, lifecycle, and deletion wire models."""
+"""ACP v1 session setup, MCP server descriptors, discovery, config options, and modes."""
 
 from typing import Any, Literal
 
@@ -9,18 +9,87 @@ from core.models.base import FrozenModel
 _SESSION_WIRE_CONFIG = ConfigDict(frozen=True, extra="ignore", populate_by_name=True)
 
 
+class EnvVariable(FrozenModel):
+    """Named environment variable entry for stdio MCP servers and terminals."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    name: str = Field(min_length=1)
+    value: str
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class HttpHeader(FrozenModel):
+    """HTTP header name/value entry for HTTP or SSE MCP servers."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    name: str = Field(min_length=1)
+    value: str
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class McpServerStdio(FrozenModel):
+    """Stdio transport MCP server descriptor."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    name: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+    args: tuple[str, ...] = ()
+    env: tuple[EnvVariable, ...] = ()
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class McpServerHttp(FrozenModel):
+    """Streamable HTTP transport MCP server descriptor."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    type: Literal["http"]
+    name: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    headers: tuple[HttpHeader, ...] = ()
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class McpServerSse(FrozenModel):
+    """Legacy SSE transport MCP server descriptor."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    type: Literal["sse"]
+    name: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    headers: tuple[HttpHeader, ...] = ()
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
 class SystemPromptTextBlock(FrozenModel):
     """Text content block permitted inside ACP ``systemPrompt.content``."""
 
+    model_config = _SESSION_WIRE_CONFIG
+
     type: Literal["text"]
     text: str
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SystemPromptConfig(FrozenModel):
     """Client-supplied system prompt configuration for session setup methods."""
 
+    model_config = _SESSION_WIRE_CONFIG
+
     mode: str = Field(min_length=1, max_length=64)
     content: tuple[SystemPromptTextBlock, ...] = Field(min_length=1)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionRootSet(FrozenModel):
+    """Effective filesystem workspace root set ``[cwd, ...additionalDirectories]``."""
+
+    cwd: str = Field(min_length=1)
+    additional_directories: tuple[str, ...] = ()
 
 
 class SessionNewParams(FrozenModel):
@@ -80,6 +149,29 @@ class SessionListParams(FrozenModel):
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
+class SessionInfo(FrozenModel):
+    """Single session summary entry returned inside ``session/list``."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    session_id: str = Field(alias="sessionId", min_length=1)
+    cwd: str = Field(min_length=1)
+    additional_directories: tuple[str, ...] = Field(default=(), alias="additionalDirectories")
+    title: str | None = None
+    updated_at: str | None = Field(default=None, alias="updatedAt")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionListResult(FrozenModel):
+    """Paginated response payload for ``session/list``."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    sessions: tuple[SessionInfo, ...] = ()
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
 class SessionCloseParams(FrozenModel):
     """Validated parameters for ``session/close``."""
 
@@ -98,34 +190,6 @@ class SessionDeleteParams(FrozenModel):
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
-class SessionArtifactSummary(FrozenModel):
-    """Metadata summary for a single markdown artifact in ``brain/<sessionId>/``."""
-
-    name: str
-    summary: str | None = None
-    updated_at: str
-    size_bytes: int = Field(ge=0)
-    user_facing: bool = True
-
-
-class SessionArtifactList(FrozenModel):
-    """Read-only listing of markdown artifacts belonging to an ACP session."""
-
-    session_id: str
-    artifacts: tuple[SessionArtifactSummary, ...] = ()
-
-
-class SessionArtifactContent(FrozenModel):
-    """Read-only markdown content and metadata for a single session artifact."""
-
-    session_id: str
-    name: str
-    summary: str | None = None
-    updated_at: str
-    size_bytes: int = Field(ge=0)
-    content: str
-
-
 class SessionModelOption(FrozenModel):
     """Single model descriptor returned inside ``models.availableModels``."""
 
@@ -134,6 +198,7 @@ class SessionModelOption(FrozenModel):
     model_id: str = Field(alias="modelId", min_length=1)
     name: str = Field(min_length=1)
     description: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionModelsState(FrozenModel):
@@ -146,6 +211,7 @@ class SessionModelsState(FrozenModel):
         alias="availableModels",
     )
     current_model_id: str | None = Field(default=None, alias="currentModelId")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionModeOption(FrozenModel):
@@ -156,6 +222,7 @@ class SessionModeOption(FrozenModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
     description: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionModesState(FrozenModel):
@@ -168,6 +235,7 @@ class SessionModesState(FrozenModel):
         default=(),
         alias="availableModes",
     )
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionConfigSelectChoice(FrozenModel):
@@ -178,6 +246,7 @@ class SessionConfigSelectChoice(FrozenModel):
     value: str = Field(min_length=1)
     name: str = Field(min_length=1)
     description: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionConfigSelectGroup(FrozenModel):
@@ -188,10 +257,11 @@ class SessionConfigSelectGroup(FrozenModel):
     group: str = Field(min_length=1)
     name: str = Field(min_length=1)
     options: tuple[SessionConfigSelectChoice, ...] = ()
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionConfigOption(FrozenModel):
-    """ACP v1 session configuration option descriptor (``model``, ``thought_level``, ``mode``)."""
+    """ACP v1 session configuration option descriptor (``select`` or ``boolean``)."""
 
     model_config = _SESSION_WIRE_CONFIG
 
@@ -202,16 +272,7 @@ class SessionConfigOption(FrozenModel):
     type: str = Field(min_length=1)
     current_value: StrictBool | str = Field(alias="currentValue")
     options: tuple[SessionConfigSelectChoice | SessionConfigSelectGroup, ...] = ()
-
-
-class AntigravityTierInfo(FrozenModel):
-    """Account subscription tier metadata extracted from ``_meta.antigravity.tier``."""
-
-    model_config = _SESSION_WIRE_CONFIG
-
-    id: str = Field(min_length=1)
-    name: str = Field(min_length=1)
-    upgrade_uri: str | None = Field(default=None, alias="upgradeUri")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class AvailableCommandInput(FrozenModel):
@@ -220,6 +281,7 @@ class AvailableCommandInput(FrozenModel):
     model_config = _SESSION_WIRE_CONFIG
 
     hint: str = Field(min_length=1)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class AvailableCommand(FrozenModel):
@@ -230,6 +292,7 @@ class AvailableCommand(FrozenModel):
     name: str = Field(min_length=1)
     description: str
     input: AvailableCommandInput | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionCostUsage(FrozenModel):
@@ -239,6 +302,7 @@ class SessionCostUsage(FrozenModel):
 
     amount: float
     currency: str = Field(min_length=1)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionUsageSnapshot(FrozenModel):
@@ -249,6 +313,7 @@ class SessionUsageSnapshot(FrozenModel):
     used: int = Field(ge=0)
     size: int = Field(ge=0)
     cost: SessionCostUsage | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionSetConfigOptionParams(FrozenModel):
@@ -260,6 +325,18 @@ class SessionSetConfigOptionParams(FrozenModel):
     config_id: str = Field(alias="configId", min_length=1)
     type: str | None = None
     value: StrictBool | str
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionSetConfigOptionResult(FrozenModel):
+    """Validated response for ``session/set_config_option``."""
+
+    model_config = _SESSION_WIRE_CONFIG
+
+    config_options: tuple[SessionConfigOption, ...] = Field(
+        default=(),
+        alias="configOptions",
+    )
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
@@ -284,32 +361,36 @@ class SessionRuntimeState(FrozenModel):
     config_options: tuple[SessionConfigOption, ...] = ()
     available_commands: tuple[AvailableCommand, ...] = ()
     usage: SessionUsageSnapshot | None = None
-    tier: AntigravityTierInfo | None = None
 
 
 __all__ = [
-    "AntigravityTierInfo",
     "AvailableCommand",
     "AvailableCommandInput",
-    "SessionArtifactContent",
-    "SessionArtifactList",
-    "SessionArtifactSummary",
+    "EnvVariable",
+    "HttpHeader",
+    "McpServerHttp",
+    "McpServerSse",
+    "McpServerStdio",
     "SessionCloseParams",
     "SessionConfigOption",
     "SessionConfigSelectChoice",
     "SessionConfigSelectGroup",
     "SessionCostUsage",
     "SessionDeleteParams",
+    "SessionInfo",
     "SessionListParams",
+    "SessionListResult",
     "SessionLoadParams",
     "SessionModeOption",
+    "SessionModelOption",
     "SessionModelsState",
     "SessionModesState",
-    "SessionModelOption",
     "SessionNewParams",
     "SessionResumeParams",
+    "SessionRootSet",
     "SessionRuntimeState",
     "SessionSetConfigOptionParams",
+    "SessionSetConfigOptionResult",
     "SessionSetModeParams",
     "SessionUsageSnapshot",
     "SystemPromptConfig",

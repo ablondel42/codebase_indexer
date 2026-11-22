@@ -15,9 +15,16 @@ from api.models.acp import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_METHOD_NOT_FOUND,
 )
-from api.models.config import ApiServerConfig
+from api.models.config import (
+    AcpServerConfig,
+    AgentConfig,
+    CapabilityPolicyConfig,
+    LogFormat,
+    LoggingConfig,
+    RelayOnlyPolicy,
+)
+from api.services.logging import AcpLoggingConfigurator
 from api.services.server import ApiServerRunner
-from api.utils.formatting import configure_api_terminal_logging
 from core.models.config import AppConfig
 from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
 
@@ -134,11 +141,19 @@ def _write_auth_agent_script(
     return script_path
 
 
-def _make_auth_client(tmp_path: Path, script_path: Path) -> TestClient:
+def _make_auth_client(
+    tmp_path: Path,
+    script_path: Path,
+    *,
+    auth_terminal: RelayOnlyPolicy = RelayOnlyPolicy.DISABLED,
+) -> TestClient:
     """Create a ``TestClient`` wired to ``script_path``."""
-    api_cfg = ApiServerConfig(
-        agy_command=(sys.executable, "-u", str(script_path)),
-        workspace_root=tmp_path,
+    api_cfg = AcpServerConfig(
+        agent=AgentConfig(
+            command=(sys.executable, "-u", str(script_path)),
+            workspace_root=tmp_path,
+        ),
+        capabilities=CapabilityPolicyConfig(auth_terminal=auth_terminal),
     )
     app_cfg = AppConfig(db_path=tmp_path / "auth_test.db")
     return TestClient(
@@ -214,7 +229,7 @@ def test_acp_all_four_methods_and_scoped_api_key_redaction(
     root_logger.addHandler(logging.NullHandler())
 
     try:
-        configure_api_terminal_logging(debug=False)
+        AcpLoggingConfigurator(LoggingConfig(format=LogFormat.PRETTY, level="INFO")).configure()
         with (
             _make_auth_client(tmp_path, script) as client,
             client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws,
@@ -246,7 +261,7 @@ def test_acp_all_four_methods_and_scoped_api_key_redaction(
                     "method": "authenticate",
                     "params": {
                         "methodId": "gemini-api-key",
-                        "_meta": {"apiKey": "AIza-super-secret-key", "traceparent": "00-strip"},
+                        "_meta": {"apiKey": "AIza-super-secret-key", "authorization": "strip"},
                     },
                 }
             )

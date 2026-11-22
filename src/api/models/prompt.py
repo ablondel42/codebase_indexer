@@ -1,4 +1,4 @@
-"""ACP v1 prompt turn, content block, cancellation, permission, and turn-state models."""
+"""ACP v1 prompt turn, content block, tool call, plan, compaction, notice, and subagent models."""
 
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -51,6 +51,63 @@ class PermissionOptionKind(StrEnum):
     ALLOW_ALWAYS = "allow_always"
     REJECT_ONCE = "reject_once"
     REJECT_ALWAYS = "reject_always"
+
+
+class ToolKind(StrEnum):
+    """Standard ACP v1 tool presentation categories."""
+
+    READ = "read"
+    EDIT = "edit"
+    DELETE = "delete"
+    MOVE = "move"
+    SEARCH = "search"
+    EXECUTE = "execute"
+    THINK = "think"
+    FETCH = "fetch"
+    SWITCH_MODE = "switch_mode"
+    OTHER = "other"
+
+
+class ToolCallStatus(StrEnum):
+    """Execution lifecycle statuses for tool calls."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class PlanEntryPriority(StrEnum):
+    """Relative importance of an agent plan entry."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class PlanEntryStatus(StrEnum):
+    """Execution state of an agent plan entry."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+
+class CompactionStatus(StrEnum):
+    """Known ACP context-compaction lifecycle states."""
+
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class NoticeSeverity(StrEnum):
+    """Known presentation severity hints for live ``notice`` updates."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 class ContentAnnotations(FrozenModel):
@@ -159,6 +216,134 @@ PromptContentBlock = Annotated[
 ]
 
 
+class ToolCallLocation(FrozenModel):
+    """File location accessed or modified by a tool call."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    path: str = Field(min_length=1)
+    line: int | None = Field(default=None, ge=0)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ToolCallContentBlock(FrozenModel):
+    """Standard ``ContentBlock`` embedded inside a tool call."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["content"]
+    content: PromptContentBlock
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ToolCallDiffContent(FrozenModel):
+    """File modification diff item inside a tool call."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["diff"]
+    path: str = Field(min_length=1)
+    old_text: str | None = Field(default=None, alias="oldText")
+    new_text: str = Field(alias="newText")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ToolCallTerminalContent(FrozenModel):
+    """Live terminal reference embedded inside a tool call."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["terminal"]
+    terminal_id: str = Field(alias="terminalId", min_length=1)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ToolCallSessionContent(FrozenModel):
+    """Display-only reference linking a tool call to another session (subagent)."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["session"]
+    session_id: str = Field(alias="sessionId", min_length=1)
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+ToolCallContentItem = Annotated[
+    ToolCallContentBlock | ToolCallDiffContent | ToolCallTerminalContent | ToolCallSessionContent,
+    Field(discriminator="type"),
+]
+
+
+class PlanEntry(FrozenModel):
+    """Single task entry inside an agent execution plan."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    content: str
+    priority: PlanEntryPriority | str
+    status: PlanEntryStatus | str
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class PlanItems(FrozenModel):
+    """Item-based identified plan payload for ``plan_update``."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["items"]
+    plan_id: str = Field(alias="planId", min_length=1)
+    entries: tuple[PlanEntry, ...] = ()
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class PlanMarkdown(FrozenModel):
+    """Markdown-based identified plan payload for ``plan_update``."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    type: Literal["markdown"]
+    plan_id: str = Field(alias="planId", min_length=1)
+    content: str
+    path: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class NoticeUpdate(FrozenModel):
+    """Live user-facing ``notice`` session update (gated by ``session.notices``)."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    session_update: Literal["notice"] = Field(alias="sessionUpdate")
+    severity: NoticeSeverity | str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class CompactionUpdate(FrozenModel):
+    """ID-addressed ``compaction_update`` (gated by ``session.compaction``)."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    session_update: Literal["compaction_update"] = Field(alias="sessionUpdate")
+    compaction_id: str = Field(alias="compactionId", min_length=1)
+    status: CompactionStatus | str = Field(min_length=1)
+    summary: tuple[PromptContentBlock, ...] | None = None
+    error: str | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class CompactionSummaryChunk(FrozenModel):
+    """Streamed summary chunk for an active compaction entity."""
+
+    model_config = _PROMPT_WIRE_CONFIG
+
+    session_update: Literal["compaction_summary_chunk"] = Field(alias="sessionUpdate")
+    compaction_id: str = Field(alias="compactionId", min_length=1)
+    content: PromptContentBlock
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
 class SessionPromptParams(FrozenModel):
     """Validated parameters for ``session/prompt``."""
 
@@ -174,7 +359,7 @@ class SessionPromptResult(FrozenModel):
 
     model_config = _PROMPT_WIRE_CONFIG
 
-    stop_reason: StopReason = Field(alias="stopReason")
+    stop_reason: StopReason | str = Field(alias="stopReason", min_length=1)
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
@@ -266,16 +451,31 @@ class PendingPermissionRequest(FrozenModel):
     option_ids: frozenset[str]
 
 
+class PendingAgentRequest(FrozenModel):
+    """Tracked in-flight agent-to-client request (relayed or host-executed)."""
+
+    request_id: StrictInt | str
+    method: str
+    session_id: str | None = None
+    started_at_mono: float = 0.0
+    is_host_executed: bool = False
+
+
 class SubagentSessionState(MutableModel):
     """Tracked subagent child session announced via ``subagent_update``."""
 
     session_id: str
     parent_session_id: str
     can_cancel: bool = False
+    cwd: str | None = None
+    additional_directories: tuple[str, ...] | None = None
+    title: str | None = None
+    description: str | None = None
+    state: dict[str, Any] | None = None
 
 
 class AgentFrameDecision(FrozenModel):
-    """Bridge routing outcome after inspecting one outbound ``agy acp`` frame."""
+    """Bridge routing outcome after inspecting one outbound agent JSON-RPC frame."""
 
     forward_frame: str = ""
     agent_reply: dict[str, Any] | None = None
@@ -288,13 +488,24 @@ __all__ = [
     "BlobResourceContents",
     "CancelRequestParams",
     "CancelledPermissionOutcome",
+    "CompactionStatus",
+    "CompactionSummaryChunk",
+    "CompactionUpdate",
     "ContentAnnotations",
     "EmbeddedResourceContentBlock",
     "ImageContentBlock",
+    "NoticeSeverity",
+    "NoticeUpdate",
+    "PendingAgentRequest",
     "PendingPermissionRequest",
     "PermissionOption",
     "PermissionOptionKind",
     "PermissionOutcome",
+    "PlanEntry",
+    "PlanEntryPriority",
+    "PlanEntryStatus",
+    "PlanItems",
+    "PlanMarkdown",
     "PromptContentBlock",
     "RequestPermissionParams",
     "RequestPermissionResult",
@@ -308,4 +519,12 @@ __all__ = [
     "SubagentSessionState",
     "TextContentBlock",
     "TextResourceContents",
+    "ToolCallContentBlock",
+    "ToolCallContentItem",
+    "ToolCallDiffContent",
+    "ToolCallLocation",
+    "ToolCallSessionContent",
+    "ToolCallStatus",
+    "ToolCallTerminalContent",
+    "ToolKind",
 ]

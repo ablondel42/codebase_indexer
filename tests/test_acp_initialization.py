@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
+from pydantic import ValidationError as PydanticValidationError
 from starlette.websockets import WebSocketDisconnect
 
 from api.models.acp import (
@@ -19,12 +21,23 @@ from api.models.acp import (
     JSONRPC_INVALID_REQUEST,
     JSONRPC_PARSE_ERROR,
 )
-from api.models.config import DEFAULT_AGY_APP_DATA_DIR, ApiServerConfig
+from api.models.config import (
+    DEFAULT_AGY_APP_DATA_DIR,
+    AcpServerConfig,
+    AgentConfig,
+    LogFormat,
+    LoggingConfig,
+    TransportConfig,
+)
+from api.services.logging import AcpLoggingConfigurator
 from api.services.server import ApiServerRunner
-from api.utils.formatting import configure_api_terminal_logging
-from api.utils.security import build_agy_acp_command
+from api.utils.security import (
+    build_agent_command,
+    validate_agy_gemini_dir,
+    validate_agy_relative_dir,
+)
 from core.models.config import AppConfig
-from core.models.exceptions import AcpError
+from core.models.exceptions import AcpConfigError
 from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
 
 VALID_ORIGIN_HEADERS: dict[str, str] = {
@@ -111,13 +124,19 @@ def _make_test_client(
     *,
     max_connections: int = 4,
     initialize_timeout_seconds: float = 5.0,
+    allow_missing_origin: bool | None = None,
 ) -> TestClient:
     """Build a ``TestClient`` backed by a temporary DB and fake ACP subprocess command."""
-    api_cfg = ApiServerConfig(
-        agy_command=(sys.executable, "-u", str(script_path)),
-        max_connections=max_connections,
-        initialize_timeout_seconds=initialize_timeout_seconds,
-        workspace_root=tmp_path,
+    api_cfg = AcpServerConfig(
+        transport=TransportConfig(
+            max_connections=max_connections,
+            allow_missing_origin=allow_missing_origin,
+        ),
+        agent=AgentConfig(
+            command=(sys.executable, "-u", str(script_path)),
+            initialize_timeout_seconds=initialize_timeout_seconds,
+            workspace_root=tmp_path,
+        ),
     )
     app_cfg = AppConfig(db_path=tmp_path / "api_test.db")
     app = ApiServerRunner(api_cfg, app_cfg).create_app()
@@ -163,28 +182,30 @@ def _assert_pid_exited(pid: int, timeout_seconds: float = 2.0) -> None:
     raise AssertionError(f"Subprocess pid={pid} remained alive after socket close.")
 
 
-def test_healthz_and_non_loopback_bind_guard(tmp_path: Path) -> None:
-    """``/healthz`` reports ACP v1 readiness and non-loopback bind fails closed."""
-    with pytest.raises(AcpError, match="non-loopback"):
-        ApiServerRunner(
-            ApiServerConfig(host="0.0.0.0"),
-            AppConfig(db_path=tmp_path / "blocked.db"),
-        ).create_app()
+def test_pure_ws_and_non_loopback_bind_guard(tmp_path: Path) -> None:
+    """Zero HTTP wrapper routes exist and non-loopback bind fails closed."""
+    with pytest.raises(PydanticValidationError, match="non-loopback"):
+        AcpServerConfig(transport=TransportConfig(host="0.0.0.0"))
+
+    with pytest.raises(PydanticValidationError, match="auth_token"):
+        AcpServerConfig(transport=TransportConfig(host="0.0.0.0", allow_non_loopback=True))
 
     allowed_app = ApiServerRunner(
-        ApiServerConfig(host="0.0.0.0", allow_non_loopback=True),
+        AcpServerConfig(
+            transport=TransportConfig(
+                host="0.0.0.0",
+                allow_non_loopback=True,
+                auth_token=SecretStr("dev-secret"),
+            ),
+            agent=AgentConfig(agy_app_data_dir=DEFAULT_AGY_APP_DATA_DIR),
+        ),
         AppConfig(db_path=tmp_path / "allowed.db"),
     ).create_app()
     with TestClient(allowed_app, base_url="http://127.0.0.1:8000") as client:
-        resp = client.get("/healthz")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "ok"
-        assert body["supported_acp_versions"] == [1]
-        assert body["agy_app_data_dir"] == DEFAULT_AGY_APP_DATA_DIR
-        assert body["agy_profile_dir"] == "~/.gemini/antigravity"
+        assert client.get("/healthz").status_code == 404
+        assert client.get("/api/sessions/any/state").status_code == 404
 
-    assert build_agy_acp_command(ApiServerConfig()) == (
+    assert build_agent_command(AgentConfig()) == (
         "agy",
         "acp",
         "--stdio",
@@ -193,8 +214,8 @@ def test_healthz_and_non_loopback_bind_guard(tmp_path: Path) -> None:
         "antigravity",
     )
     isolated_gemini = str((tmp_path / "cbi-gemini").resolve())
-    assert build_agy_acp_command(
-        ApiServerConfig(agy_gemini_dir=isolated_gemini, agy_app_data_dir="acp")
+    assert build_agent_command(
+        AgentConfig(agy_gemini_dir=isolated_gemini, agy_app_data_dir="acp")
     ) == (
         "agy",
         "acp",
@@ -206,11 +227,11 @@ def test_healthz_and_non_loopback_bind_guard(tmp_path: Path) -> None:
         "acp",
     )
     for bad_dir in ("/abs/path", "../escape", ""):
-        with pytest.raises(AcpError):
-            build_agy_acp_command(ApiServerConfig(agy_app_data_dir=bad_dir))
+        with pytest.raises(AcpConfigError):
+            validate_agy_relative_dir(bad_dir, flag_name="--agy-app-data-dir")
     for bad_gemini in (".relative-gemini", f"{isolated_gemini}/../escape", ""):
-        with pytest.raises(AcpError):
-            build_agy_acp_command(ApiServerConfig(agy_gemini_dir=bad_gemini))
+        with pytest.raises(AcpConfigError):
+            validate_agy_gemini_dir(bad_gemini)
 
 
 def test_acp_initialize_happy_path_clamping_and_meta_scrubbing(tmp_path: Path) -> None:
@@ -262,19 +283,21 @@ def test_acp_initialize_happy_path_clamping_and_meta_scrubbing(tmp_path: Path) -
         assert sent_caps["fs"] == {"readTextFile": False, "writeTextFile": False}
         assert sent_caps["terminal"] is False
         assert sent_caps["plan"] == {}
-        assert captured["params"]["_meta"] == {"nested": {"uiTheme": "dark"}}
+        assert captured["params"]["_meta"] == {
+            "traceparent": "00-trace-id",
+            "nested": {"uiTheme": "dark"},
+        }
 
         child_pid = int(pid_path.read_text(encoding="utf-8"))
         _assert_pid_exited(child_pid)
 
 
 def test_acp_rejects_untrusted_origin_and_dns_rebinding_host_before_accept(tmp_path: Path) -> None:
-    """Missing/untrusted ``Origin`` and non-loopback ``Host`` fail pre-accept with ``1008``."""
+    """Disallowed ``Origin`` & non-loopback ``Host`` fail pre-accept; loopback allows no-Origin."""
     capture_path = tmp_path / "never_spawned.json"
     script = _write_fake_acp_script(tmp_path / "fake_acp.py", capture_path=capture_path)
 
     bad_header_cases = [
-        {"host": "127.0.0.1:8000"},
         {"host": "127.0.0.1:8000", "origin": "https://evil.example"},
         {"host": "127.0.0.1:8000", "origin": "null"},
         {"origin": "http://localhost:5173", "host": "attacker.example:8000"},
@@ -287,6 +310,15 @@ def test_acp_rejects_untrusted_origin_and_dns_rebinding_host_before_accept(tmp_p
             ):
                 pytest.fail("Connection should have been rejected before accept.")
             assert exc_info.value.code == 1008
+    assert not capture_path.exists()
+
+    with _make_test_client(tmp_path, script, allow_missing_origin=False) as strict_client:
+        with (
+            pytest.raises(WebSocketDisconnect) as strict_exc,
+            strict_client.websocket_connect("/acp", headers={"host": "127.0.0.1:8000"}),
+        ):
+            pytest.fail("Strict origin policy should reject missing Origin.")
+        assert strict_exc.value.code == 1008
     assert not capture_path.exists()
 
 
@@ -365,14 +397,14 @@ def test_acp_terminal_logging_indents_json_and_redacts_secrets(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """``configure_api_terminal_logging`` emits indented ACP JSON to stderr without secrets."""
+    """``AcpLoggingConfigurator`` emits indented ACP JSON to stderr without secrets."""
     script = _write_fake_acp_script(tmp_path / "log_acp.py")
     root_logger = logging.getLogger(ROOT_LOGGER_NAME)
     reset_logging()
     root_logger.addHandler(logging.NullHandler())
 
     try:
-        configure_api_terminal_logging(debug=False)
+        AcpLoggingConfigurator(LoggingConfig(format=LogFormat.PRETTY, level="INFO")).configure()
         with (
             _make_test_client(tmp_path, script) as client,
             client.websocket_connect("/acp", headers=VALID_ORIGIN_HEADERS) as ws,
@@ -386,10 +418,10 @@ def test_acp_terminal_logging_indents_json_and_redacts_secrets(
             assert ws.receive_json()["id"] == 7
 
         err_out = capsys.readouterr().err
-        assert "UI -> Bridge (request #7 · initialize)\n  {\n    \"jsonrpc\": \"2.0\"" in err_out
-        assert "Bridge -> agy (request #7 · clamped initialize)\n  {" in err_out
-        assert "agy -> UI (response #7 · initialize)\n  {" in err_out
-        assert "\"authorization\": \"[REDACTED]\"" in err_out
+        assert 'UI -> Bridge (request #7 · initialize)\n  {\n    "jsonrpc": "2.0"' in err_out
+        assert "Bridge -> Agent (request #7 · initialize)\n  {" in err_out
+        assert "Agent -> UI (response #7 · initialize)" in err_out
+        assert '"authorization": "[REDACTED]"' in err_out
         assert "super-secret-token" not in err_out
     finally:
         reset_logging()
@@ -399,7 +431,7 @@ def test_acp_terminal_logging_indents_json_and_redacts_secrets(
 def test_live_agy_acp_initialization_smoke(tmp_path: Path) -> None:
     """Smoke-test real ``agy acp --stdio --sandbox`` handshake through FastAPI bridge."""
     app = ApiServerRunner(
-        ApiServerConfig(workspace_root=tmp_path),
+        AcpServerConfig(agent=AgentConfig(workspace_root=tmp_path)),
         AppConfig(db_path=tmp_path / "live_agy.db"),
     ).create_app()
     with (

@@ -1,42 +1,18 @@
-"""FastAPI application factory and Uvicorn runner for the ACP bridge and UI API."""
+"""Pure WebSocket ASGI application factory and Uvicorn runner for ACP v1."""
 
-import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI
 
-from api.models.chat import SessionChatMessagesResponse
-from api.models.config import ApiServerConfig, HealthStatus
-from api.models.session import (
-    SessionArtifactContent,
-    SessionArtifactList,
-    SessionRuntimeState,
-)
+from api.models.config import AcpServerConfig, LogFormat
 from api.services.gateway import AcpWebSocketGateway
-from api.services.watcher import AgyProfileSyncWatcher
-from api.utils.artifacts import (
-    list_session_artifacts,
-    read_session_artifact,
-    validate_artifact_session_id,
-)
-from api.utils.chat import history_page_to_wire
-from api.utils.formatting import configure_api_terminal_logging, format_kv_block
-from api.utils.security import (
-    build_agy_acp_command,
-    format_agy_profile_display,
-    is_allowed_ws_host,
-    is_allowed_ws_origin,
-    resolve_agy_profile_root,
-    validate_bind_host,
-)
-from core.models.chat import ChatPageQuery
+from api.services.logging import AcpLoggingConfigurator
+from api.utils.formatting import format_kv_block
+from api.utils.security import build_agent_command, format_agy_profile_display, validate_bind_host
 from core.models.config import AppConfig
 from core.models.enums import APP_VERSION
-from core.models.exceptions import AcpError
-from core.ports.chat import ChatStoreProtocol
 from core.utils.logging import get_logger
 from engine.services.facade import IndexerEngine
 
@@ -44,75 +20,35 @@ logger = get_logger("api.services.server")
 
 
 class ApiServerRunner:
-    """Constructs the FastAPI ACP bridge app and runs Uvicorn cleanly."""
+    """Constructs the WebSocket-only ACP FastAPI app and runs Uvicorn cleanly."""
 
     def __init__(
         self,
-        api_config: ApiServerConfig | None = None,
+        api_config: AcpServerConfig | None = None,
         app_config: AppConfig | None = None,
         *,
         engine: IndexerEngine | None = None,
-        chat_store: ChatStoreProtocol | None = None,
     ) -> None:
-        """Initialize the FastAPI server runner with optional ``IndexerEngine`` and chat store."""
-        base_api_cfg = api_config if api_config is not None else ApiServerConfig()
+        """Initialize the pure-WebSocket ACP server runner with optional ``IndexerEngine``."""
+        base_cfg = api_config if api_config is not None else AcpServerConfig()
         self._app_config = app_config if app_config is not None else AppConfig()
         self._owns_engine = engine is None
         self._engine = engine if engine is not None else IndexerEngine(self._app_config)
-        chat_db_path = self._resolve_chat_db_path(base_api_cfg, self._engine.db_path)
-        self._api_config = base_api_cfg.model_copy(
-            update={
-                "cbi_db_path": (
-                    base_api_cfg.cbi_db_path
-                    if base_api_cfg.cbi_db_path is not None
-                    else self._engine.db_path
-                ),
-                "chat_db_path": chat_db_path,
-            }
+        resolved_cbi_db = (
+            base_cfg.mcp.cbi_db_path
+            if base_cfg.mcp.cbi_db_path is not None
+            else self._engine.db_path
         )
-        self._chat_store = (
-            chat_store if chat_store is not None else self._engine.open_chat_store(chat_db_path)
+        updated_mcp = base_cfg.mcp.model_copy(update={"cbi_db_path": resolved_cbi_db})
+        updated_logging = (
+            base_cfg.logging.model_copy(update={"level": "DEBUG"})
+            if self._app_config.debug and base_cfg.logging.level != "DEBUG"
+            else base_cfg.logging
         )
-        self._gateway = AcpWebSocketGateway(self._api_config, chat_store=self._chat_store)
-        watch_enabled = self._should_enable_profile_watch(self._api_config)
-        self._profile_watcher = AgyProfileSyncWatcher(
-            resolve_agy_profile_root(self._api_config),
-            self._chat_store,
-            self._gateway,
-            self._engine,
-            enabled=watch_enabled,
+        self._api_config = base_cfg.model_copy(
+            update={"mcp": updated_mcp, "logging": updated_logging}
         )
-        self._gateway.set_sync_callbacks(
-            pre_setup_sync=self._pre_setup_sync,
-            on_prompt_finished=self._profile_watcher.flush_deferred_session,
-        )
-
-    @staticmethod
-    def _should_enable_profile_watch(api_cfg: ApiServerConfig) -> bool:
-        """Enable profile watch automatically for ``agy`` or isolated profile dirs."""
-        if api_cfg.watch_agy_profile is not None:
-            return api_cfg.watch_agy_profile
-        cmd_name = Path(api_cfg.agy_command[0]).name if api_cfg.agy_command else ""
-        return cmd_name == "agy" or api_cfg.agy_gemini_dir is not None
-
-    async def _pre_setup_sync(self, session_id: str) -> bool:
-        """Synchronize ``session_id`` from disk before ACP setup routing executes."""
-        return await self._profile_watcher.sync_session_now(
-            session_id,
-            broadcast=False,
-            defer_if_prompt_active=False,
-        )
-
-    @staticmethod
-    def _resolve_chat_db_path(api_cfg: ApiServerConfig, engine_db_path: Path) -> Path:
-        """Resolve dedicated SQLite chat database path respecting test and profile isolation."""
-        if api_cfg.chat_db_path is not None:
-            return api_cfg.chat_db_path
-        if api_cfg.agy_gemini_dir is not None:
-            return resolve_agy_profile_root(api_cfg) / "cbi_chat.db"
-        if str(engine_db_path) == ":memory:":
-            return Path(":memory:")
-        return engine_db_path.parent / "cbi_chat.db"
+        self._gateway = AcpWebSocketGateway(self._api_config)
 
     @property
     def engine(self) -> IndexerEngine:
@@ -121,206 +57,77 @@ class ApiServerRunner:
 
     @property
     def gateway(self) -> AcpWebSocketGateway:
-        """Return ``AcpWebSocketGateway`` driving ``WS /acp``."""
+        """Return ``AcpWebSocketGateway`` driving the ACP WebSocket route."""
         return self._gateway
 
     @property
-    def chat_store(self) -> ChatStoreProtocol:
-        """Return persistent ``ChatStoreProtocol`` used for conversation timelines."""
-        return self._chat_store
-
-    @property
-    def profile_watcher(self) -> AgyProfileSyncWatcher:
-        """Return ``AgyProfileSyncWatcher`` synchronizing external Antigravity logs."""
-        return self._profile_watcher
-
-    def _verify_http_request(self, request: Request) -> None:
-        """Enforce Host anti-DNS-rebinding and Origin allowlist checks on API routes."""
-        if not is_allowed_ws_host(
-            request.headers.get("host"),
-            allow_non_loopback=self._api_config.allow_non_loopback,
-        ):
-            raise HTTPException(status_code=403, detail="Disallowed Host header.")
-        origin = request.headers.get("origin")
-        if origin is not None and not is_allowed_ws_origin(
-            origin,
-            self._api_config.allowed_origins,
-        ):
-            raise HTTPException(status_code=403, detail="Disallowed Origin header.")
-
-    async def _health_endpoint(self) -> HealthStatus:
-        """Emit structured FastAPI server and supported ACP protocol status."""
-        default_cwd = str((self._api_config.workspace_root or Path.cwd()).resolve())
-        return HealthStatus(
-            app=self._app_config.app_name,
-            version=APP_VERSION,
-            default_cwd=default_cwd,
-            cbi_mcp_enabled=self._api_config.enable_cbi_mcp,
-            agy_app_data_dir=self._api_config.agy_app_data_dir or "",
-            agy_profile_dir=format_agy_profile_display(self._api_config),
-        )
-
-    async def _list_session_artifacts_endpoint(
-        self,
-        session_id: str,
-        request: Request,
-    ) -> SessionArtifactList:
-        """Return read-only ``brain/<session_id>/*.md`` artifact summaries."""
-        self._verify_http_request(request)
-        profile_root = resolve_agy_profile_root(self._api_config)
-        try:
-            return list_session_artifacts(profile_root, session_id)
-        except AcpError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-
-    async def _read_session_artifact_endpoint(
-        self,
-        session_id: str,
-        artifact_name: str,
-        request: Request,
-    ) -> SessionArtifactContent:
-        """Return read-only markdown content for ``brain/<session_id>/<artifact_name>``."""
-        self._verify_http_request(request)
-        profile_root = resolve_agy_profile_root(self._api_config)
-        try:
-            artifact = read_session_artifact(profile_root, session_id, artifact_name)
-        except AcpError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        if artifact is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Artifact '{artifact_name}' not found for session '{session_id}'.",
-            )
-        return artifact
-
-    async def _get_session_state_endpoint(
-        self,
-        session_id: str,
-        request: Request,
-    ) -> SessionRuntimeState:
-        """Return live collected ``SessionRuntimeState`` for an active ACP session."""
-        self._verify_http_request(request)
-        try:
-            clean_id = validate_artifact_session_id(session_id)
-        except AcpError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        state = self._gateway.get_session_state(clean_id)
-        if state is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Active session '{clean_id}' not found.",
-            )
-        return state
-
-    async def _get_session_messages_endpoint(
-        self,
-        session_id: str,
-        request: Request,
-        limit_turns: int = Query(default=8, ge=1, le=50),
-        before_turn: int | None = Query(default=None, ge=1),
-    ) -> SessionChatMessagesResponse:
-        """Return turn-aligned paginated persisted timeline items for ``session_id``."""
-        self._verify_http_request(request)
-        try:
-            clean_id = validate_artifact_session_id(session_id)
-        except AcpError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        await self._gateway.flush_session_chat(clean_id)
-        await self._profile_watcher.sync_session_now(
-            clean_id,
-            broadcast=False,
-            defer_if_prompt_active=False,
-        )
-        page = await asyncio.to_thread(
-            self._chat_store.get_history_page,
-            ChatPageQuery(
-                session_id=clean_id,
-                limit_turns=limit_turns,
-                before_turn=before_turn,
-            ),
-        )
-        return history_page_to_wire(page)
+    def api_config(self) -> AcpServerConfig:
+        """Return resolved immutable ``AcpServerConfig`` for this server."""
+        return self._api_config
 
     def create_app(self) -> FastAPI:
-        """Validate bind host security rules and build the configured ``FastAPI`` app."""
+        """Validate security rules and build the pure WebSocket-only ``FastAPI`` app."""
         validate_bind_host(
-            self._api_config.host,
-            allow_non_loopback=self._api_config.allow_non_loopback,
+            self._api_config.transport.host,
+            allow_non_loopback=self._api_config.transport.allow_non_loopback,
         )
-        build_agy_acp_command(self._api_config)
+        build_agent_command(self._api_config.agent)
 
         @asynccontextmanager
         async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-            self._profile_watcher.start()
             try:
                 yield
             finally:
-                await self._profile_watcher.stop()
                 await self._gateway.close_all()
 
         app = FastAPI(
-            title="Codebase Indexer ACP API",
+            title="Codebase Indexer ACP WebSocket Gateway",
             version=APP_VERSION,
             lifespan=_lifespan,
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
         )
-        app.add_api_route(
-            "/healthz",
-            self._health_endpoint,
-            methods=["GET"],
-            response_model=HealthStatus,
+        app.add_api_websocket_route(
+            self._api_config.transport.ws_path,
+            self._gateway.handle_websocket,
         )
-        app.add_api_route(
-            "/api/sessions/{session_id}/state",
-            self._get_session_state_endpoint,
-            methods=["GET"],
-            response_model=SessionRuntimeState,
-        )
-        app.add_api_route(
-            "/api/sessions/{session_id}/messages",
-            self._get_session_messages_endpoint,
-            methods=["GET"],
-            response_model=SessionChatMessagesResponse,
-            response_model_by_alias=True,
-        )
-        app.add_api_route(
-            "/api/sessions/{session_id}/artifacts",
-            self._list_session_artifacts_endpoint,
-            methods=["GET"],
-            response_model=SessionArtifactList,
-        )
-        app.add_api_route(
-            "/api/sessions/{session_id}/artifacts/{artifact_name}",
-            self._read_session_artifact_endpoint,
-            methods=["GET"],
-            response_model=SessionArtifactContent,
-        )
-        app.add_api_websocket_route("/acp", self._gateway.handle_websocket)
         return app
 
     def run(self) -> None:
-        """Start the Uvicorn ASGI server and close owned ``IndexerEngine`` on exit."""
-        configure_api_terminal_logging(debug=self._app_config.debug)
+        """Configure structured logging, start Uvicorn, and close owned engine on exit."""
+        AcpLoggingConfigurator(self._api_config.logging).configure()
         app = self.create_app()
+        t_cfg = self._api_config.transport
+        c_cfg = self._api_config.capabilities
         logger.info(
-            "Starting FastAPI ACP bridge\n%s",
+            "Starting pure ACP v1 WebSocket gateway\n%s",
             format_kv_block(
                 {
-                    "bind": f"{self._api_config.host}:{self._api_config.port}",
-                    "agy_command": " ".join(build_agy_acp_command(self._api_config)),
-                    "agy_profile": format_agy_profile_display(self._api_config),
-                    "chat_db": str(self._chat_store.db_path),
-                    "allowed_origins": ", ".join(self._api_config.allowed_origins),
-                    "max_connections": self._api_config.max_connections,
+                    "ws_url": f"ws://{t_cfg.host}:{t_cfg.port}{t_cfg.ws_path}",
+                    "agent_command": " ".join(build_agent_command(self._api_config.agent)),
+                    "agy_profile": format_agy_profile_display(self._api_config.agent),
+                    "fs_policy": f"read={c_cfg.fs_read.value}, write={c_cfg.fs_write.value}",
+                    "terminal_policy": c_cfg.terminal.value,
+                    "log_format": self._api_config.logging.format.value,
+                    "max_connections": t_cfg.max_connections,
                 }
             ),
+        )
+        uvicorn_level = (
+            "debug"
+            if self._api_config.logging.level == "DEBUG"
+            else ("warning" if self._api_config.logging.format == LogFormat.JSON else "info")
         )
         try:
             uvicorn.run(
                 app,
-                host=self._api_config.host,
-                port=self._api_config.port,
-                ws_max_size=self._api_config.max_frame_bytes,
-                log_level="debug" if self._app_config.debug else "info",
+                host=t_cfg.host,
+                port=t_cfg.port,
+                ws_max_size=t_cfg.max_frame_bytes,
+                ws_ping_interval=t_cfg.ws_ping_interval_seconds,
+                ws_ping_timeout=t_cfg.ws_ping_timeout_seconds,
+                log_level=uvicorn_level,
             )
         finally:
             if self._owns_engine:

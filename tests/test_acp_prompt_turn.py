@@ -16,9 +16,14 @@ from api.models.acp import (
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
 )
-from api.models.config import ApiServerConfig
+from api.models.config import (
+    AcpServerConfig,
+    AgentConfig,
+    LogFormat,
+    LoggingConfig,
+)
+from api.services.logging import AcpLoggingConfigurator
 from api.services.server import ApiServerRunner
-from api.utils.formatting import configure_api_terminal_logging
 from core.models.config import AppConfig
 from core.utils.logging import ROOT_LOGGER_NAME, reset_logging
 
@@ -380,9 +385,11 @@ def _write_prompt_agent_script(
 
 def _make_prompt_client(tmp_path: Path, script_path: Path) -> TestClient:
     """Create a FastAPI ``TestClient`` wired to ``script_path``."""
-    api_cfg = ApiServerConfig(
-        agy_command=(sys.executable, "-u", str(script_path)),
-        workspace_root=tmp_path,
+    api_cfg = AcpServerConfig(
+        agent=AgentConfig(
+            command=(sys.executable, "-u", str(script_path)),
+            workspace_root=tmp_path,
+        ),
     )
     app_cfg = AppConfig(db_path=tmp_path / "prompt_turn.db")
     return TestClient(
@@ -443,7 +450,7 @@ def test_prompt_turn_full_lifecycle_permission_meta_scrubbing_and_followup(
     root_logger.addHandler(logging.NullHandler())
 
     try:
-        configure_api_terminal_logging(debug=False)
+        AcpLoggingConfigurator(LoggingConfig(format=LogFormat.PRETTY, level="INFO")).configure()
         with (
             _make_prompt_client(tmp_path, script) as client,
             client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws,

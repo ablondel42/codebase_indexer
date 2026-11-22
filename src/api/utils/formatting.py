@@ -1,16 +1,17 @@
-"""Stateless terminal log formatting and secret-redacted JSON indentation helpers."""
+"""Stateless terminal log formatting, NDJSON serialization, and deep secret redaction."""
 
 import difflib
 import json
-import logging
-import sys
+import re
 import textwrap
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
-from api.utils.security import FORBIDDEN_META_KEYS
-from core.utils.logging import ROOT_LOGGER_NAME, get_logger
+from pydantic import SecretStr
+
+from core.utils.logging import get_logger
 
 logger = get_logger("api.utils.formatting")
 
@@ -18,9 +19,54 @@ API_CONSOLE_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 API_CONSOLE_DATEFMT: str = "%H:%M:%S"
 BINARY_LOG_PREVIEW_LIMIT: int = 128
 
+FORBIDDEN_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "api_key",
+        "apikey",
+        "x-api-key",
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "cookie",
+        "set-cookie",
+        "auth_token",
+        "bearer",
+        "private_key",
+    }
+)
+
+_URL_CREDENTIALS_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _redact_url_credentials(text: str) -> str:
+    """Mask embedded ``user:password@`` credentials inside HTTP/WS/URL strings."""
+    if "@" not in text or not _URL_CREDENTIALS_RE.match(text):
+        return text
+    try:
+        parsed = urlsplit(text)
+    except ValueError as exc:
+        logger.debug("Skipping credential mask on malformed URL: %s", exc)
+        return text
+    if not parsed.username and not parsed.password:
+        return text
+    host_part = parsed.hostname or ""
+    if ":" in host_part and not host_part.startswith("["):
+        host_part = f"[{host_part}]"
+    netloc = f"[REDACTED]@{host_part}"
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
 
 def _redact_named_pairs(items: list[Any] | tuple[Any, ...]) -> list[Any]:
-    """Redact ``value`` fields in MCP ``env`` or ``headers`` ``{name, value}`` lists."""
+    """Redact ``value`` fields in MCP/terminal ``env`` or ``headers`` ``{name, value}`` lists."""
     redacted: list[Any] = []
     for entry in items:
         if isinstance(entry, Mapping) and "name" in entry and "value" in entry:
@@ -32,25 +78,34 @@ def _redact_named_pairs(items: list[Any] | tuple[Any, ...]) -> list[Any]:
     return redacted
 
 
+def _redact_env_mapping(env_map: Mapping[str, Any]) -> dict[str, str]:
+    """Redact all values in a flat environment dictionary."""
+    return {str(k): "[REDACTED]" for k in env_map}
+
+
 def _redact_mapping_entry(key: object, val: Any) -> Any:
-    """Redact a single mapping value based on credential and MCP env/header rules."""
+    """Redact a single mapping value based on credential and env/header rules."""
     if isinstance(key, str):
         lowered = key.lower()
-        if lowered in FORBIDDEN_META_KEYS:
+        if lowered in FORBIDDEN_SECRET_KEYS:
             return "[REDACTED]"
         if lowered in ("env", "headers") and isinstance(val, (list, tuple)):
             return _redact_named_pairs(val)
+        if lowered == "env" and isinstance(val, Mapping):
+            return _redact_env_mapping(val)
     return redact_for_log(val)
 
 
 def redact_for_log(value: Any) -> Any:
-    """Recursively replace sensitive credential/tracing keys with ``'[REDACTED]'``."""
+    """Recursively replace sensitive credentials, URL auth, and env/headers with ``[REDACTED]``."""
+    if isinstance(value, SecretStr):
+        return "[REDACTED]"
     if isinstance(value, Mapping):
         return {str(k): _redact_mapping_entry(k, v) for k, v in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [redact_for_log(item) for item in value]
-    if isinstance(value, tuple):
-        return [redact_for_log(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url_credentials(value)
     return value
 
 
@@ -180,7 +235,7 @@ def _format_value_for_log(value: Any, depth: int) -> str:
         return _format_sequence_for_log(value, depth)
     if isinstance(value, str) and "\n" in value:
         return _format_multiline_str(value, depth)
-    return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def indent_json_payload(payload: Any, *, indent_spaces: int = 2) -> str:
@@ -216,45 +271,26 @@ def format_kv_block(fields: Mapping[str, Any], *, indent_spaces: int = 2) -> str
     if not fields:
         return ""
     pad = " " * indent_spaces
-    width = max(len(str(key)) for key in fields) + 1
-    lines = [f"{pad}{f'{key}:':<{width}} {value}" for key, value in fields.items()]
+    redacted = redact_for_log(fields)
+    width = max(len(str(key)) for key in redacted) + 1
+    lines = [f"{pad}{f'{key}:':<{width}} {value}" for key, value in redacted.items()]
     return "\n".join(lines)
 
 
-def configure_api_terminal_logging(*, debug: bool = False) -> None:
-    """Ensure ``indexer`` logs emit cleanly to ``stderr`` during ``cbi api`` runs."""
-    root_logger = logging.getLogger(ROOT_LOGGER_NAME)
-    for handler in list(root_logger.handlers):
-        if isinstance(handler, logging.NullHandler):
-            root_logger.removeHandler(handler)
-
-    formatter = logging.Formatter(API_CONSOLE_FORMAT, datefmt=API_CONSOLE_DATEFMT)
-    has_stream_handler = False
-    for handler in root_logger.handlers:
-        if isinstance(handler, logging.StreamHandler) and not isinstance(
-            handler,
-            logging.FileHandler,
-        ):
-            handler.setFormatter(formatter)
-            has_stream_handler = True
-
-    if not has_stream_handler:
-        console = logging.StreamHandler(sys.stderr)
-        console.setLevel(logging.DEBUG)
-        console.setFormatter(formatter)
-        root_logger.addHandler(console)
-
-    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    root_logger.propagate = False
+def format_ndjson_log_line(fields: Mapping[str, Any]) -> str:
+    """Serialize a structured log record dictionary as redacted single-line NDJSON."""
+    redacted = redact_for_log(fields)
+    return json.dumps(redacted, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 __all__ = [
     "API_CONSOLE_DATEFMT",
     "API_CONSOLE_FORMAT",
     "BINARY_LOG_PREVIEW_LIMIT",
-    "configure_api_terminal_logging",
+    "FORBIDDEN_SECRET_KEYS",
     "describe_jsonrpc_frame",
     "format_kv_block",
+    "format_ndjson_log_line",
     "format_raw_frame_for_log",
     "indent_json_payload",
     "redact_for_log",

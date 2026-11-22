@@ -1,4 +1,4 @@
-"""Async subprocess lifecycle manager for ``agy acp --stdio``."""
+"""Async subprocess lifecycle manager for stdio ACP agents."""
 
 import asyncio
 import shutil
@@ -6,24 +6,25 @@ from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
-from api.models.config import ApiServerConfig
+from api.models.config import AcpServerConfig
 from api.utils.formatting import format_kv_block
 from api.utils.jsonrpc import encode_stdio_line
-from api.utils.security import build_agy_acp_command, build_sanitized_agy_env
-from core.models.exceptions import AcpError
+from api.utils.security import build_agent_command, build_sanitized_agent_env
+from core.models.exceptions import AcpConfigError, AcpTransportError
 from core.utils.logging import get_logger
 
 logger = get_logger("api.services.process")
 
 
-class AgyAcpProcess:
-    """Manages spawning, stdio NDJSON I/O, ``stderr`` draining, and teardown of ``agy acp``."""
+class AcpSubprocessTransport:
+    """Manages spawning, stdio NDJSON I/O, ``stderr`` draining, and teardown of ACP agents."""
 
-    def __init__(self, config: ApiServerConfig) -> None:
-        """Initialize the ACP subprocess manager from immutable ``ApiServerConfig``."""
+    def __init__(self, config: AcpServerConfig) -> None:
+        """Initialize the ACP subprocess transport from immutable ``AcpServerConfig``."""
         self._config = config
+        self._agent_cfg = config.agent
         self._proc: asyncio.subprocess.Process | None = None
-        self._stderr_lines: deque[str] = deque(maxlen=config.stderr_history_limit)
+        self._stderr_lines: deque[str] = deque(maxlen=self._agent_cfg.stderr_history_limit)
         self._stderr_task: asyncio.Task[None] | None = None
         self._write_lock = asyncio.Lock()
 
@@ -49,25 +50,25 @@ class AgyAcpProcess:
 
     def _resolve_workspace_cwd(self) -> str | None:
         """Validate and return resolved working directory string when configured."""
-        workspace = self._config.workspace_root
+        workspace = self._agent_cfg.workspace_root
         if workspace is None:
             return None
         resolved = workspace.resolve()
         if not resolved.exists() or not resolved.is_dir():
-            raise AcpError(
+            raise AcpConfigError(
                 f"Configured ACP workspace directory does not exist: {workspace}",
                 context={"workspace_root": str(workspace)},
             )
         return str(resolved)
 
     async def start(self) -> None:
-        """Validate command/workspace, spawn ``agy acp`` safely, and begin draining stderr."""
+        """Validate command/workspace, spawn ACP subprocess safely, and drain stderr."""
         if self._proc is not None:
             return
-        cmd = build_agy_acp_command(self._config)
+        cmd = build_agent_command(self._agent_cfg)
         executable = cmd[0]
         if shutil.which(executable) is None:
-            raise AcpError(
+            raise AcpTransportError(
                 f"ACP agent executable '{executable}' was not found in PATH.",
                 context={"executable": executable},
             )
@@ -81,11 +82,11 @@ class AgyAcpProcess:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
-                env=build_sanitized_agy_env(),
-                limit=self._config.max_frame_bytes,
+                env=build_sanitized_agent_env(self._agent_cfg.extra_env_allowlist),
+                limit=self._config.transport.max_frame_bytes,
             )
         except OSError as exc:
-            raise AcpError(
+            raise AcpTransportError(
                 f"Failed to spawn ACP agent '{executable}': {exc}",
                 context={"command": list(cmd)},
             ) from exc
@@ -93,7 +94,7 @@ class AgyAcpProcess:
         self._proc = proc
         if proc.stdin is None or proc.stdout is None or proc.stderr is None:
             await self.stop()
-            raise AcpError("ACP subprocess failed to attach stdio pipes.")
+            raise AcpTransportError("ACP subprocess failed to attach stdio pipes.")
 
         self._stderr_task = asyncio.create_task(self._drain_stderr(proc.stderr))
         logger.info(
@@ -108,34 +109,37 @@ class AgyAcpProcess:
         )
 
     async def send_line(self, payload: Mapping[str, Any]) -> None:
-        """Write one UTF-8 newline-delimited JSON-RPC message to ``agy acp`` ``stdin``."""
+        """Write one UTF-8 newline-delimited JSON-RPC message to subprocess ``stdin``."""
         async with self._write_lock:
             proc = self._proc
             if proc is None or proc.stdin is None:
-                raise AcpError("Cannot write to ACP subprocess: stdin is closed.")
-            encoded = encode_stdio_line(payload, max_bytes=self._config.max_frame_bytes)
+                raise AcpTransportError("Cannot write to ACP subprocess: stdin is closed.")
+            encoded = encode_stdio_line(
+                payload,
+                max_bytes=self._config.transport.max_frame_bytes,
+            )
             try:
                 proc.stdin.write(encoded)
                 await proc.stdin.drain()
             except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-                raise AcpError(f"Failed writing to ACP subprocess stdin: {exc}") from exc
+                raise AcpTransportError(f"Failed writing to ACP subprocess stdin: {exc}") from exc
 
     async def read_line(self) -> str | None:
-        """Read one newline-delimited JSON-RPC frame from ``agy acp`` ``stdout``."""
+        """Read one newline-delimited JSON-RPC frame from subprocess ``stdout``."""
         proc = self._proc
         if proc is None or proc.stdout is None:
-            raise AcpError("Cannot read from ACP subprocess: stdout is closed.")
+            raise AcpTransportError("Cannot read from ACP subprocess: stdout is closed.")
         try:
             raw_line = await proc.stdout.readline()
         except (asyncio.LimitOverrunError, ValueError, OSError) as exc:
             logger.warning("ACP subprocess stdout read error: %s", exc)
-            raise AcpError(f"ACP stdout frame failed size or stream check: {exc}") from exc
+            raise AcpTransportError(f"ACP stdout frame failed size or stream check: {exc}") from exc
         if not raw_line:
             return None
         try:
             return raw_line.decode("utf-8").rstrip("\r\n")
         except UnicodeDecodeError as exc:
-            raise AcpError(f"ACP agent emitted non-UTF-8 stdout data: {exc}") from exc
+            raise AcpTransportError(f"ACP agent emitted non-UTF-8 stdout data: {exc}") from exc
 
     async def stop(self) -> None:
         """Close pipes, gracefully terminate or kill the child process, and join stderr."""
@@ -187,12 +191,15 @@ class AgyAcpProcess:
             except ProcessLookupError as exc:
                 logger.debug("ACP subprocess pid=%s already exited: %s", proc.pid, exc)
         try:
-            await asyncio.wait_for(proc.wait(), timeout=self._config.terminate_wait_seconds)
+            await asyncio.wait_for(
+                proc.wait(),
+                timeout=self._agent_cfg.terminate_wait_seconds,
+            )
         except TimeoutError as exc:
             logger.warning(
                 "ACP subprocess pid=%s did not exit within %.2fs (%s); killing",
                 proc.pid,
-                self._config.terminate_wait_seconds,
+                self._agent_cfg.terminate_wait_seconds,
                 exc,
             )
             await self._kill_and_reap(proc)
@@ -219,6 +226,9 @@ class AgyAcpProcess:
             logger.debug("ACP stderr drain task cancelled: %s", exc)
 
 
+AgyAcpProcess = AcpSubprocessTransport
+
 __all__ = [
+    "AcpSubprocessTransport",
     "AgyAcpProcess",
 ]

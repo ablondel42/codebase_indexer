@@ -3,14 +3,9 @@
 import argparse
 import asyncio
 import json
+from typing import Any
 
-from api import (
-    DEFAULT_AGY_APP_DATA_DIR,
-    DEFAULT_ALLOWED_ORIGINS,
-    ApiServerConfig,
-    ApiServerRunner,
-)
-from api.utils.security import resolve_agy_profile_root
+from api import DEFAULT_ALLOWED_ORIGINS, ApiServerRunner, resolve_acp_server_config
 from cli.utils.argv import normalize_mcp_tool_kwargs, parse_mcp_call_args
 from cli.utils.output import (
     emit_json,
@@ -26,40 +21,22 @@ logger = get_logger("cli.services.server")
 
 
 class ServerCliCommands:
-    """Executes ``cbi serve`` stdio MCP server and ``cbi mcp-call`` local tool inspection."""
+    """Executes ``cbi serve``, ``cbi mcp-call``, and ``cbi api`` CLI commands."""
 
     def __init__(self, engine: IndexerEngine) -> None:
-        """Initialize MCP server and local call CLI command handlers.
-
-        Args:
-            engine: Headless ``IndexerEngine`` application facade.
-        """
+        """Initialize MCP server and ACP gateway CLI command handlers."""
         self._engine = engine
 
     @staticmethod
     def _extract_raw_tokens(args: argparse.Namespace) -> list[str]:
-        """Extract raw ``json_args`` CLI tokens as a normalized list of strings.
-
-        Args:
-            args: Parsed ``cbi mcp-call`` CLI arguments.
-
-        Returns:
-            List of raw string tokens supplied after ``tool_name``.
-        """
+        """Extract raw ``json_args`` CLI tokens as a normalized list of strings."""
         raw_arg_value = getattr(args, "json_args", [])
         if isinstance(raw_arg_value, str):
             return [raw_arg_value] if raw_arg_value else []
         return list(raw_arg_value or [])
 
     def run_serve(self, args: argparse.Namespace) -> int:
-        """Start the token-lean MCP server on ``stdio`` transport.
-
-        Args:
-            args: Parsed ``cbi serve`` CLI arguments.
-
-        Returns:
-            Process exit code ``0`` when the ``stdio`` loop exits cleanly.
-        """
+        """Start the token-lean MCP server on ``stdio`` transport."""
         db_path = resolve_cli_db_path(args, self._engine.db_path)
         debug = bool(getattr(args, "debug", False) or getattr(args, "verbose", False))
         logger.debug("Running cbi serve (db_path=%s, debug=%s)", db_path, debug)
@@ -92,28 +69,62 @@ class ServerCliCommands:
         emit_json(envelope.model_dump())
         return exit_code
 
+    @staticmethod
+    def _build_api_transport_overrides(args: argparse.Namespace) -> dict[str, Any]:
+        """Extract CLI transport overrides without masking TOML/env defaults."""
+        extra_origins = getattr(args, "allow_origin", None)
+        return {
+            "host": getattr(args, "host", None),
+            "port": getattr(args, "port", None),
+            "ws_path": getattr(args, "ws_path", None),
+            "allow_non_loopback": getattr(args, "allow_non_loopback", None),
+            "allowed_origins": (
+                (*DEFAULT_ALLOWED_ORIGINS, *extra_origins) if extra_origins else None
+            ),
+            "auth_token": getattr(args, "auth_token", None),
+        }
+
+    @staticmethod
+    def _build_api_agent_overrides(args: argparse.Namespace) -> dict[str, Any]:
+        """Extract CLI ACP agent overrides without masking TOML/env defaults."""
+        agent_cmd = getattr(args, "agent_command", None)
+        return {
+            "command": tuple(agent_cmd) if agent_cmd else None,
+            "workspace_root": getattr(args, "workspace", None),
+            "agy_sandbox": False if getattr(args, "no_agy_sandbox", False) else None,
+            "agy_app_data_dir": getattr(args, "agy_app_data_dir", None),
+            "agy_gemini_dir": getattr(args, "agy_gemini_dir", None),
+        }
+
+    @staticmethod
+    def _build_api_cli_overrides(args: argparse.Namespace, *, debug: bool) -> dict[str, Any]:
+        """Collect non-None CLI overrides across composed ``AcpServerConfig`` sections."""
+        log_level = getattr(args, "log_level", None) or ("DEBUG" if debug else None)
+        return {
+            "transport": ServerCliCommands._build_api_transport_overrides(args),
+            "agent": ServerCliCommands._build_api_agent_overrides(args),
+            "capabilities": {
+                "fs_read": getattr(args, "fs_read", None),
+                "fs_write": getattr(args, "fs_write", None),
+                "terminal": getattr(args, "terminal", None),
+                "auth_terminal": getattr(args, "auth_terminal", None),
+            },
+            "logging": {
+                "format": getattr(args, "log_format", None),
+                "level": log_level,
+                "log_file": getattr(args, "log_file", None),
+            },
+        }
+
     def run_api(self, args: argparse.Namespace) -> int:
-        """Start the FastAPI ACP bridge server after validating loopback security."""
+        """Start the pure-WebSocket ACP v1 server after resolving 3-layer config."""
         db_path = resolve_cli_db_path(args, self._engine.db_path)
-        extra_origins = tuple(getattr(args, "allow_origin", []) or ())
         debug = bool(getattr(args, "debug", self._engine.config.debug))
         scoped = self._engine.for_db(db_path)
         app_cfg = scoped.config.model_copy(update={"debug": debug})
-        raw_app_dir = getattr(args, "agy_app_data_dir", None)
-        base_cfg = ApiServerConfig(
-            host=str(getattr(args, "host", "127.0.0.1")),
-            port=int(getattr(args, "port", 8000)),
-            allow_non_loopback=bool(getattr(args, "allow_non_loopback", False)),
-            allowed_origins=(*DEFAULT_ALLOWED_ORIGINS, *extra_origins),
-            workspace_root=getattr(args, "workspace", None),
-            agy_sandbox=not bool(getattr(args, "no_agy_sandbox", False)),
-            agy_app_data_dir=(
-                str(raw_app_dir) if raw_app_dir is not None else DEFAULT_AGY_APP_DATA_DIR
-            ),
-            agy_gemini_dir=getattr(args, "agy_gemini_dir", None),
-        )
-        api_cfg = base_cfg.model_copy(
-            update={"chat_db_path": resolve_agy_profile_root(base_cfg) / "cbi_chat.db"}
+        api_cfg = resolve_acp_server_config(
+            config_file=getattr(args, "config", None),
+            cli_overrides=self._build_api_cli_overrides(args, debug=debug),
         )
         runner = ApiServerRunner(api_cfg, app_cfg, engine=scoped)
         runner.run()

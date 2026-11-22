@@ -382,41 +382,65 @@ class CliParserBuilder:
         subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
         sub_common: argparse.ArgumentParser,
     ) -> None:
-        """Register the ``cbi api`` FastAPI ACP WebSocket server subcommand."""
+        """Register the ``cbi api`` pure ACP WebSocket gateway subcommand."""
         api_p = subparsers.add_parser(
             "api",
             parents=[sub_common],
-            help="Start FastAPI server hosting the hardened /acp WebSocket bridge",
+            help="Start pure JSON-RPC 2.0 ACP v1 WebSocket gateway",
+        )
+        api_p.add_argument(
+            "--config",
+            type=Path,
+            default=None,
+            help="Optional TOML configuration file path",
         )
         api_p.add_argument(
             "--host",
             type=str,
-            default="127.0.0.1",
+            default=None,
             help="Bind address (default: 127.0.0.1 loopback-only)",
         )
         api_p.add_argument(
             "--port",
             type=int,
-            default=8000,
+            default=None,
             help="Listening TCP port (default: 8000)",
+        )
+        api_p.add_argument(
+            "--ws-path",
+            type=str,
+            default=None,
+            help="WebSocket endpoint path (default: /acp)",
         )
         api_p.add_argument(
             "--allow-non-loopback",
             action="store_true",
-            default=False,
-            help="Allow binding non-loopback network interfaces (unsafe on untrusted LANs)",
+            default=None,
+            help="Allow binding non-loopback network interfaces (requires --auth-token)",
         )
         api_p.add_argument(
             "--allow-origin",
             action="append",
-            default=[],
+            default=None,
             help="Additional allowed WebSocket Origin (repeatable)",
+        )
+        api_p.add_argument(
+            "--auth-token",
+            type=str,
+            default=None,
+            help="Optional Bearer token required on WebSocket upgrade",
+        )
+        api_p.add_argument(
+            "--agent-command",
+            action="append",
+            default=None,
+            help="ACP stdio agent command argument (repeatable; replaces default agy acp --stdio)",
         )
         api_p.add_argument(
             "--workspace",
             type=Path,
             default=None,
-            help="Optional workspace root directory passed as cwd for agy acp",
+            help="Optional workspace root directory passed as cwd for the ACP agent",
         )
         api_p.add_argument(
             "--no-agy-sandbox",
@@ -435,6 +459,48 @@ class CliParserBuilder:
             type=str,
             default=None,
             help="Optional absolute root directory override instead of ~/.gemini",
+        )
+        api_p.add_argument(
+            "--fs-read",
+            choices=["disabled", "relay", "host"],
+            default=None,
+            help="Policy for Agent->Client fs/read_text_file (default: disabled)",
+        )
+        api_p.add_argument(
+            "--fs-write",
+            choices=["disabled", "relay", "host"],
+            default=None,
+            help="Policy for Agent->Client fs/write_text_file (default: disabled)",
+        )
+        api_p.add_argument(
+            "--terminal",
+            choices=["disabled", "relay", "host"],
+            default=None,
+            help="Policy for Agent->Client terminal/* (default: disabled)",
+        )
+        api_p.add_argument(
+            "--auth-terminal",
+            choices=["disabled", "relay"],
+            default=None,
+            help="Policy for clientCapabilities.auth.terminal (default: disabled)",
+        )
+        api_p.add_argument(
+            "--log-format",
+            choices=["pretty", "json"],
+            default=None,
+            help="Log format: pretty (DEV) or json (PROD NDJSON)",
+        )
+        api_p.add_argument(
+            "--log-level",
+            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            default=None,
+            help="Minimum ACP server log level",
+        )
+        api_p.add_argument(
+            "--log-file",
+            type=Path,
+            default=None,
+            help="Optional NDJSON log output file path",
         )
         api_p.add_argument(
             "--debug",

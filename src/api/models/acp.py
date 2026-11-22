@@ -1,23 +1,28 @@
-"""ACP v1 initialization, capability negotiation, and JSON-RPC 2.0 wire models."""
+"""ACP v1 initialization, capability negotiation, and authentication wire models."""
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import ConfigDict, Field, StrictInt
 
+from api.models.jsonrpc import (
+    ACP_AUTH_REQUIRED,
+    ACP_REQUEST_CANCELLED,
+    ACP_RESOURCE_NOT_FOUND,
+    JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST,
+    JSONRPC_METHOD_NOT_FOUND,
+    JSONRPC_PARSE_ERROR,
+    JsonRpcErrorObject,
+    JsonRpcErrorResponse,
+    JsonRpcSuccessResponse,
+    SessionStepOutcome,
+)
 from core.models.base import FrozenModel
 
 LATEST_ACP_VERSION: int = 1
 SUPPORTED_ACP_VERSIONS: frozenset[int] = frozenset({1})
-
-JSONRPC_PARSE_ERROR: int = -32700
-JSONRPC_INVALID_REQUEST: int = -32600
-JSONRPC_METHOD_NOT_FOUND: int = -32601
-JSONRPC_INVALID_PARAMS: int = -32602
-JSONRPC_INTERNAL_ERROR: int = -32603
-ACP_REQUEST_CANCELLED: int = -32800
-ACP_AUTH_REQUIRED: int = -32000
-ACP_RESOURCE_NOT_FOUND: int = -32002
 
 _WIRE_MODEL_CONFIG = ConfigDict(frozen=True, extra="ignore", populate_by_name=True)
 
@@ -56,6 +61,7 @@ class ClientAuthCapabilities(FrozenModel):
     model_config = _WIRE_MODEL_CONFIG
 
     terminal: bool = False
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class ClientFsCapabilities(FrozenModel):
@@ -65,6 +71,82 @@ class ClientFsCapabilities(FrozenModel):
 
     read_text_file: bool = Field(default=False, alias="readTextFile")
     write_text_file: bool = Field(default=False, alias="writeTextFile")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ElicitationFormCapabilities(FrozenModel):
+    """Capability marker for form-based elicitation support."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ElicitationUrlCapabilities(FrozenModel):
+    """Capability marker for URL-based elicitation support."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class ElicitationCapabilities(FrozenModel):
+    """Elicitation modes advertised by the client during initialization."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    form: ElicitationFormCapabilities | None = None
+    url: ElicitationUrlCapabilities | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class PlanCapabilities(FrozenModel):
+    """Capability marker for ``plan_update`` and ``plan_removed`` session updates."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class CompactionCapabilities(FrozenModel):
+    """Capability marker for ``compaction_update`` and ``compaction_summary_chunk``."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class NoticeCapabilities(FrozenModel):
+    """Capability marker for live user-facing ``notice`` session updates."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SubagentCapabilities(FrozenModel):
+    """Capability marker for ``subagent_update``, ``session_message``, and child rules."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class BooleanConfigOptionCapabilities(FrozenModel):
+    """Capability marker for ``type: 'boolean'`` session configuration options."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionConfigOptionsCapabilities(FrozenModel):
+    """Client config option extensions supported on session responses and updates."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    boolean: BooleanConfigOptionCapabilities | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class ClientSessionCapabilities(FrozenModel):
@@ -72,8 +154,12 @@ class ClientSessionCapabilities(FrozenModel):
 
     model_config = _WIRE_MODEL_CONFIG
 
-    notices: dict[str, Any] | None = None
-    compaction: dict[str, Any] | None = None
+    notices: NoticeCapabilities | None = None
+    compaction: CompactionCapabilities | None = None
+    config_options: SessionConfigOptionsCapabilities | None = Field(
+        default=None,
+        alias="configOptions",
+    )
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
@@ -85,10 +171,10 @@ class ClientCapabilities(FrozenModel):
     auth: ClientAuthCapabilities | None = None
     fs: ClientFsCapabilities | None = None
     terminal: bool = False
-    elicitation: dict[str, Any] | None = None
-    plan: dict[str, Any] | None = None
+    elicitation: ElicitationCapabilities | None = None
+    plan: PlanCapabilities | None = None
     session: ClientSessionCapabilities | None = None
-    subagents: dict[str, Any] | None = None
+    subagents: SubagentCapabilities | None = None
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
@@ -114,6 +200,7 @@ class PromptCapabilities(FrozenModel):
     image: bool = False
     audio: bool = False
     embedded_context: bool = Field(default=False, alias="embeddedContext")
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class McpCapabilities(FrozenModel):
@@ -123,6 +210,7 @@ class McpCapabilities(FrozenModel):
 
     http: bool = False
     sse: bool = False
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class AgentAuthCapabilities(FrozenModel):
@@ -131,6 +219,33 @@ class AgentAuthCapabilities(FrozenModel):
     model_config = _WIRE_MODEL_CONFIG
 
     logout: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionSystemPromptOverrideCapabilities(FrozenModel):
+    """Capability marker for ``systemPrompt.mode = 'override'``."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionSystemPromptModeCapabilities(FrozenModel):
+    """Supported ``systemPrompt.mode`` variants beyond baseline ``append``."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    override: SessionSystemPromptOverrideCapabilities | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+class SessionSystemPromptCapabilities(FrozenModel):
+    """Agent ``sessionCapabilities.systemPrompt`` capability descriptor."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    mode: SessionSystemPromptModeCapabilities | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class SessionCapabilities(FrozenModel):
@@ -143,11 +258,15 @@ class SessionCapabilities(FrozenModel):
         default=None,
         alias="additionalDirectories",
     )
-    system_prompt: dict[str, Any] | None = Field(default=None, alias="systemPrompt")
+    system_prompt: SessionSystemPromptCapabilities | None = Field(
+        default=None,
+        alias="systemPrompt",
+    )
     resume: dict[str, Any] | None = None
     close: dict[str, Any] | None = None
     load: dict[str, Any] | None = None
     list: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class AgentCapabilities(FrozenModel):
@@ -173,7 +292,7 @@ class AgentCapabilities(FrozenModel):
 
 
 class AuthMethod(FrozenModel):
-    """Authentication flow descriptor advertised during ``initialize``."""
+    """Authentication flow descriptor advertised during ``initialize`` (``agent``/``terminal``)."""
 
     model_config = _WIRE_MODEL_CONFIG
 
@@ -183,6 +302,7 @@ class AuthMethod(FrozenModel):
     type: str = "agent"
     args: tuple[str, ...] = ()
     env: dict[str, str] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class InitializeResult(FrozenModel):
@@ -217,29 +337,6 @@ class LogoutParams(FrozenModel):
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
-class JsonRpcErrorObject(FrozenModel):
-    """JSON-RPC 2.0 error payload."""
-
-    code: int
-    message: str
-    data: dict[str, Any] | None = None
-
-
-class JsonRpcErrorResponse(FrozenModel):
-    """JSON-RPC 2.0 error envelope."""
-
-    jsonrpc: Literal["2.0"] = "2.0"
-    id: int | str | None = None
-    error: JsonRpcErrorObject
-
-
-class SessionStepOutcome(FrozenModel):
-    """Outbound WebSocket frames and optional close directive from one session step."""
-
-    frames: tuple[str, ...] = ()
-    close_code: int | None = None
-
-
 __all__ = [
     "ACP_AUTH_REQUIRED",
     "ACP_REQUEST_CANCELLED",
@@ -250,10 +347,15 @@ __all__ = [
     "AgentCapabilities",
     "AuthMethod",
     "AuthenticateParams",
+    "BooleanConfigOptionCapabilities",
     "ClientAuthCapabilities",
     "ClientCapabilities",
     "ClientFsCapabilities",
     "ClientSessionCapabilities",
+    "CompactionCapabilities",
+    "ElicitationCapabilities",
+    "ElicitationFormCapabilities",
+    "ElicitationUrlCapabilities",
     "ImplementationInfo",
     "InitializeParams",
     "InitializeResult",
@@ -264,11 +366,19 @@ __all__ = [
     "JSONRPC_PARSE_ERROR",
     "JsonRpcErrorObject",
     "JsonRpcErrorResponse",
+    "JsonRpcSuccessResponse",
     "LATEST_ACP_VERSION",
     "LogoutParams",
     "McpCapabilities",
+    "NoticeCapabilities",
+    "PlanCapabilities",
     "PromptCapabilities",
     "SUPPORTED_ACP_VERSIONS",
     "SessionCapabilities",
+    "SessionConfigOptionsCapabilities",
     "SessionStepOutcome",
+    "SessionSystemPromptCapabilities",
+    "SessionSystemPromptModeCapabilities",
+    "SessionSystemPromptOverrideCapabilities",
+    "SubagentCapabilities",
 ]
