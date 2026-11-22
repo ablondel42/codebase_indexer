@@ -1,12 +1,14 @@
 """FastAPI application factory and Uvicorn runner for the ACP bridge and UI API."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
+from api.models.chat import SessionChatMessagesResponse
 from api.models.config import ApiServerConfig, HealthStatus
 from api.models.session import (
     SessionArtifactContent,
@@ -19,6 +21,7 @@ from api.utils.artifacts import (
     read_session_artifact,
     validate_artifact_session_id,
 )
+from api.utils.chat import history_page_to_wire
 from api.utils.formatting import configure_api_terminal_logging, format_kv_block
 from api.utils.security import (
     build_agy_acp_command,
@@ -28,9 +31,11 @@ from api.utils.security import (
     resolve_agy_profile_root,
     validate_bind_host,
 )
+from core.models.chat import ChatPageQuery
 from core.models.config import AppConfig
 from core.models.enums import APP_VERSION
 from core.models.exceptions import AcpError
+from core.ports.chat import ChatStoreProtocol
 from core.utils.logging import get_logger
 from engine.services.facade import IndexerEngine
 
@@ -46,18 +51,39 @@ class ApiServerRunner:
         app_config: AppConfig | None = None,
         *,
         engine: IndexerEngine | None = None,
+        chat_store: ChatStoreProtocol | None = None,
     ) -> None:
-        """Initialize the FastAPI server runner with optional injected ``IndexerEngine``."""
+        """Initialize the FastAPI server runner with optional ``IndexerEngine`` and chat store."""
         base_api_cfg = api_config if api_config is not None else ApiServerConfig()
         self._app_config = app_config if app_config is not None else AppConfig()
         self._owns_engine = engine is None
         self._engine = engine if engine is not None else IndexerEngine(self._app_config)
-        self._api_config = (
-            base_api_cfg
-            if base_api_cfg.cbi_db_path is not None
-            else base_api_cfg.model_copy(update={"cbi_db_path": self._engine.db_path})
+        chat_db_path = self._resolve_chat_db_path(base_api_cfg, self._engine.db_path)
+        self._api_config = base_api_cfg.model_copy(
+            update={
+                "cbi_db_path": (
+                    base_api_cfg.cbi_db_path
+                    if base_api_cfg.cbi_db_path is not None
+                    else self._engine.db_path
+                ),
+                "chat_db_path": chat_db_path,
+            }
         )
-        self._gateway = AcpWebSocketGateway(self._api_config)
+        self._chat_store = (
+            chat_store if chat_store is not None else self._engine.open_chat_store(chat_db_path)
+        )
+        self._gateway = AcpWebSocketGateway(self._api_config, chat_store=self._chat_store)
+
+    @staticmethod
+    def _resolve_chat_db_path(api_cfg: ApiServerConfig, engine_db_path: Path) -> Path:
+        """Resolve dedicated SQLite chat database path respecting test and profile isolation."""
+        if api_cfg.chat_db_path is not None:
+            return api_cfg.chat_db_path
+        if api_cfg.agy_gemini_dir is not None:
+            return resolve_agy_profile_root(api_cfg) / "cbi_chat.db"
+        if str(engine_db_path) == ":memory:":
+            return Path(":memory:")
+        return engine_db_path.parent / "cbi_chat.db"
 
     @property
     def engine(self) -> IndexerEngine:
@@ -68,6 +94,11 @@ class ApiServerRunner:
     def gateway(self) -> AcpWebSocketGateway:
         """Return ``AcpWebSocketGateway`` driving ``WS /acp``."""
         return self._gateway
+
+    @property
+    def chat_store(self) -> ChatStoreProtocol:
+        """Return persistent ``ChatStoreProtocol`` used for conversation timelines."""
+        return self._chat_store
 
     def _verify_http_request(self, request: Request) -> None:
         """Enforce Host anti-DNS-rebinding and Origin allowlist checks on API routes."""
@@ -147,6 +178,30 @@ class ApiServerRunner:
             )
         return state
 
+    async def _get_session_messages_endpoint(
+        self,
+        session_id: str,
+        request: Request,
+        limit_turns: int = Query(default=8, ge=1, le=50),
+        before_turn: int | None = Query(default=None, ge=1),
+    ) -> SessionChatMessagesResponse:
+        """Return turn-aligned paginated persisted timeline items for ``session_id``."""
+        self._verify_http_request(request)
+        try:
+            clean_id = validate_artifact_session_id(session_id)
+        except AcpError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        await self._gateway.flush_session_chat(clean_id)
+        page = await asyncio.to_thread(
+            self._chat_store.get_history_page,
+            ChatPageQuery(
+                session_id=clean_id,
+                limit_turns=limit_turns,
+                before_turn=before_turn,
+            ),
+        )
+        return history_page_to_wire(page)
+
     def create_app(self) -> FastAPI:
         """Validate bind host security rules and build the configured ``FastAPI`` app."""
         validate_bind_host(
@@ -180,6 +235,13 @@ class ApiServerRunner:
             response_model=SessionRuntimeState,
         )
         app.add_api_route(
+            "/api/sessions/{session_id}/messages",
+            self._get_session_messages_endpoint,
+            methods=["GET"],
+            response_model=SessionChatMessagesResponse,
+            response_model_by_alias=True,
+        )
+        app.add_api_route(
             "/api/sessions/{session_id}/artifacts",
             self._list_session_artifacts_endpoint,
             methods=["GET"],
@@ -205,6 +267,7 @@ class ApiServerRunner:
                     "bind": f"{self._api_config.host}:{self._api_config.port}",
                     "agy_command": " ".join(build_agy_acp_command(self._api_config)),
                     "agy_profile": format_agy_profile_display(self._api_config),
+                    "chat_db": str(self._chat_store.db_path),
                     "allowed_origins": ", ".join(self._api_config.allowed_origins),
                     "max_connections": self._api_config.max_connections,
                 }

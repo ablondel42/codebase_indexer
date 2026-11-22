@@ -1,5 +1,6 @@
 """Public re-exports for ``core.ports``."""
 
+from core.ports.chat import ChatStoreProtocol
 from core.ports.events import EventCallback
 from core.ports.lsp import LspClientProtocol, LspPoolProtocol
 from core.ports.repositories import (
@@ -15,6 +16,7 @@ from core.ports.repositories import (
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
 
 __all__ = [
+    "ChatStoreProtocol",
     "DiagnosticsRepositoryProtocol",
     "EdgeRepositoryProtocol",
     "EventCallback",

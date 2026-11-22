@@ -26,8 +26,10 @@ from api.models.acp import (
 )
 from api.models.config import ApiServerConfig
 from api.models.session import SessionRuntimeState
+from api.services.chat import SessionChatRecorder
 from api.services.process import AgyAcpProcess
 from api.services.prompt import PromptTurnManager
+from api.utils.chat import extract_hydrate_only_flag
 from api.utils.formatting import (
     describe_jsonrpc_frame,
     format_raw_frame_for_log,
@@ -56,6 +58,7 @@ from api.utils.session_state import (
     prepare_set_mode_params,
 )
 from core.models.exceptions import AcpError
+from core.ports.chat import ChatStoreProtocol
 from core.utils.logging import get_logger
 
 logger = get_logger("api.services.session")
@@ -70,6 +73,7 @@ class AcpConnectionSession:
         config: ApiServerConfig,
         *,
         process: AgyAcpProcess | None = None,
+        chat_store: ChatStoreProtocol | None = None,
     ) -> None:
         """Create a new uninitialized session bound to ``connection_id``."""
         self._connection_id = connection_id
@@ -85,6 +89,7 @@ class AcpConnectionSession:
         self._pending_rpc_methods: dict[int | str, tuple[str, str | None]] = {}
         self._pending_mode_targets: dict[int | str, str] = {}
         self._turns = PromptTurnManager(connection_id)
+        self._chat = SessionChatRecorder(connection_id, chat_store)
 
     @property
     def connection_id(self) -> str:
@@ -144,6 +149,10 @@ class AcpConnectionSession:
     def get_session_state(self, session_id: str) -> SessionRuntimeState | None:
         """Return collected ``SessionRuntimeState`` for ``session_id``, or ``None``."""
         return self._session_states.get(session_id)
+
+    async def flush_session_chat(self, session_id: str) -> None:
+        """Persist any pending buffered live chat chunks for ``session_id``."""
+        await self._chat.flush_session(session_id)
 
     def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
         """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
@@ -465,6 +474,53 @@ class AcpConnectionSession:
         self._pending_rpc_methods[req_id] = ("logout", None)
         return {"jsonrpc": "2.0", "id": req_id, "method": "logout", "params": params_payload}
 
+    def _resolve_session_setup_target(
+        self,
+        method: str,
+        raw_params: object,
+        caps: AgentCapabilities,
+    ) -> tuple[str, object, tuple[bool, bool, bool]]:
+        """Route ``hydrateOnly`` resume/load requests against persisted chat hydration state."""
+        hydrate_only, cleaned_params = extract_hydrate_only_flag(raw_params)
+        if not hydrate_only or method not in ("session/load", "session/resume"):
+            return method, cleaned_params, (False, False, False)
+        raw_sid = (
+            cleaned_params.get("sessionId")
+            if isinstance(cleaned_params, Mapping)
+            else None
+        )
+        if not isinstance(raw_sid, str) or not raw_sid:
+            return method, cleaned_params, (True, False, False)
+        outbound, suppress_replay, hydrate_reset = self._chat.resolve_setup_routing(
+            method,
+            raw_sid,
+            caps,
+            hydrate_only=True,
+        )
+        return outbound, cleaned_params, (True, suppress_replay, hydrate_reset)
+
+    def _validate_and_sanitize_session_params(
+        self,
+        req_id: int | str,
+        method: str,
+        raw_params: object,
+        caps: AgentCapabilities,
+    ) -> dict[str, Any] | SessionStepOutcome:
+        """Validate ``method`` capability and sanitize outbound session parameters."""
+        cap_error = check_session_capability(method, caps)
+        if cap_error is not None:
+            return SessionStepOutcome(
+                frames=(format_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND, cap_error),)
+            )
+        try:
+            return prepare_session_params(method, raw_params, caps, self._config)
+        except (PydanticValidationError, ValueError) as exc:
+            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
+            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
+            return SessionStepOutcome(
+                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
+            )
+
     def _prepare_session_outbound(
         self,
         method: str,
@@ -496,29 +552,27 @@ class AcpConnectionSession:
             if self._initialize_result is not None
             else AgentCapabilities()
         )
-        cap_error = check_session_capability(method, caps)
-        if cap_error is not None:
-            return SessionStepOutcome(
-                frames=(format_jsonrpc_error(req_id, JSONRPC_METHOD_NOT_FOUND, cap_error),)
-            )
-        try:
-            sanitized_params = prepare_session_params(
-                method,
-                msg.get("params"),
-                caps,
-                self._config,
-            )
-        except (PydanticValidationError, ValueError) as exc:
-            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
-            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
-            return SessionStepOutcome(
-                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
-            )
+        route = self._resolve_session_setup_target(method, msg.get("params"), caps)
+        sanitized = self._validate_and_sanitize_session_params(
+            req_id,
+            route[0],
+            route[1],
+            caps,
+        )
+        if isinstance(sanitized, SessionStepOutcome):
+            return sanitized
 
-        target_session = sanitized_params.get("sessionId")
+        target_session = sanitized.get("sessionId")
         tracked_id = target_session if isinstance(target_session, str) else None
-        self._pending_rpc_methods[req_id] = (method, tracked_id)
-        return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized_params}
+        self._pending_rpc_methods[req_id] = (route[0], tracked_id)
+        if route[2][0] and tracked_id is not None:
+            self._chat.register_pending_setup(
+                req_id,
+                tracked_id,
+                suppress_replay=route[2][1],
+                hydrate_reset=route[2][2],
+            )
+        return {"jsonrpc": "2.0", "id": req_id, "method": route[0], "params": sanitized}
 
     def _prepare_prompt_or_cancel(
         self,
@@ -702,9 +756,22 @@ class AcpConnectionSession:
             sess_id = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
             if isinstance(sess_id, str):
                 await self._flush_turn_teardown(sess_id)
+                await self._chat.flush_session(sess_id)
+        elif method == "session/prompt":
+            await self._record_outbound_prompt(prepared)
 
         await self._send_bridge_payload_to_agent(prepared)
         return SessionStepOutcome()
+
+    async def _record_outbound_prompt(self, prepared: Mapping[str, Any]) -> None:
+        """Persist outbound ``session/prompt`` user turn before waiting for streamed reply."""
+        req_id = extract_request_id(prepared)
+        raw_params = prepared.get("params")
+        if req_id is None or not isinstance(raw_params, Mapping):
+            return
+        sess_id = raw_params.get("sessionId")
+        if isinstance(sess_id, str) and sess_id:
+            await self._chat.record_prompt_sent(sess_id, req_id, raw_params)
 
     def _record_setup_state(self, session_id: str, res_obj: object) -> None:
         """Activate ``session_id`` and merge setup metadata into ``_session_states``."""
@@ -787,37 +854,44 @@ class AcpConnectionSession:
             self._auth_state = AcpAuthState.UNAUTHENTICATED
             self._active_auth_method_id = None
 
-    def _observe_agent_frame(self, raw_line: str) -> Mapping[str, Any] | None:
-        """Update tracked authentication/session state and return parsed JSON mapping."""
+    def _observe_agent_frame(
+        self,
+        raw_line: str,
+    ) -> tuple[Mapping[str, Any] | None, tuple[int | str, str, str | None, bool] | None]:
+        """Update tracked auth/session state and return parsed frame plus completed RPC."""
         try:
             loaded = json.loads(raw_line)
         except json.JSONDecodeError as exc:
             logger.debug("Skipping non-JSON agent frame in auth observer: %s", exc)
-            return None
+            return None, None
         if not isinstance(loaded, Mapping):
-            return None
+            return None, None
 
         err_obj = loaded.get("error")
         if isinstance(err_obj, Mapping) and err_obj.get("code") == ACP_AUTH_REQUIRED:
             self._auth_state = AcpAuthState.UNAUTHENTICATED
             self._active_auth_method_id = None
 
+        completed_rpc: tuple[int | str, str, str | None, bool] | None = None
         resp_id = extract_request_id(loaded)
         if resp_id is not None and resp_id in self._pending_rpc_methods:
-            method_name, auth_method_id = self._pending_rpc_methods.pop(resp_id)
+            method_name, target_id = self._pending_rpc_methods.pop(resp_id)
             mode_id = self._pending_mode_targets.pop(resp_id, None)
-            self._apply_auth_rpc_result(method_name, auth_method_id, loaded, mode_id)
-        return loaded
+            self._apply_auth_rpc_result(method_name, target_id, loaded, mode_id)
+            succeeded = "result" in loaded and "error" not in loaded
+            completed_rpc = (resp_id, method_name, target_id, succeeded)
+        return loaded, completed_rpc
 
-    def _observe_forwarded_session_update(self, loaded: Mapping[str, Any]) -> None:
-        """Patch ``_session_states`` from allowed ``session/update`` notifications."""
+    def _observe_forwarded_session_update(self, loaded: Mapping[str, Any]) -> bool:
+        """Record real-time timeline updates, patch runtime state, and check suppression."""
         if loaded.get("method") != "session/update" or "id" in loaded:
-            return
+            return True
         params = loaded.get("params")
         update = params.get("update") if isinstance(params, Mapping) else None
         raw_sid = params.get("sessionId") if isinstance(params, Mapping) else None
         if not isinstance(raw_sid, str) or not raw_sid or not isinstance(update, Mapping):
-            return
+            return True
+        should_forward = self._chat.observe_session_update(raw_sid, update)
         next_state = apply_session_update_to_state(
             self._session_states.get(raw_sid),
             raw_sid,
@@ -825,15 +899,51 @@ class AcpConnectionSession:
         )
         if next_state is not None:
             self._session_states[raw_sid] = next_state
+        return should_forward
+
+    async def _finalize_chat_rpc_effect(
+        self,
+        completed_rpc: tuple[int | str, str, str | None, bool],
+        forward_frame: str,
+        loaded: Mapping[str, Any],
+    ) -> str:
+        """Apply chat persistence side effects and ``_meta.cbiChat`` hydration enrichment."""
+        resp_id, method_name, target_id, succeeded = completed_rpc
+        if method_name == "session/new" and succeeded:
+            res_obj = loaded.get("result")
+            new_id = res_obj.get("sessionId") if isinstance(res_obj, Mapping) else None
+            if isinstance(new_id, str) and new_id:
+                await self._chat.mark_new_session(new_id)
+        elif method_name in ("session/load", "session/resume"):
+            return await self._chat.complete_setup_response(
+                resp_id,
+                forward_frame,
+                loaded,
+                succeeded=succeeded,
+            )
+        elif method_name == "session/close" and target_id:
+            await self._chat.flush_session(target_id)
+        elif method_name == "session/delete" and target_id:
+            err_obj = loaded.get("error")
+            err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
+            if succeeded or err_code == ACP_RESOURCE_NOT_FOUND:
+                await self._chat.delete_session(target_id)
+        return forward_frame
 
     async def read_agent_frame(self) -> str | None:
-        """Read, validate, and filter the next outbound NDJSON frame emitted by ``agy acp``."""
+        """Read, validate, persist, and filter the next outbound NDJSON frame from ``agy``."""
         raw_line = await self._process.read_line()
         if not raw_line:
             return raw_line
-        loaded = self._observe_agent_frame(raw_line)
+        loaded, completed_rpc = self._observe_agent_frame(raw_line)
         if loaded is None:
             return raw_line
+        resp_id = extract_request_id(loaded)
+        prompt_session_id = (
+            self._turns.session_id_for_prompt_request(resp_id)
+            if resp_id is not None
+            else None
+        )
         decision = self._turns.inspect_agent_frame(
             raw_line,
             loaded,
@@ -841,14 +951,24 @@ class AcpConnectionSession:
         )
         if decision.agent_reply is not None:
             await self._send_bridge_payload_to_agent(decision.agent_reply)
-        if decision.forward_frame:
-            self._observe_forwarded_session_update(loaded)
-        return decision.forward_frame
+        forward_frame = decision.forward_frame
+        if forward_frame and not self._observe_forwarded_session_update(loaded):
+            forward_frame = ""
+        if prompt_session_id is not None:
+            await self._chat.flush_session(prompt_session_id)
+        if completed_rpc is not None:
+            forward_frame = await self._finalize_chat_rpc_effect(
+                completed_rpc,
+                forward_frame,
+                loaded,
+            )
+        return forward_frame
 
     async def close(self) -> None:
-        """Cancel pending permissions/turns, close session, and stop ``agy acp``."""
+        """Cancel pending permissions/turns, flush chat history, and stop ``agy acp``."""
         self._state = AcpConnectionState.CLOSED
         await self._flush_turn_teardown()
+        await self._chat.flush_all()
         self._session_states.clear()
         self._pending_mode_targets.clear()
         await self._process.stop()

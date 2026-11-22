@@ -59,6 +59,9 @@ from api.models import (
     SessionArtifactSummary,
     SessionCancelParams,
     SessionCapabilities,
+    SessionChatMessageItem,
+    SessionChatMessagesResponse,
+    SessionChatPlanStep,
     SessionCloseParams,
     SessionConfigOption,
     SessionConfigSelectChoice,
@@ -94,6 +97,7 @@ from api.services import (
     AgyAcpProcess,
     ApiServerRunner,
     PromptTurnManager,
+    SessionChatRecorder,
 )
 
 __all__ = [
@@ -160,6 +164,10 @@ __all__ = [
     "SessionArtifactSummary",
     "SessionCancelParams",
     "SessionCapabilities",
+    "SessionChatMessageItem",
+    "SessionChatMessagesResponse",
+    "SessionChatPlanStep",
+    "SessionChatRecorder",
     "SessionCloseParams",
     "SessionConfigOption",
     "SessionConfigSelectChoice",

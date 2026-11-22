@@ -1,6 +1,15 @@
 """Public re-exports for ``core.models``."""
 
 from core.models.base import FrozenModel, MutableModel
+from core.models.chat import (
+    ChatHistoryPage,
+    ChatItemRole,
+    ChatPageQuery,
+    ChatPlanStep,
+    ChatSessionRecord,
+    ChatTimelineItem,
+    ChatTimelineItemUpsert,
+)
 from core.models.config import IGNORED_DIRS, AppConfig, build_config
 from core.models.diagnostics import (
     DatabaseStatusReport,
@@ -87,6 +96,13 @@ __all__ = [
     "AcpError",
     "AppConfig",
     "CALLABLE_KINDS",
+    "ChatHistoryPage",
+    "ChatItemRole",
+    "ChatPageQuery",
+    "ChatPlanStep",
+    "ChatSessionRecord",
+    "ChatTimelineItem",
+    "ChatTimelineItemUpsert",
     "CodeMatchItem",
     "CodeSearchQuery",
     "CodeSearchReport",

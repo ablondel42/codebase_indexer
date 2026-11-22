@@ -82,6 +82,12 @@ interface AcpSessionsPanelProps {
   activeSessionId: string | null;
   activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
+  hasMoreMessages: boolean;
+  loadingMessages: boolean;
+  loadingOlderMessages: boolean;
+  isLiveThinking: boolean;
+  totalMessageItems: number;
+  onLoadOlderMessages: () => Promise<void>;
   sessionModels: AcpModelsState | null;
   sessionModes: AcpModesState | null;
   configOptions: AcpConfigOption[];
@@ -143,6 +149,12 @@ export function AcpSessionsPanel({
   activeSessionId,
   activeSessionMode,
   replayedMessages,
+  hasMoreMessages,
+  loadingMessages,
+  loadingOlderMessages,
+  isLiveThinking,
+  totalMessageItems,
+  onLoadOlderMessages,
   sessionModels,
   sessionModes,
   configOptions,
@@ -198,8 +210,8 @@ export function AcpSessionsPanel({
   const canResumeAny = sessionCaps.canLoad || sessionCaps.canResume;
 
   const handleResumeClick = async (session: AcpSessionInfo) => {
-    await onResumeSession(session);
     setActiveTab("chat");
+    await onResumeSession(session);
   };
 
   const handleCreateClick = async () => {
@@ -354,8 +366,10 @@ export function AcpSessionsPanel({
             <TabsTrigger value="chat">
               <MessageSquareIcon />
               <span>Chat</span>
-              {replayedMessages.length > 0 && (
-                <Badge variant="secondary">{replayedMessages.length}</Badge>
+              {(totalMessageItems > 0 || replayedMessages.length > 0) && (
+                <Badge variant="secondary">
+                  {totalMessageItems || replayedMessages.length}
+                </Badge>
               )}
             </TabsTrigger>
             <TabsTrigger value="artifacts">
@@ -474,11 +488,7 @@ export function AcpSessionsPanel({
                                 Resume
                               </TooltipTrigger>
                               <TooltipContent>
-                                <p>
-                                  {sessionCaps.canLoad
-                                    ? "Resume session and replay conversation history"
-                                    : "Resume session"}
-                                </p>
+                                <p>Resume session</p>
                               </TooltipContent>
                             </Tooltip>
                             <Tooltip>
@@ -542,6 +552,11 @@ export function AcpSessionsPanel({
             activeSession={activeSession}
             activeSessionMode={activeSessionMode}
             replayedMessages={replayedMessages}
+            hasMoreMessages={hasMoreMessages}
+            loadingMessages={loadingMessages}
+            loadingOlderMessages={loadingOlderMessages}
+            isLiveThinking={isLiveThinking}
+            onLoadOlderMessages={onLoadOlderMessages}
             sessionModels={sessionModels}
             sessionModes={sessionModes}
             configOptions={configOptions}

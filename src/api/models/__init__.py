@@ -32,6 +32,11 @@ from api.models.acp import (
     SessionCapabilities,
     SessionStepOutcome,
 )
+from api.models.chat import (
+    SessionChatMessageItem,
+    SessionChatMessagesResponse,
+    SessionChatPlanStep,
+)
 from api.models.config import (
     DEFAULT_AGY_APP_DATA_DIR,
     DEFAULT_ALLOWED_ORIGINS,
@@ -154,6 +159,9 @@ __all__ = [
     "SessionArtifactSummary",
     "SessionCancelParams",
     "SessionCapabilities",
+    "SessionChatMessageItem",
+    "SessionChatMessagesResponse",
+    "SessionChatPlanStep",
     "SessionCloseParams",
     "SessionConfigOption",
     "SessionConfigSelectChoice",

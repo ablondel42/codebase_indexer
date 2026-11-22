@@ -1,5 +1,6 @@
 """Public service re-exports for ``api.services``."""
 
+from api.services.chat import SessionChatRecorder
 from api.services.gateway import AcpWebSocketGateway
 from api.services.process import AgyAcpProcess
 from api.services.prompt import PromptTurnManager
@@ -12,4 +13,5 @@ __all__ = [
     "AgyAcpProcess",
     "ApiServerRunner",
     "PromptTurnManager",
+    "SessionChatRecorder",
 ]

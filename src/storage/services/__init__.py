@@ -1,5 +1,6 @@
 """Public service exports for ``storage.services``."""
 
+from storage.services.chat import SqlChatStore
 from storage.services.connection import ConnectionFactory
 from storage.services.diagnostics import SqlDiagnosticsRepository
 from storage.services.edges import SqlEdgeRepository
@@ -15,6 +16,7 @@ from storage.services.uow import SqlUnitOfWork, SqlUnitOfWorkFactory
 __all__ = [
     "ConnectionFactory",
     "SchemaMigrator",
+    "SqlChatStore",
     "SqlDiagnosticsRepository",
     "SqlEdgeRepository",
     "SqlFileRepository",

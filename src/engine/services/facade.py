@@ -11,6 +11,7 @@ from context.services.outline import OutlineBuilder
 from context.services.source import SourceReader
 from core.models.config import AppConfig
 from core.models.exceptions import IndexerError
+from core.ports.chat import ChatStoreProtocol
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol
 from core.utils.logging import get_logger
@@ -31,6 +32,7 @@ from indexing.services.incremental import IncrementalIndexer
 from indexing.services.lsp_runner import RepoLspCoordinator
 from indexing.services.watcher import RepoWatcher
 from lsp.services.pool import LspSessionPool
+from storage.services.chat import SqlChatStore
 from storage.services.uow import SqlUnitOfWorkFactory
 from views.services.filesystem import FilesystemViewBuilder
 
@@ -50,6 +52,7 @@ class _EngineRuntime:
         self.lsp_pool = lsp_pool
         self.lock = threading.RLock()
         self.factories_by_key: dict[str, UnitOfWorkFactoryProtocol] = {}
+        self.chat_stores_by_key: dict[str, ChatStoreProtocol] = {}
 
         self.resolver = SymbolTargetResolver()
         self.navigator = GraphNavigator(config)
@@ -118,6 +121,18 @@ class _EngineRuntime:
             created = SqlUnitOfWorkFactory(db_path)
             self.factories_by_key[key] = created
             logger.debug("Created UoW factory for %s", key)
+            return created
+
+    def acquire_chat_store(self, db_path: Path) -> ChatStoreProtocol:
+        """Fetch or create a cached ``SqlChatStore`` bound to ``db_path``."""
+        key = self.db_key(db_path)
+        with self.lock:
+            cached = self.chat_stores_by_key.get(key)
+            if cached is not None:
+                return cached
+            created = SqlChatStore(db_path)
+            self.chat_stores_by_key[key] = created
+            logger.debug("Created SqlChatStore for %s", key)
             return created
 
     def build_commands(
@@ -190,6 +205,11 @@ class _EngineRuntime:
         with self.lock:
             factories = list(self.factories_by_key.values())
             self.factories_by_key.clear()
+            chat_stores = list(self.chat_stores_by_key.values())
+            self.chat_stores_by_key.clear()
+
+        for store in chat_stores:
+            store.close()
 
         for factory in factories:
             close_fn = getattr(factory, "close", None)
@@ -281,6 +301,10 @@ class IndexerEngine:
     def lsp_pool(self) -> LspPoolProtocol:
         """Shared ``LspPoolProtocol`` reused across ``for_db`` scopes."""
         return self._lsp_pool
+
+    def open_chat_store(self, db_path: Path | str) -> ChatStoreProtocol:
+        """Acquire or reuse the persistent ``ChatStoreProtocol`` for ``db_path``."""
+        return self._runtime.acquire_chat_store(Path(db_path))
 
     def for_db(self, db_path: Path | str | None = None) -> "IndexerEngine":
         """Return an ``IndexerEngine`` targeting ``db_path`` while sharing ``lsp_pool``.

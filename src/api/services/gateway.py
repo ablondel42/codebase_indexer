@@ -18,6 +18,7 @@ from api.utils.formatting import format_kv_block, format_raw_frame_for_log
 from api.utils.jsonrpc import format_jsonrpc_error
 from api.utils.security import is_allowed_ws_host, is_allowed_ws_origin
 from core.models.exceptions import AcpError
+from core.ports.chat import ChatStoreProtocol
 from core.utils.logging import get_logger
 
 logger = get_logger("api.services.gateway")
@@ -26,9 +27,15 @@ logger = get_logger("api.services.gateway")
 class AcpWebSocketGateway:
     """FastAPI ``/acp`` WebSocket handler enforcing CSWSH, Host, and connection limits."""
 
-    def __init__(self, config: ApiServerConfig) -> None:
+    def __init__(
+        self,
+        config: ApiServerConfig,
+        *,
+        chat_store: ChatStoreProtocol | None = None,
+    ) -> None:
         """Initialize the WebSocket gateway with immutable server security configuration."""
         self._config = config
+        self._chat_store = chat_store
         self._active_sessions: set[AcpConnectionSession] = set()
 
     @property
@@ -43,6 +50,11 @@ class AcpWebSocketGateway:
             if state is not None:
                 return state
         return None
+
+    async def flush_session_chat(self, session_id: str) -> None:
+        """Flush buffered real-time chat chunks for ``session_id`` across active connections."""
+        for conn in tuple(self._active_sessions):
+            await conn.flush_session_chat(session_id)
 
     def _is_authorized_upgrade(self, websocket: WebSocket) -> bool:
         """Verify HTTP ``Host`` (anti-DNS-rebinding) and ``Origin`` (anti-CSWSH)."""
@@ -203,7 +215,11 @@ class AcpWebSocketGateway:
             return
 
         connection_id = f"acp_{secrets.token_urlsafe(18)}"
-        session = AcpConnectionSession(connection_id, self._config)
+        session = AcpConnectionSession(
+            connection_id,
+            self._config,
+            chat_store=self._chat_store,
+        )
         self._active_sessions.add(session)
         try:
             await websocket.accept(

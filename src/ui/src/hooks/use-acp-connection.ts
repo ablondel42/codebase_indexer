@@ -7,6 +7,7 @@ import {
   fetchServerDefaults,
   fetchSessionArtifactContent,
   fetchSessionArtifacts,
+  fetchSessionMessages,
   sanitizeAvailableCommands,
   sanitizeConfigOptions,
   sanitizeSessionUsage,
@@ -34,6 +35,7 @@ import {
   type AcpSessionArtifactSummary,
   type AcpSessionCapabilitiesFlags,
   type AcpSessionInfo,
+  type AcpSessionMessagesPage,
   type AcpSessionRuntimeMeta,
   type AcpSessionSetupResult,
   type AcpSessionUsage,
@@ -85,6 +87,12 @@ export interface UseAcpConnectionState {
   activeSessionId: string | null;
   activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
+  hasMoreMessages: boolean;
+  loadingMessages: boolean;
+  loadingOlderMessages: boolean;
+  isLiveThinking: boolean;
+  totalMessageItems: number;
+  loadOlderMessages: () => Promise<void>;
   sessionModels: AcpModelsState | null;
   sessionModes: AcpModesState | null;
   configOptions: AcpConfigOption[];
@@ -123,31 +131,191 @@ export interface UseAcpConnectionState {
   reconnect: () => void;
 }
 
-function appendMessageChunk(
+type LiveMessageOp =
+  | {
+      kind: "chunk";
+      sessionId: string;
+      id: string;
+      role: "user" | "agent" | "thought";
+      text: string;
+    }
+  | {
+      kind: "tool";
+      sessionId: string;
+      id: string;
+      toolKind?: string;
+      toolTitle?: string;
+      toolStatus?: AcpToolStatus;
+      text: string;
+      locations: string[];
+      exitCode?: number;
+    }
+  | {
+      kind: "plan";
+      sessionId: string;
+      planTitle: string;
+      planSteps: AcpPlanStep[];
+    };
+
+interface KnownTimelineTracker {
+  ids: Set<string>;
+  lastRole: AcpReplayedMessage["role"] | null;
+  lastId: string | null;
+}
+
+function syncKnownTracker(
+  tracker: KnownTimelineTracker,
+  items: AcpReplayedMessage[],
+): void {
+  tracker.ids = new Set(items.map((item) => item.id));
+  const tail = items[items.length - 1];
+  tracker.lastRole = tail?.role ?? null;
+  tracker.lastId = tail?.id ?? null;
+}
+
+function countAddedLiveOps(
+  ops: LiveMessageOp[],
+  tracker: KnownTimelineTracker,
+): number {
+  let added = 0;
+  for (const op of ops) {
+    if (op.kind === "chunk") {
+      if (!op.text) {
+        continue;
+      }
+      const matchesTail =
+        tracker.lastId === op.id ||
+        (op.id.startsWith("auto_") && tracker.lastRole === op.role);
+      if (!matchesTail && !tracker.ids.has(op.id)) {
+        added += 1;
+        tracker.ids.add(op.id);
+        tracker.lastId = op.id;
+      }
+      tracker.lastRole = op.role;
+      continue;
+    }
+    if (op.kind === "tool") {
+      if (!tracker.ids.has(op.id)) {
+        added += 1;
+        tracker.ids.add(op.id);
+        tracker.lastId = op.id;
+        tracker.lastRole = "tool";
+      }
+      continue;
+    }
+    if (tracker.lastRole !== "plan") {
+      added += 1;
+      tracker.lastRole = "plan";
+    }
+  }
+  return added;
+}
+
+function applyLiveOps(
   prev: AcpReplayedMessage[],
-  id: string,
-  role: "user" | "agent" | "thought",
-  chunkText: string,
+  ops: LiveMessageOp[],
+  nextPlanId: () => string,
 ): AcpReplayedMessage[] {
-  if (!chunkText) {
-    return prev;
+  let next = prev;
+  let copied = false;
+  const ensureCopy = () => {
+    if (!copied) {
+      next = [...prev];
+      copied = true;
+    }
+    return next;
+  };
+
+  for (const op of ops) {
+    if (op.kind === "chunk") {
+      if (!op.text) {
+        continue;
+      }
+      const tail = next[next.length - 1];
+      if (
+        tail &&
+        (tail.id === op.id ||
+          (op.id.startsWith("auto_") && tail.role === op.role))
+      ) {
+        const arr = ensureCopy();
+        arr[arr.length - 1] = { ...tail, text: tail.text + op.text };
+        continue;
+      }
+      const idx = op.id.startsWith("auto_")
+        ? -1
+        : next.findIndex((item) => item.id === op.id);
+      if (idx >= 0) {
+        const arr = ensureCopy();
+        const existing = arr[idx]!;
+        arr[idx] = { ...existing, text: existing.text + op.text };
+      } else {
+        const arr = ensureCopy();
+        arr.push({ id: op.id, role: op.role, text: op.text });
+      }
+      continue;
+    }
+
+    if (op.kind === "tool") {
+      const tail = next[next.length - 1];
+      const idx =
+        tail?.id === op.id
+          ? next.length - 1
+          : next.findIndex((item) => item.id === op.id);
+      if (idx >= 0) {
+        const arr = ensureCopy();
+        const existing = arr[idx]!;
+        arr[idx] = {
+          ...existing,
+          ...(op.toolKind ? { toolKind: op.toolKind } : {}),
+          ...(op.toolTitle ? { toolTitle: op.toolTitle } : {}),
+          ...(op.toolStatus ? { toolStatus: op.toolStatus } : {}),
+          ...(op.text ? { text: op.text } : {}),
+          ...(op.locations.length > 0 ? { locations: op.locations } : {}),
+          ...(op.exitCode !== undefined ? { exitCode: op.exitCode } : {}),
+        };
+      } else {
+        const arr = ensureCopy();
+        arr.push({
+          id: op.id,
+          role: "tool",
+          text: op.text,
+          toolKind: op.toolKind,
+          toolTitle: op.toolTitle,
+          toolStatus: op.toolStatus ?? "done",
+          locations: op.locations.length > 0 ? op.locations : undefined,
+          exitCode: op.exitCode,
+        });
+      }
+      continue;
+    }
+
+    let lastPlanIdx = -1;
+    for (let i = next.length - 1; i >= 0; i -= 1) {
+      if (next[i]?.role === "plan") {
+        lastPlanIdx = i;
+        break;
+      }
+    }
+    if (lastPlanIdx >= 0) {
+      const arr = ensureCopy();
+      arr[lastPlanIdx] = {
+        ...arr[lastPlanIdx]!,
+        planTitle: op.planTitle,
+        planSteps: op.planSteps,
+      };
+    } else {
+      const arr = ensureCopy();
+      arr.push({
+        id: nextPlanId(),
+        role: "plan",
+        text: "",
+        planTitle: op.planTitle,
+        planSteps: op.planSteps,
+      });
+    }
   }
-  const existingIdx = prev.findIndex((item) => item.id === id);
-  if (existingIdx >= 0) {
-    return prev.map((item, idx) =>
-      idx === existingIdx
-        ? { ...item, text: sanitizeMultilineAgentText(item.text + chunkText) }
-        : item,
-    );
-  }
-  const last = prev[prev.length - 1];
-  if (id.startsWith("auto_") && last && last.role === role) {
-    return [
-      ...prev.slice(0, -1),
-      { ...last, text: sanitizeMultilineAgentText(last.text + chunkText) },
-    ];
-  }
-  return [...prev, { id, role, text: chunkText }];
+
+  return next;
 }
 
 function mapRawToolStatus(rawStatus: unknown): AcpToolStatus {
@@ -273,6 +441,16 @@ export function useAcpConnection(): UseAcpConnectionState {
   const clientRef = useRef<AcpBrowserClient | null>(null);
   const defaultCwdRef = useRef<string>("");
   const chunkCounterRef = useRef(0);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const nextBeforeTurnRef = useRef<number | null>(null);
+  const loadingOlderRef = useRef(false);
+  const pendingLiveOpsRef = useRef<LiveMessageOp[]>([]);
+  const rafFlushIdRef = useRef<number | null>(null);
+  const knownTrackerRef = useRef<KnownTimelineTracker>({
+    ids: new Set(),
+    lastRole: null,
+    lastId: null,
+  });
 
   const [attempt, setAttempt] = useState(0);
   const [status, setStatus] = useState<AcpConnectionStatus>("initializing");
@@ -295,6 +473,11 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [replayedMessages, setReplayedMessages] = useState<
     AcpReplayedMessage[]
   >([]);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [isLiveThinking, setIsLiveThinking] = useState(false);
+  const [totalMessageItems, setTotalMessageItems] = useState(0);
   const [sessionMetaById, setSessionMetaById] = useState<
     Record<string, AcpSessionRuntimeMeta>
   >({});
@@ -317,6 +500,65 @@ export function useAcpConnection(): UseAcpConnectionState {
   const clearAuthError = useCallback(() => setAuthError(null), []);
   const clearSessionError = useCallback(() => setSessionError(null), []);
   const closeArtifact = useCallback(() => setSelectedArtifact(null), []);
+
+  const cancelPendingLiveFlush = useCallback(() => {
+    if (rafFlushIdRef.current !== null) {
+      window.cancelAnimationFrame(rafFlushIdRef.current);
+      rafFlushIdRef.current = null;
+    }
+    pendingLiveOpsRef.current = [];
+  }, []);
+
+  const resetTimelineState = useCallback(
+    (nextSessionId: string | null) => {
+      cancelPendingLiveFlush();
+      activeSessionIdRef.current = nextSessionId;
+      nextBeforeTurnRef.current = null;
+      loadingOlderRef.current = false;
+      knownTrackerRef.current = { ids: new Set(), lastRole: null, lastId: null };
+      setActiveSessionId(nextSessionId);
+      setReplayedMessages([]);
+      setHasMoreMessages(false);
+      setLoadingMessages(false);
+      setLoadingOlderMessages(false);
+      setIsLiveThinking(false);
+      setTotalMessageItems(0);
+    },
+    [cancelPendingLiveFlush],
+  );
+
+  const enqueueLiveOp = useCallback((op: LiveMessageOp) => {
+    pendingLiveOpsRef.current.push(op);
+    if (rafFlushIdRef.current !== null) {
+      return;
+    }
+    rafFlushIdRef.current = window.requestAnimationFrame(() => {
+      rafFlushIdRef.current = null;
+      const queued = pendingLiveOpsRef.current;
+      pendingLiveOpsRef.current = [];
+      const currentSid = activeSessionIdRef.current;
+      const relevant = currentSid
+        ? queued.filter((item) => item.sessionId === currentSid)
+        : queued;
+      if (relevant.length === 0) {
+        return;
+      }
+      const added = countAddedLiveOps(relevant, knownTrackerRef.current);
+      const lastOp = relevant[relevant.length - 1];
+      if (lastOp) {
+        setIsLiveThinking(lastOp.kind === "chunk" && lastOp.role === "thought");
+      }
+      setReplayedMessages((prev) =>
+        applyLiveOps(prev, relevant, () => {
+          chunkCounterRef.current += 1;
+          return `plan_${chunkCounterRef.current}`;
+        }),
+      );
+      if (added > 0) {
+        setTotalMessageItems((prev) => prev + added);
+      }
+    });
+  }, []);
 
   const mergeSetupMetadata = useCallback((setup: AcpSessionSetupResult) => {
     if (setup.tier) {
@@ -457,6 +699,14 @@ export function useAcpConnection(): UseAcpConnectionState {
         return;
       }
 
+      const targetSid = sessionId || activeSessionIdRef.current || "";
+      if (
+        !targetSid ||
+        (activeSessionIdRef.current && targetSid !== activeSessionIdRef.current)
+      ) {
+        return;
+      }
+
       if (updateKind === "plan") {
         const planSteps = parsePlanEntries(update.entries);
         if (planSteps.length === 0) {
@@ -466,27 +716,11 @@ export function useAcpConnection(): UseAcpConnectionState {
           typeof update.title === "string" && update.title
             ? sanitizeAgentText(update.title, 140)
             : "Execution plan";
-        setReplayedMessages((prev) => {
-          const lastPlanIdx = [...prev]
-            .reverse()
-            .findIndex((item) => item.role === "plan");
-          if (lastPlanIdx >= 0) {
-            const targetIdx = prev.length - 1 - lastPlanIdx;
-            return prev.map((item, idx) =>
-              idx === targetIdx ? { ...item, planTitle, planSteps } : item,
-            );
-          }
-          chunkCounterRef.current += 1;
-          return [
-            ...prev,
-            {
-              id: `plan_${chunkCounterRef.current}`,
-              role: "plan",
-              text: "",
-              planTitle,
-              planSteps,
-            },
-          ];
+        enqueueLiveOp({
+          kind: "plan",
+          sessionId: targetSid,
+          planTitle,
+          planSteps,
         });
         return;
       }
@@ -517,36 +751,16 @@ export function useAcpConnection(): UseAcpConnectionState {
         const exitCode =
           typeof rawOut?.exitCode === "number" ? rawOut.exitCode : undefined;
 
-        setReplayedMessages((prev) => {
-          const existingIdx = prev.findIndex((item) => item.id === rawToolId);
-          if (existingIdx >= 0) {
-            return prev.map((item, idx) =>
-              idx === existingIdx
-                ? {
-                    ...item,
-                    ...(toolKind ? { toolKind } : {}),
-                    ...(toolTitle ? { toolTitle } : {}),
-                    ...(toolStatus ? { toolStatus } : {}),
-                    ...(text ? { text } : {}),
-                    ...(locations.length > 0 ? { locations } : {}),
-                    ...(exitCode !== undefined ? { exitCode } : {}),
-                  }
-                : item,
-            );
-          }
-          return [
-            ...prev,
-            {
-              id: rawToolId,
-              role: "tool",
-              text,
-              toolKind,
-              toolTitle,
-              toolStatus: toolStatus ?? "done",
-              locations: locations.length > 0 ? locations : undefined,
-              exitCode,
-            },
-          ];
+        enqueueLiveOp({
+          kind: "tool",
+          sessionId: targetSid,
+          id: rawToolId,
+          toolKind,
+          toolTitle,
+          toolStatus,
+          text,
+          locations,
+          exitCode,
         });
         return;
       }
@@ -573,11 +787,15 @@ export function useAcpConnection(): UseAcpConnectionState {
       if (rawMsgId.startsWith("auto_")) {
         chunkCounterRef.current += 1;
       }
-      setReplayedMessages((prev) =>
-        appendMessageChunk(prev, rawMsgId, role, cleanChunk),
-      );
+      enqueueLiveOp({
+        kind: "chunk",
+        sessionId: targetSid,
+        id: rawMsgId,
+        role,
+        text: cleanChunk,
+      });
     },
-    [],
+    [enqueueLiveOp],
   );
 
   const reconnect = useCallback(() => {
@@ -590,16 +808,15 @@ export function useAcpConnection(): UseAcpConnectionState {
     setAuthenticatingMethodId(null);
     setSessions([]);
     setNextCursor(null);
-    setActiveSessionId(null);
     setActiveSessionMode(null);
-    setReplayedMessages([]);
+    resetTimelineState(null);
     setSessionMetaById({});
     setAccountTier(null);
     setConfigBusyId(null);
     setSessionArtifacts([]);
     setSelectedArtifact(null);
     setAttempt((current) => current + 1);
-  }, []);
+  }, [resetTimelineState]);
 
   useEffect(() => {
     let disposed = false;
@@ -660,12 +877,13 @@ export function useAcpConnection(): UseAcpConnectionState {
 
     return () => {
       disposed = true;
+      cancelPendingLiveFlush();
       if (clientRef.current === client) {
         clientRef.current = null;
       }
       client.close();
     };
-  }, [attempt, handleNotification]);
+  }, [attempt, cancelPendingLiveFlush, handleNotification]);
 
   const refreshSessions = useCallback(async () => {
     const client = clientRef.current;
@@ -758,9 +976,8 @@ export function useAcpConnection(): UseAcpConnectionState {
       setActiveMethodId(null);
       setSessions([]);
       setNextCursor(null);
-      setActiveSessionId(null);
       setActiveSessionMode(null);
-      setReplayedMessages([]);
+      resetTimelineState(null);
       setSessionMetaById({});
       setAccountTier(null);
       setConfigBusyId(null);
@@ -773,7 +990,7 @@ export function useAcpConnection(): UseAcpConnectionState {
       setAuthStatus("authenticated");
       setAuthError(message);
     }
-  }, []);
+  }, [resetTimelineState]);
 
   const createNewSession = useCallback(async () => {
     const client = clientRef.current;
@@ -787,10 +1004,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     try {
       const created = await client.createSession(cwd, { includeCbiMcp });
       mergeSetupMetadata(created);
-      setReplayedMessages([]);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
-      setActiveSessionId(created.sessionId);
+      resetTimelineState(created.sessionId);
       setActiveSessionMode("new");
       setSessions((prev) => [
         {
@@ -812,7 +1028,27 @@ export function useAcpConnection(): UseAcpConnectionState {
     } finally {
       setSessionBusyId(null);
     }
-  }, [includeCbiMcp, mergeSetupMetadata]);
+  }, [includeCbiMcp, mergeSetupMetadata, resetTimelineState]);
+
+  const applyInitialMessagesPage = useCallback(
+    (page: AcpSessionMessagesPage) => {
+      nextBeforeTurnRef.current = page.nextBeforeTurn;
+      setHasMoreMessages(page.hasMore);
+      setTotalMessageItems(page.totalItems);
+      setReplayedMessages((prev) => {
+        if (prev.length === 0) {
+          syncKnownTracker(knownTrackerRef.current, page.items);
+          return page.items;
+        }
+        const pageIds = new Set(page.items.map((item) => item.id));
+        const trailingLive = prev.filter((item) => !pageIds.has(item.id));
+        const merged = [...page.items, ...trailingLive];
+        syncKnownTracker(knownTrackerRef.current, merged);
+        return merged;
+      });
+    },
+    [],
+  );
 
   const resumeExistingSession = useCallback(
     async (session: AcpSessionInfo) => {
@@ -820,32 +1056,113 @@ export function useAcpConnection(): UseAcpConnectionState {
       if (!client) {
         return;
       }
+      const targetId = session.sessionId;
       setSessionError(null);
-      setSessionBusyId(session.sessionId);
-      setReplayedMessages([]);
+      setSessionBusyId(targetId);
+      resetTimelineState(targetId);
+      setLoadingMessages(true);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
+
+      const initialTailPromise = fetchSessionMessages(targetId, {
+        limitTurns: 8,
+      })
+        .then((page) => {
+          if (activeSessionIdRef.current === targetId && page.hydrated) {
+            applyInitialMessagesPage(page);
+            setLoadingMessages(false);
+          }
+          return page;
+        })
+        .catch(() => null);
+
       try {
-        const [resumed, artifacts] = await Promise.all([
-          client.resumeSession(session.sessionId, session.cwd, {
+        const [resumed, artifacts, initialPage] = await Promise.all([
+          client.resumeSession(targetId, session.cwd, {
             includeCbiMcp,
           }),
-          safeFetchArtifacts(session.sessionId),
+          safeFetchArtifacts(targetId),
+          initialTailPromise,
         ]);
+        if (activeSessionIdRef.current !== targetId) {
+          return;
+        }
         mergeSetupMetadata(resumed);
-        setActiveSessionId(session.sessionId);
         setActiveSessionMode(resumed.replayed ? "loaded" : "resumed");
         setSessionArtifacts(artifacts);
+
+        if (!initialPage || !initialPage.hydrated) {
+          const postHydratePage = await fetchSessionMessages(targetId, {
+            limitTurns: 8,
+          });
+          if (activeSessionIdRef.current === targetId) {
+            applyInitialMessagesPage(postHydratePage);
+          }
+        }
       } catch (err: unknown) {
-        setSessionError(
-          err instanceof Error ? err.message : "Failed to resume session.",
-        );
+        if (activeSessionIdRef.current === targetId) {
+          setSessionError(
+            err instanceof Error ? err.message : "Failed to resume session.",
+          );
+        }
       } finally {
+        if (activeSessionIdRef.current === targetId) {
+          setLoadingMessages(false);
+        }
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp, mergeSetupMetadata],
+    [applyInitialMessagesPage, includeCbiMcp, mergeSetupMetadata, resetTimelineState],
   );
+
+  const loadOlderMessages = useCallback(async () => {
+    const targetId = activeSessionIdRef.current;
+    const beforeTurn = nextBeforeTurnRef.current;
+    if (!targetId || beforeTurn === null || loadingOlderRef.current) {
+      return;
+    }
+    loadingOlderRef.current = true;
+    setLoadingOlderMessages(true);
+    try {
+      const page = await fetchSessionMessages(targetId, {
+        limitTurns: 10,
+        beforeTurn,
+      });
+      if (activeSessionIdRef.current !== targetId) {
+        return;
+      }
+      nextBeforeTurnRef.current = page.nextBeforeTurn;
+      setHasMoreMessages(page.hasMore);
+      setTotalMessageItems((prev) => Math.max(prev, page.totalItems));
+      if (page.items.length > 0) {
+        setReplayedMessages((prev) => {
+          const existingIds = new Set(prev.map((item) => item.id));
+          const olderUnique = page.items.filter(
+            (item) => !existingIds.has(item.id),
+          );
+          if (olderUnique.length === 0) {
+            return prev;
+          }
+          const combined = [...olderUnique, ...prev];
+          syncKnownTracker(knownTrackerRef.current, combined);
+          return combined;
+        });
+      }
+    } catch (err: unknown) {
+      if (activeSessionIdRef.current === targetId) {
+        setSessionError(
+          err instanceof Error
+            ? err.message
+            : "Failed to load earlier messages.",
+        );
+      }
+    } finally {
+      if (activeSessionIdRef.current === targetId) {
+        loadingOlderRef.current = false;
+        setLoadingOlderMessages(false);
+      }
+    }
+  }, []);
 
   const setSessionConfigOption = useCallback(
     async (configId: string, value: string | boolean) => {
@@ -941,9 +1258,8 @@ export function useAcpConnection(): UseAcpConnectionState {
     setSessionBusyId("close");
     try {
       await client.closeSession(closingId);
-      setActiveSessionId(null);
       setActiveSessionMode(null);
-      setReplayedMessages([]);
+      resetTimelineState(null);
       setSessionMetaById((prev) => {
         const next = { ...prev };
         delete next[closingId];
@@ -958,7 +1274,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     } finally {
       setSessionBusyId(null);
     }
-  }, [activeSessionId]);
+  }, [activeSessionId, resetTimelineState]);
 
   const deleteExistingSession = useCallback(
     async (sessionId: string) => {
@@ -979,9 +1295,8 @@ export function useAcpConnection(): UseAcpConnectionState {
           return next;
         });
         if (activeSessionId === sessionId) {
-          setActiveSessionId(null);
           setActiveSessionMode(null);
-          setReplayedMessages([]);
+          resetTimelineState(null);
           setSessionArtifacts([]);
           setSelectedArtifact(null);
         }
@@ -993,7 +1308,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [activeSessionId],
+    [activeSessionId, resetTimelineState],
   );
 
   const refreshArtifacts = useCallback(async () => {
@@ -1063,6 +1378,12 @@ export function useAcpConnection(): UseAcpConnectionState {
     activeSessionId,
     activeSessionMode,
     replayedMessages,
+    hasMoreMessages,
+    loadingMessages,
+    loadingOlderMessages,
+    isLiveThinking,
+    totalMessageItems,
+    loadOlderMessages,
     sessionModels: activeMeta.models,
     sessionModes: activeMeta.modes,
     configOptions: activeMeta.configOptions,

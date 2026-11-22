@@ -10,6 +10,7 @@ from api import (
     ApiServerConfig,
     ApiServerRunner,
 )
+from api.utils.security import resolve_agy_profile_root
 from cli.utils.argv import normalize_mcp_tool_kwargs, parse_mcp_call_args
 from cli.utils.output import (
     emit_json,
@@ -99,7 +100,7 @@ class ServerCliCommands:
         scoped = self._engine.for_db(db_path)
         app_cfg = scoped.config.model_copy(update={"debug": debug})
         raw_app_dir = getattr(args, "agy_app_data_dir", None)
-        api_cfg = ApiServerConfig(
+        base_cfg = ApiServerConfig(
             host=str(getattr(args, "host", "127.0.0.1")),
             port=int(getattr(args, "port", 8000)),
             allow_non_loopback=bool(getattr(args, "allow_non_loopback", False)),
@@ -110,6 +111,9 @@ class ServerCliCommands:
                 str(raw_app_dir) if raw_app_dir is not None else DEFAULT_AGY_APP_DATA_DIR
             ),
             agy_gemini_dir=getattr(args, "agy_gemini_dir", None),
+        )
+        api_cfg = base_cfg.model_copy(
+            update={"chat_db_path": resolve_agy_profile_root(base_cfg) / "cbi_chat.db"}
         )
         runner = ApiServerRunner(api_cfg, app_cfg, engine=scoped)
         runner.run()

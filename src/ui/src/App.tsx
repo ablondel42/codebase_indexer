@@ -139,6 +139,12 @@ function WorkspaceCanvas() {
                 activeSessionId={acp.activeSessionId}
                 activeSessionMode={acp.activeSessionMode}
                 replayedMessages={acp.replayedMessages}
+                hasMoreMessages={acp.hasMoreMessages}
+                loadingMessages={acp.loadingMessages}
+                loadingOlderMessages={acp.loadingOlderMessages}
+                isLiveThinking={acp.isLiveThinking}
+                totalMessageItems={acp.totalMessageItems}
+                onLoadOlderMessages={acp.loadOlderMessages}
                 sessionModels={acp.sessionModels}
                 sessionModes={acp.sessionModes}
                 configOptions={acp.configOptions}

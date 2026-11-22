@@ -82,6 +82,10 @@ class PromptTurnManager:
         """Return ``True`` when ``session_id`` is an announced subagent child session."""
         return session_id in self._child_sessions
 
+    def session_id_for_prompt_request(self, req_id: int | str) -> str | None:
+        """Return active turn ``sessionId`` matching ``req_id``, if any."""
+        return self._turn_by_req_id.get(req_id)
+
     def _validate_prompt_session_state(
         self,
         req_id: int | str,
