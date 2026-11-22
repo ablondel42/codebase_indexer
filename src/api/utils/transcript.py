@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,9 @@ from core.utils.logging import get_logger
 logger = get_logger("api.utils.transcript")
 
 MAX_TOOL_OUTPUT_CHARS = 8000
+_STALE_BATCH_SECONDS = 1800.0
+_STALE_TASK_SECONDS = 86_400.0
+_NON_ERROR_UNPAIRED_TOOLS: frozenset[str] = frozenset({"ask_question", "exit_plan_mode"})
 _SEARCH_MCP_TOOLS: frozenset[str] = frozenset(
     {
         "find_by_name",
@@ -154,12 +158,11 @@ def classify_profile_watch_path(
 
 def extract_user_request_text(raw_content: str) -> str:
     """Extract clean user prompt text from ``USER_INPUT`` transcript steps."""
-    match = _USER_REQUEST_RE.search(raw_content)
-    if match is not None:
-        return match.group(1).strip()
-    cleaned = _CONTEXT_SUMMARY_RE.sub("", raw_content)
-    cleaned = _ADDITIONAL_META_RE.sub("", cleaned)
-    return cleaned.strip()
+    without_summary = _CONTEXT_SUMMARY_RE.sub("", raw_content)
+    matches = _USER_REQUEST_RE.findall(without_summary)
+    if matches:
+        return matches[-1].strip()
+    return _ADDITIONAL_META_RE.sub("", without_summary).strip()
 
 
 def _parse_iso_timestamp(raw: object) -> float | None:
@@ -326,8 +329,8 @@ def clean_generic_tool_output(raw_content: str) -> tuple[str, float | None, int 
 def _decode_consumed_jsonl(consumed: bytes) -> list[dict[str, Any]]:
     """Parse decoded newline-terminated JSON object lines while skipping invalid lines."""
     entries: list[dict[str, Any]] = []
-    for raw_line in consumed.decode("utf-8", errors="replace").splitlines():
-        text_line = raw_line.strip()
+    for raw_line in consumed.split(b"\n"):
+        text_line = raw_line.decode("utf-8", errors="replace").strip()
         if not text_line:
             continue
         try:
@@ -474,12 +477,39 @@ def _append_planner_upserts(
         planner_step=step_index,
         next_tool_idx=0,
         total_tools=len(tool_calls),
+        tool_names=tuple(
+            str(call.get("name") or "") if isinstance(call, Mapping) else ""
+            for call in tool_calls
+        ),
         planner_item_id=planner_item_id,
         planner_role=planner_role,
         planner_created_at=raw_created,
         duration_updated=duration_sec is not None,
     )
     return batch, True
+
+
+def _finalize_interrupted_batch(
+    batch: TranscriptToolBatchState | None,
+    step_created_at: object,
+    upserts: list[ChatTimelineItemUpsert],
+) -> None:
+    """Close any remaining tool calls in ``batch`` when a turn interrupts or settles."""
+    if batch is None:
+        return
+    _backfill_planner_duration(upserts, batch, step_created_at)
+    for tool_idx in range(batch.next_tool_idx, batch.total_tools):
+        tool_name = batch.tool_names[tool_idx] if tool_idx < len(batch.tool_names) else ""
+        is_benign = tool_name in _NON_ERROR_UNPAIRED_TOOLS
+        upserts.append(
+            ChatTimelineItemUpsert(
+                item_id=f"tf:{batch.planner_step}:tool:{tool_idx}",
+                role=ChatItemRole.TOOL,
+                text="" if is_benign else "Tool execution was canceled.",
+                merge_mode="replace",
+                tool_status="done" if is_benign else "error",
+            )
+        )
 
 
 def _resolve_generic_tool_status(
@@ -768,6 +798,7 @@ def _handle_model_entry(
     """Handle one ``MODEL/PLANNER_RESPONSE`` or ``MODEL/GENERIC`` transcript entry."""
     batch, active, started_at, upserts, tasks_map = state
     if str(entries[idx].get("type") or "") == "PLANNER_RESPONSE":
+        _finalize_interrupted_batch(batch, entries[idx].get("created_at"), upserts)
         next_batch, next_active = _append_planner_upserts(
             context[0],
             entries[idx],
@@ -801,18 +832,66 @@ def _process_transcript_entry(
     result = (batch, active, started_at, False)
 
     if source == "USER_EXPLICIT" and step_type == "USER_INPUT":
+        _finalize_interrupted_batch(batch, entry.get("created_at"), upserts)
         result = (*_apply_user_step(context[0], entry, upserts, started_at), False)
     elif source == "MODEL" and step_type in ("PLANNER_RESPONSE", "GENERIC"):
         result = _handle_model_entry(idx, entries, context, state)
     elif step_type == "ERROR_MESSAGE":
+        _finalize_interrupted_batch(batch, entry.get("created_at"), upserts)
         tasks_map.clear()
         result = (*_apply_error_step(context[0], entry, upserts), None, False)
     elif step_type == "SYSTEM_MESSAGE":
         sys_res = _apply_system_message_step(entry, context[1], tasks_map, upserts, active)
         result = (batch, sys_res[0], started_at if sys_res[0] else None, sys_res[1])
     elif step_type == "CHECKPOINT":
+        _finalize_interrupted_batch(batch, entry.get("created_at"), upserts)
         result = (None, bool(tasks_map), started_at if tasks_map else None, False)
     return result
+
+
+def _canonicalize_transcript_entries(
+    entries: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse rewound or retried ``step_index`` branches into the active trajectory."""
+    canonical: list[tuple[int, dict[str, Any]]] = []
+    for entry in entries:
+        raw_step = entry.get("step_index")
+        if not isinstance(raw_step, int) or isinstance(raw_step, bool):
+            continue
+        is_same_step_generic = (
+            bool(canonical)
+            and raw_step == canonical[-1][0]
+            and str(entry.get("type") or "") == "GENERIC"
+        )
+        if canonical and raw_step <= canonical[-1][0] and not is_same_step_generic:
+            while canonical and canonical[-1][0] >= raw_step:
+                canonical.pop()
+        canonical.append((raw_step, entry))
+    return [entry for _, entry in canonical]
+
+
+def _settle_stale_turn_state(
+    mtime: float | None,
+    active: bool,
+    pending_batch: TranscriptToolBatchState | None,
+    tasks_map: dict[str, TranscriptBackgroundTask],
+    upserts: list[ChatTimelineItemUpsert],
+    turn_started_at: str | None,
+) -> tuple[TranscriptToolBatchState | None, bool, str | None]:
+    """Finalize abandoned pending batches or tasks when ``transcript_path`` is idle."""
+    if not active or mtime is None:
+        return pending_batch, active, turn_started_at
+    idle_sec = max(0.0, time.time() - mtime)
+    batch_stale = not tasks_map and idle_sec > _STALE_BATCH_SECONDS
+    task_stale = idle_sec > _STALE_TASK_SECONDS
+    if not batch_stale and not task_stale:
+        return pending_batch, active, turn_started_at
+    if pending_batch is not None:
+        _finalize_interrupted_batch(pending_batch, None, upserts)
+        pending_batch = None
+    if tasks_map and task_stale:
+        _stop_restarted_tasks(tasks_map, upserts, None)
+    return pending_batch, False, None
 
 
 def read_transcript_delta(
@@ -825,7 +904,7 @@ def read_transcript_delta(
     turn_started_at: str | None = None,
 ) -> TranscriptParseResult:
     """Parse newly appended ``transcript_full.jsonl`` lines starting at ``start_offset``."""
-    entries, next_offset, truncated, _ = _extract_complete_lines(
+    entries, next_offset, truncated, mtime = _extract_complete_lines(
         transcript_path,
         start_offset,
     )
@@ -838,6 +917,9 @@ def read_transcript_delta(
             turn_started_at=turn_started_at,
         )
 
+    if start_offset == 0:
+        entries = _canonicalize_transcript_entries(entries)
+
     upserts: list[ChatTimelineItemUpsert] = []
     tasks_map: dict[str, TranscriptBackgroundTask] = {t.task_id: t for t in pending_tasks}
     active = pending_batch is not None or bool(tasks_map)
@@ -846,8 +928,10 @@ def read_transcript_delta(
         raw_step = entry.get("step_index")
         if not isinstance(raw_step, int) or isinstance(raw_step, bool):
             continue
-        if raw_step <= prev_step and not (
-            raw_step == prev_step and str(entry.get("type") or "") == "GENERIC"
+        if (
+            start_offset > 0
+            and raw_step <= prev_step
+            and not (raw_step == prev_step and str(entry.get("type") or "") == "GENERIC")
         ):
             return TranscriptParseResult(
                 last_step_index=prev_step,
@@ -870,6 +954,14 @@ def read_transcript_delta(
                 turn_started_at=turn_started_at,
             )
 
+    pending_batch, active, turn_started_at = _settle_stale_turn_state(
+        mtime,
+        active,
+        pending_batch,
+        tasks_map,
+        upserts,
+        turn_started_at,
+    )
     return TranscriptParseResult(
         upserts=tuple(upserts),
         last_step_index=prev_step,

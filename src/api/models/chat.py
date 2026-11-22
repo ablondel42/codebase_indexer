@@ -81,6 +81,7 @@ class TranscriptToolBatchState(FrozenModel):
     planner_step: int
     next_tool_idx: int
     total_tools: int
+    tool_names: tuple[str, ...] = ()
     planner_item_id: str | None = None
     planner_role: Literal["thought", "agent"] | None = None
     planner_created_at: str | None = None

@@ -44,11 +44,6 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  PROMPT_EFFORT_OPTIONS,
-  PROMPT_MODEL_PROVIDERS,
-  type PromptEffortId,
-} from "@/lib/acp/turn-grouping";
 import type {
   AcpAvailableCommand,
   AcpConfigOption,
@@ -93,10 +88,6 @@ export function PromptSuggestions({
     </div>
   );
 }
-
-const FALLBACK_MODELS = PROMPT_MODEL_PROVIDERS.flatMap(
-  (provider) => provider.models,
-);
 
 function flattenConfigChoices(opt: AcpConfigOption): AcpConfigSelectChoice[] {
   if (opt.groups.length > 0) {
@@ -158,11 +149,6 @@ export function SessionPromptInput({
   onSubmitPrompt,
 }: SessionPromptInputProps) {
   const [files, setFiles] = React.useState<AttachedDraftFile[]>([]);
-  const [fallbackModel, setFallbackModel] = React.useState<string>(
-    FALLBACK_MODELS[0]?.id ?? "gemini-3.1-pro",
-  );
-  const [fallbackEffort, setFallbackEffort] =
-    React.useState<PromptEffortId>("medium");
   const [dismissedSlashDraft, setDismissedSlashDraft] = React.useState<
     string | null
   >(null);
@@ -211,13 +197,13 @@ export function SessionPromptInput({
         description: item.description,
       }));
     }
-    return FALLBACK_MODELS.map((item) => ({ value: item.id, name: item.name }));
+    return [];
   }, [modelConfigOpt, sessionModels]);
 
   const activeModelValue =
     modelConfigOpt && typeof modelConfigOpt.currentValue === "string"
       ? modelConfigOpt.currentValue
-      : (sessionModels?.currentModelId ?? fallbackModel);
+      : (sessionModels?.currentModelId ?? "");
 
   const activeModelLabel =
     activeModelChoices.find((item) => item.value === activeModelValue)?.name ??
@@ -227,19 +213,13 @@ export function SessionPromptInput({
     if (thoughtConfigOpt) {
       return flattenConfigChoices(thoughtConfigOpt);
     }
-    if (configOptions.length > 0) {
-      return [];
-    }
-    return PROMPT_EFFORT_OPTIONS.map((item) => ({
-      value: item.id,
-      name: item.name,
-    }));
-  }, [configOptions.length, thoughtConfigOpt]);
+    return [];
+  }, [thoughtConfigOpt]);
 
   const activeThoughtValue =
     thoughtConfigOpt && typeof thoughtConfigOpt.currentValue === "string"
       ? thoughtConfigOpt.currentValue
-      : fallbackEffort;
+      : "";
 
   const activeThoughtLabel =
     activeThoughtChoices.find((item) => item.value === activeThoughtValue)
@@ -307,17 +287,13 @@ export function SessionPromptInput({
   function handleModelChange(nextValue: string) {
     if (modelConfigOpt && onSelectConfigOption) {
       void onSelectConfigOption(modelConfigOpt.id, nextValue);
-      return;
     }
-    setFallbackModel(nextValue);
   }
 
   function handleThoughtChange(nextValue: string) {
     if (thoughtConfigOpt && onSelectConfigOption) {
       void onSelectConfigOption(thoughtConfigOpt.id, nextValue);
-      return;
     }
-    setFallbackEffort(nextValue as PromptEffortId);
   }
 
   function handleModeChange(nextValue: string) {
@@ -592,73 +568,75 @@ export function SessionPromptInput({
             </DropdownMenu>
           )}
 
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <InputGroupButton
-                  size="xs"
-                  variant="outline"
-                  aria-label={`Model: ${activeModelLabel}`}
-                  className="ml-auto"
-                  disabled={
-                    !hasActiveSession ||
-                    (modelConfigOpt !== null && configBusyId === modelConfigOpt.id)
-                  }
-                />
-              }
-            >
-              {modelConfigOpt && configBusyId === modelConfigOpt.id ? (
-                <Spinner className="size-3" />
-              ) : null}
-              <span className="max-w-36 truncate">{activeModelLabel}</span>
-              <ChevronDownIcon />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="end"
-              side="top"
-              className="max-h-72 w-56 overflow-y-auto"
-            >
-              <DropdownMenuRadioGroup
-                value={activeModelValue}
-                onValueChange={(next) => handleModelChange(String(next))}
+          {activeModelChoices.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <InputGroupButton
+                    size="xs"
+                    variant="outline"
+                    aria-label={`Model: ${activeModelLabel}`}
+                    className="ml-auto"
+                    disabled={
+                      !hasActiveSession ||
+                      (modelConfigOpt !== null && configBusyId === modelConfigOpt.id)
+                    }
+                  />
+                }
               >
-                {modelConfigOpt && modelConfigOpt.groups.length > 0 ? (
-                  modelConfigOpt.groups.map((grp, idx) => (
-                    <React.Fragment key={grp.group}>
-                      {idx > 0 && <DropdownMenuSeparator />}
-                      <DropdownMenuGroup>
-                        <DropdownMenuLabel>{grp.name}</DropdownMenuLabel>
-                        {grp.options.map((item) => (
-                          <DropdownMenuRadioItem
-                            key={item.value}
-                            value={item.value}
-                            closeOnClick
-                          >
-                            {item.name}
-                          </DropdownMenuRadioItem>
-                        ))}
-                      </DropdownMenuGroup>
-                    </React.Fragment>
-                  ))
-                ) : (
-                  <DropdownMenuGroup>
-                    <DropdownMenuLabel>
-                      {modelConfigOpt?.name ?? "Model"}
-                    </DropdownMenuLabel>
-                    {activeModelChoices.map((item) => (
-                      <DropdownMenuRadioItem
-                        key={item.value}
-                        value={item.value}
-                        closeOnClick
-                      >
-                        {item.name}
-                      </DropdownMenuRadioItem>
-                    ))}
-                  </DropdownMenuGroup>
-                )}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
+                {modelConfigOpt && configBusyId === modelConfigOpt.id ? (
+                  <Spinner className="size-3" />
+                ) : null}
+                <span className="max-w-36 truncate">{activeModelLabel}</span>
+                <ChevronDownIcon />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                side="top"
+                className="max-h-72 w-56 overflow-y-auto"
+              >
+                <DropdownMenuRadioGroup
+                  value={activeModelValue}
+                  onValueChange={(next) => handleModelChange(String(next))}
+                >
+                  {modelConfigOpt && modelConfigOpt.groups.length > 0 ? (
+                    modelConfigOpt.groups.map((grp, idx) => (
+                      <React.Fragment key={grp.group}>
+                        {idx > 0 && <DropdownMenuSeparator />}
+                        <DropdownMenuGroup>
+                          <DropdownMenuLabel>{grp.name}</DropdownMenuLabel>
+                          {grp.options.map((item) => (
+                            <DropdownMenuRadioItem
+                              key={item.value}
+                              value={item.value}
+                              closeOnClick
+                            >
+                              {item.name}
+                            </DropdownMenuRadioItem>
+                          ))}
+                        </DropdownMenuGroup>
+                      </React.Fragment>
+                    ))
+                  ) : (
+                    <DropdownMenuGroup>
+                      <DropdownMenuLabel>
+                        {modelConfigOpt?.name ?? "Model"}
+                      </DropdownMenuLabel>
+                      {activeModelChoices.map((item) => (
+                        <DropdownMenuRadioItem
+                          key={item.value}
+                          value={item.value}
+                          closeOnClick
+                        >
+                          {item.name}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuGroup>
+                  )}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
           {activeThoughtChoices.length > 0 && (
             <DropdownMenu>
@@ -712,7 +690,13 @@ export function SessionPromptInput({
           <Tooltip>
             <TooltipTrigger
               render={
-                <span className="inline-flex">
+                <span
+                  className={
+                    activeModelChoices.length > 0
+                      ? "inline-flex"
+                      : "ml-auto inline-flex"
+                  }
+                >
                   <InputGroupButton
                     type="submit"
                     size="icon-xs"

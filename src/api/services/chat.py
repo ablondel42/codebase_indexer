@@ -37,6 +37,7 @@ class SessionChatRecorder:
         self._flush_interval_seconds = flush_interval_seconds
         self._io_lock = asyncio.Lock()
         self._pending_setups: dict[int | str, tuple[str, bool, bool]] = {}
+        self._metadata_only_reqs: set[int | str] = set()
         self._suppressed_sessions: dict[str, bool] = {}
         self._hydration_buffers: dict[str, list[ChatTimelineItemUpsert]] = {}
         self._live_buffers: dict[str, list[ChatTimelineItemUpsert]] = {}
@@ -86,6 +87,12 @@ class SessionChatRecorder:
             self._hydration_buffers[session_id] = []
             self._auto_stream_state.pop(session_id, None)
             self._active_plan_ids.pop(session_id, None)
+
+    def register_metadata_only_load(self, req_id: int | str, session_id: str) -> None:
+        """Suppress timeline chunks on a metadata-only ``session/load`` without touching storage."""
+        self._metadata_only_reqs.add(req_id)
+        self._pending_setups[req_id] = (session_id, True, False)
+        self._suppressed_sessions[session_id] = False
 
     async def record_prompt_sent(
         self,
@@ -334,6 +341,8 @@ class SessionChatRecorder:
     ) -> str:
         """Commit buffered replay history (if hydrating) and attach ``_meta.cbiChat``."""
         pending = self._pending_setups.pop(req_id, None)
+        is_metadata_only = req_id in self._metadata_only_reqs
+        self._metadata_only_reqs.discard(req_id)
         if pending is None:
             return raw_line
 
@@ -346,7 +355,7 @@ class SessionChatRecorder:
         self._item_started_at = {
             key: val for key, val in self._item_started_at.items() if key[0] != session_id
         }
-        if not succeeded or self._store is None:
+        if is_metadata_only or not succeeded or self._store is None:
             return raw_line
 
         async with self._io_lock:
@@ -363,7 +372,7 @@ class SessionChatRecorder:
                     await asyncio.to_thread(
                         self._store.mark_session_hydrated,
                         session_id,
-                        reset_existing=True,
+                        reset_existing=False,
                     )
             record = await asyncio.to_thread(self._store.get_session, session_id)
 

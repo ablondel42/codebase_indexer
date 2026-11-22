@@ -127,6 +127,10 @@ def _write_session_agent_script(
                                         "modelId": "gemini-4-carbon-high",
                                         "name": "Gemini 4 Carbon (High)",
                                     }},
+                                    {{
+                                        "modelId": "gemini-pro-orchestrator",
+                                        "name": "Orchestrator (Carbon)",
+                                    }},
                                 ],
                                 "currentModelId": "gemini-4-neon-high",
                             }},
@@ -155,6 +159,10 @@ def _write_session_agent_script(
                                     "options": [
                                         {{"value": "gemini-4-neon", "name": "Gemini 4 Neon"}},
                                         {{"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"}},
+                                        {{
+                                            "value": "gemini-pro-orchestrator",
+                                            "name": "Orchestrator (Carbon)",
+                                        }},
                                     ],
                                 }},
                                 {{
@@ -241,6 +249,10 @@ def _write_session_agent_script(
                                 "options": [
                                     {{"value": "gemini-4-neon", "name": "Gemini 4 Neon"}},
                                     {{"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"}},
+                                    {{
+                                        "value": "gemini-pro-orchestrator",
+                                        "name": "Orchestrator (Carbon)",
+                                    }},
                                 ],
                             }},
                             {{
@@ -788,9 +800,32 @@ def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
         assert updated_state["config_options"][2]["currentValue"] == "plan"
 
         ws.send_json(
-            {"jsonrpc": "2.0", "id": 7, "method": "session/close", "params": {"sessionId": sid}}
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": sid,
+                    "configId": "model",
+                    "value": "gemini-pro-orchestrator",
+                },
+            }
         )
-        assert ws.receive_json()["id"] == 7
+        orch_resp = ws.receive_json()
+        assert orch_resp["id"] == 7
+        assert orch_resp["result"]["configOptions"][0]["currentValue"] == "gemini-pro-orchestrator"
+
+        orch_state = client.get(
+            f"/api/sessions/{sid}/state",
+            headers={"host": "127.0.0.1:8000"},
+        ).json()
+        assert orch_state["config_options"][0]["currentValue"] == "gemini-pro-orchestrator"
+        assert orch_state["models"]["currentModelId"] == "gemini-pro-orchestrator"
+
+        ws.send_json(
+            {"jsonrpc": "2.0", "id": 8, "method": "session/close", "params": {"sessionId": sid}}
+        )
+        assert ws.receive_json()["id"] == 8
         assert (
             client.get(
                 f"/api/sessions/{sid}/state",

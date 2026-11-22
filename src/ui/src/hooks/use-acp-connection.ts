@@ -52,6 +52,24 @@ const EMPTY_SESSION_META: AcpSessionRuntimeMeta = {
   tier: null,
 };
 
+function syncModelsWithOptions(
+  models: AcpModelsState | null,
+  options: AcpConfigOption[],
+): AcpModelsState | null {
+  if (!models) {
+    return null;
+  }
+  const modelOpt = options.find(
+    (opt) =>
+      (opt.category === "model" || opt.id === "model") &&
+      typeof opt.currentValue === "string",
+  );
+  if (!modelOpt || typeof modelOpt.currentValue !== "string") {
+    return models;
+  }
+  return { ...models, currentModelId: modelOpt.currentValue };
+}
+
 function syncModesWithOptions(
   modes: AcpModesState | null,
   options: AcpConfigOption[],
@@ -515,6 +533,7 @@ export function useAcpConnection(): UseAcpConnectionState {
   const rafFlushIdRef = useRef<number | null>(null);
   const selectedArtifactNameRef = useRef<string | null>(null);
   const silentSessionsTimerRef = useRef<number | null>(null);
+  const timelineResetSeqRef = useRef(0);
   const knownTrackerRef = useRef<KnownTimelineTracker>({
     ids: new Set(),
     lastRole: null,
@@ -596,6 +615,7 @@ export function useAcpConnection(): UseAcpConnectionState {
   const resetTimelineState = useCallback(
     (nextSessionId: string | null) => {
       cancelPendingLiveFlush();
+      timelineResetSeqRef.current += 1;
       activeSessionIdRef.current = nextSessionId;
       nextBeforeTurnRef.current = null;
       loadingOlderRef.current = false;
@@ -661,33 +681,53 @@ export function useAcpConnection(): UseAcpConnectionState {
     });
   }, []);
 
-  const mergeSetupMetadata = useCallback((setup: AcpSessionSetupResult) => {
-    if (setup.tier) {
-      setAccountTier(setup.tier);
-    }
-    setSessionMetaById((prev) => {
-      const base = prev[setup.sessionId] ?? EMPTY_SESSION_META;
-      const configOptions =
-        setup.configOptions.length > 0
-          ? setup.configOptions
-          : base.configOptions;
-      const modes = syncModesWithOptions(
-        setup.modes ?? base.modes,
-        configOptions,
-      );
-      return {
-        ...prev,
-        [setup.sessionId]: {
-          models: setup.models ?? base.models,
-          modes,
+  const mergeSetupMetadata = useCallback(
+    (
+      setup: AcpSessionSetupResult,
+      options?: { fillMissingOnly?: boolean },
+    ) => {
+      if (setup.tier) {
+        const nextTier = setup.tier;
+        setAccountTier((prev) =>
+          options?.fillMissingOnly && prev ? prev : nextTier,
+        );
+      }
+      setSessionMetaById((prev) => {
+        const base = prev[setup.sessionId] ?? EMPTY_SESSION_META;
+        const configOptions = options?.fillMissingOnly
+          ? base.configOptions.length > 0
+            ? base.configOptions
+            : setup.configOptions
+          : setup.configOptions.length > 0
+            ? setup.configOptions
+            : base.configOptions;
+        const models = options?.fillMissingOnly
+          ? (base.models ?? syncModelsWithOptions(setup.models, configOptions))
+          : syncModelsWithOptions(setup.models ?? base.models, configOptions);
+        const modes = syncModesWithOptions(
+          options?.fillMissingOnly
+            ? (base.modes ?? setup.modes)
+            : (setup.modes ?? base.modes),
           configOptions,
-          availableCommands: base.availableCommands,
-          usage: base.usage,
-          tier: setup.tier ?? base.tier,
-        },
-      };
-    });
-  }, []);
+        );
+        const tier = options?.fillMissingOnly
+          ? (base.tier ?? setup.tier)
+          : (setup.tier ?? base.tier);
+        return {
+          ...prev,
+          [setup.sessionId]: {
+            models,
+            modes,
+            configOptions,
+            availableCommands: base.availableCommands,
+            usage: base.usage,
+            tier,
+          },
+        };
+      });
+    },
+    [],
+  );
 
   const scheduleSilentSessionsRefresh = useCallback(() => {
     if (silentSessionsTimerRef.current !== null) {
@@ -767,11 +807,15 @@ export function useAcpConnection(): UseAcpConnectionState {
       }
 
       if (sync.event === "timeline_reset") {
+        const resetSeq = ++timelineResetSeqRef.current;
         setIsLiveThinking(Boolean(sync.turnActive));
         setLiveItemIds(new Set());
         void fetchSessionMessages(activeSid, { limitTurns: 8 })
           .then((page) => {
-            if (activeSessionIdRef.current !== activeSid) {
+            if (
+              activeSessionIdRef.current !== activeSid ||
+              timelineResetSeqRef.current !== resetSeq
+            ) {
               return;
             }
             nextBeforeTurnRef.current = page.nextBeforeTurn;
@@ -871,6 +915,7 @@ export function useAcpConnection(): UseAcpConnectionState {
             [sessionId]: {
               ...base,
               configOptions: nextOptions,
+              models: syncModelsWithOptions(base.models, nextOptions),
               modes: syncModesWithOptions(base.modes, nextOptions),
             },
           };
@@ -1328,10 +1373,27 @@ export function useAcpConnection(): UseAcpConnectionState {
           return;
         }
         mergeSetupMetadata(resumed);
+        const caps = deriveSessionCapabilities(result);
+        if (caps.canResume && caps.canLoad) {
+          void client
+            .collectSessionLoadMetadata(targetId, session.cwd, {
+              includeCbiMcp,
+            })
+            .then((loadedMeta) => {
+              if (loadedMeta) {
+                mergeSetupMetadata(loadedMeta, { fillMissingOnly: true });
+              }
+            })
+            .catch(() => {});
+        }
         setActiveSessionMode(resumed.replayed ? "loaded" : "resumed");
         setSessionArtifacts(artifacts);
 
-        if (!initialPage || !initialPage.hydrated) {
+        const needsPostHydrateFetch =
+          !initialPage ||
+          !initialPage.hydrated ||
+          (initialPage.items.length === 0 && (resumed.totalItems ?? 0) > 0);
+        if (needsPostHydrateFetch) {
           const postHydratePage = await fetchSessionMessages(targetId, {
             limitTurns: 8,
           });
@@ -1352,7 +1414,13 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [applyInitialMessagesPage, includeCbiMcp, mergeSetupMetadata, resetTimelineState],
+    [
+      applyInitialMessagesPage,
+      includeCbiMcp,
+      mergeSetupMetadata,
+      resetTimelineState,
+      result,
+    ],
   );
 
   const loadOlderMessages = useCallback(async () => {
@@ -1431,6 +1499,7 @@ export function useAcpConnection(): UseAcpConnectionState {
             [activeSessionId]: {
               ...base,
               configOptions: nextOptions,
+              models: syncModelsWithOptions(base.models, nextOptions),
               modes: syncModesWithOptions(base.modes, nextOptions),
             },
           };

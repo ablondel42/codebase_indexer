@@ -130,6 +130,19 @@ def _sync_modes_with_options(
     return modes
 
 
+def _sync_models_with_options(
+    models: SessionModelsState | None,
+    options: tuple[SessionConfigOption, ...],
+) -> SessionModelsState | None:
+    """Synchronize ``models.current_model_id`` when a ``model`` config option updates."""
+    if models is None:
+        return None
+    for opt in options:
+        if (opt.category == "model" or opt.id == "model") and isinstance(opt.current_value, str):
+            return models.model_copy(update={"current_model_id": opt.current_value})
+    return models
+
+
 def apply_session_setup_result(
     existing: SessionRuntimeState | None,
     session_id: str,
@@ -146,10 +159,13 @@ def apply_session_setup_result(
         else base.config_options
     )
     tier = extract_antigravity_tier(result.get("_meta")) or base.tier
+    next_models = (
+        models if models is not None else _sync_models_with_options(base.models, config_options)
+    )
     next_modes = _sync_modes_with_options(modes or base.modes, config_options)
     return base.model_copy(
         update={
-            "models": models if models is not None else base.models,
+            "models": next_models,
             "modes": next_modes,
             "config_options": config_options,
             "tier": tier,
@@ -167,8 +183,11 @@ def apply_config_options_result(
     if "configOptions" not in result:
         return base
     options = _parse_config_options(result.get("configOptions"))
+    next_models = _sync_models_with_options(base.models, options)
     next_modes = _sync_modes_with_options(base.modes, options)
-    return base.model_copy(update={"config_options": options, "modes": next_modes})
+    return base.model_copy(
+        update={"config_options": options, "models": next_models, "modes": next_modes}
+    )
 
 
 def apply_mode_change(

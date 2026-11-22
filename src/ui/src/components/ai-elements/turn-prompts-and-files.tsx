@@ -33,7 +33,6 @@ import {
   type FileTreeNode,
 } from "@/lib/acp/turn-grouping";
 import type {
-  AcpContextUsage,
   AcpPendingConfirmation,
   AcpSessionUsage,
 } from "@/lib/acp/types";
@@ -191,40 +190,32 @@ export function FileTree({
 }
 
 export function ContextUsageHoverCard({
-  usage,
   sessionUsage,
 }: {
-  usage: AcpContextUsage;
   sessionUsage?: AcpSessionUsage | null;
 }) {
-  const hasLiveUsage = Boolean(sessionUsage && sessionUsage.size > 0);
-  const used = hasLiveUsage
-    ? sessionUsage!.used
-    : usage.input + usage.output + usage.reasoning;
-  const limit = hasLiveUsage ? sessionUsage!.size : usage.limit;
+  if (!sessionUsage || sessionUsage.size <= 0) {
+    return null;
+  }
+  const used = sessionUsage.used;
+  const limit = sessionUsage.size;
   const percent = Math.min(
     100,
-    Math.max(0, Math.round((used / Math.max(1, limit)) * 100)),
+    Math.max(0, Math.round((used / limit) * 100)),
   );
 
-  const rows: { label: string; value: string }[] = hasLiveUsage
-    ? [
-        { label: "Used", value: formatCompactTokens(sessionUsage!.used) },
-        { label: "Window", value: formatCompactTokens(sessionUsage!.size) },
-        ...(sessionUsage!.cost
-          ? [
-              {
-                label: "Cost",
-                value: `${sessionUsage!.cost.amount.toFixed(3)} ${sessionUsage!.cost.currency}`,
-              },
-            ]
-          : []),
-      ]
-    : [
-        { label: "Input", value: formatCompactTokens(usage.input) },
-        { label: "Output", value: formatCompactTokens(usage.output) },
-        { label: "Reasoning", value: formatCompactTokens(usage.reasoning) },
-      ];
+  const rows: { label: string; value: string }[] = [
+    { label: "Used", value: used.toLocaleString() },
+    { label: "Window", value: limit.toLocaleString() },
+    ...(sessionUsage.cost
+      ? [
+          {
+            label: "Cost",
+            value: `${sessionUsage.cost.amount.toFixed(3)} ${sessionUsage.cost.currency}`,
+          },
+        ]
+      : []),
+  ];
 
   return (
     <HoverCard>

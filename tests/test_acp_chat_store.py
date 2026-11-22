@@ -1,6 +1,8 @@
 """Tests for SQLite chat timeline persistence, silent hydration, and REST pagination."""
 
+import asyncio
 import json
+import os
 import sqlite3
 import sys
 import textwrap
@@ -12,6 +14,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from api.models.config import ApiServerConfig
+from api.services.chat import SessionChatRecorder
 from api.services.server import ApiServerRunner
 from api.utils.transcript import classify_profile_watch_path, read_transcript_delta
 from core.models.chat import (
@@ -125,6 +128,18 @@ def _write_chat_agent_script(script_path: Path, *, capture_path: Path) -> Path:
                         "update": {{
                             "sessionUpdate": "available_commands_update",
                             "availableCommands": [{{"name": "plan", "description": "Plan work"}}],
+                        }},
+                    }},
+                }})
+                send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{
+                        "sessionId": sid,
+                        "update": {{
+                            "sessionUpdate": "usage_update",
+                            "used": 4096,
+                            "size": 1048576,
                         }},
                     }},
                 }})
@@ -367,6 +382,12 @@ def test_silent_hydration_then_fast_resume_avoids_ws_replay(tmp_path: Path) -> N
             first_frame = ws.receive_json()
             assert first_frame["method"] == "session/update"
             assert first_frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+
+            usage_frame = ws.receive_json()
+            assert usage_frame["method"] == "session/update"
+            assert usage_frame["params"]["update"]["sessionUpdate"] == "usage_update"
+            assert usage_frame["params"]["update"]["used"] == 4096
+            assert usage_frame["params"]["update"]["size"] == 1048576
 
             setup_resp = ws.receive_json()
             assert setup_resp["id"] == 2
@@ -1237,3 +1258,336 @@ def test_transcript_tool_metadata_formatting(tmp_path: Path) -> None:
         ("write", "Write plan.md"),
         ("other", "exit_plan_mode"),
     ]
+
+
+def _seed_compaction_transcript(transcript: Path) -> None:
+    """Populate pre-compaction, checkpoint, and post-compaction records with regression setup."""
+    records = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:00:00Z",
+            "content": "<USER_REQUEST>\nInitial prompt\u2028line 2\n</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:00:02Z",
+            "thinking": "Initial thought.",
+            "content": "Initial reply.",
+            "tool_calls": [],
+        },
+        {
+            "step_index": 2,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:01:00Z",
+            "content": "<USER_REQUEST>\nEdit files\n</USER_REQUEST>",
+        },
+        {
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:01:02Z",
+            "tool_calls": [
+                {"name": "read_file", "args": {"Path": "/repo/a.py"}},
+                {"name": "edit_file", "args": {"Path": "/repo/b.py"}},
+            ],
+        },
+        {
+            "step_index": 4,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:01:03Z",
+            "content": "Read ok",
+        },
+        {
+            "step_index": 5,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:02:00Z",
+            "content": "<USER_REQUEST>\n/compact\n</USER_REQUEST>",
+        },
+        {
+            "step_index": 6,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:02:00Z",
+            "content": "# Resuming from a compaction\nSummary body",
+        },
+        {
+            "step_index": 7,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:03:00Z",
+            "content": (
+                "<CONTEXT_SUMMARY>\n<USER_REQUEST>\nQuoted summary prompt\n</USER_REQUEST>\n"
+                "</CONTEXT_SUMMARY>\n"
+                "<USER_REQUEST>\nAborted post-compaction question\n</USER_REQUEST>\n"
+                "<ADDITIONAL_METADATA>\nmeta\n</ADDITIONAL_METADATA>"
+            ),
+        },
+        {
+            "step_index": 8,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-22T16:03:02Z",
+            "content": "Superseded reply",
+            "tool_calls": [],
+        },
+    ]
+    for record in records:
+        _append_jsonl(transcript, record)
+
+
+def _assert_self_heal_and_stale_guard(
+    gemini_root: Path,
+    profile_root: Path,
+    tmp_path: Path,
+    sid: str,
+) -> None:
+    """Verify wedged zero-item DB row self-heals on HTTP read and stale batches settle."""
+    db_path = profile_root / "cbi_chat.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DELETE FROM chat_items WHERE session_id = ?", (sid,))
+    conn.execute(
+        "UPDATE chat_sessions SET hydrated = 1, last_seq = 0, last_turn_index = 0, "
+        "total_items = 0, transcript_step_index = 8, transcript_offset = 0 WHERE session_id = ?",
+        (sid,),
+    )
+    conn.commit()
+    conn.close()
+
+    script = _write_chat_agent_script(tmp_path / "heal_cmp.py", capture_path=tmp_path / "hc.jsonl")
+    api_cfg = ApiServerConfig(
+        agy_command=(sys.executable, "-u", str(script)),
+        agy_gemini_dir=str(gemini_root),
+        workspace_root=tmp_path,
+        chat_db_path=db_path,
+        watch_agy_profile=True,
+    )
+    healed_runner = ApiServerRunner(api_cfg, AppConfig(db_path=tmp_path / "idx_hc.db"))
+    with TestClient(healed_runner.create_app(), base_url="http://127.0.0.1:8000") as client:
+        healed = client.get(
+            f"/api/sessions/{sid}/messages?limit_turns=20",
+            headers={"host": "127.0.0.1:8000"},
+        ).json()
+    healed_runner.engine.close()
+    assert len(healed["items"]) > 0
+    assert any(
+        i["id"] == "tf:7:user" and i["text"] == "Canonical question"
+        for i in healed["items"]
+    )
+
+    stale_log = tmp_path / "stale_transcript.jsonl"
+    _append_jsonl(
+        stale_log,
+        {
+            "step_index": 0,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-20T10:00:00Z",
+            "tool_calls": [
+                {"name": "ask_question", "args": {"questions": []}},
+                {"name": "run_command", "args": {"CommandLine": "echo hi"}},
+            ],
+        },
+    )
+    old_epoch = time.time() - 3600.0
+    os.utime(stale_log, (old_epoch, old_epoch))
+    stale_parsed = read_transcript_delta(stale_log, start_offset=0, last_step_index=None)
+    assert stale_parsed.turn_active is False
+    stale_tools = {u.item_id: u for u in stale_parsed.upserts if u.role == ChatItemRole.TOOL}
+    assert stale_tools["tf:0:tool:0"].tool_status == "done"
+    assert stale_tools["tf:0:tool:1"].tool_status == "error"
+
+    mem_store = SqlChatStore(":memory:")
+    try:
+        mem_store.upsert_items(
+            "compacted_live",
+            [ChatTimelineItemUpsert(item_id="old:0", role=ChatItemRole.USER, text="Before")],
+            mark_hydrated=False,
+        )
+        recorder = SessionChatRecorder("c_empty_replay", mem_store)
+        recorder.register_pending_setup(
+            1,
+            "compacted_live",
+            suppress_replay=True,
+            hydrate_reset=True,
+        )
+        asyncio.run(
+            recorder.complete_setup_response(
+                1,
+                '{"jsonrpc":"2.0","id":1,"result":{}}',
+                {"result": {}},
+                succeeded=True,
+            )
+        )
+        kept = mem_store.get_history_page(ChatPageQuery(session_id="compacted_live"))
+        assert [i.text for i in kept.items] == ["Before"]
+    finally:
+        mem_store.close()
+
+
+def test_compaction_and_append_only_step_regression_preserve_full_history(tmp_path: Path) -> None:
+    """Preserves full pre/post-compaction history across append-only step regressions."""
+    gemini_root = (tmp_path / "gemini_cmp").resolve()
+    profile_root = gemini_root / "antigravity"
+    sid = "sess_compaction"
+    logs_dir = profile_root / "brain" / sid / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True)
+    transcript = logs_dir / "transcript_full.jsonl"
+    _seed_compaction_transcript(transcript)
+
+    script = _write_chat_agent_script(tmp_path / "cmp_agent.py", capture_path=tmp_path / "c.jsonl")
+    api_cfg = ApiServerConfig(
+        agy_command=(sys.executable, "-u", str(script)),
+        agy_gemini_dir=str(gemini_root),
+        workspace_root=tmp_path,
+        chat_db_path=profile_root / "cbi_chat.db",
+        watch_agy_profile=True,
+    )
+    runner = ApiServerRunner(api_cfg, AppConfig(db_path=tmp_path / "idx.db"))
+    runner.profile_watcher.set_debounce_windows(transcript_seconds=0.02, sessions_seconds=0.04)
+
+    with TestClient(runner.create_app(), base_url="http://127.0.0.1:8000") as client:
+        time.sleep(0.25)
+        pre_page = client.get(
+            f"/api/sessions/{sid}/messages?limit_turns=20",
+            headers={"host": "127.0.0.1:8000"},
+        ).json()
+        pre_by_id = {i["id"]: i for i in pre_page["items"]}
+        assert pre_by_id["tf:0:user"]["text"] == "Initial prompt\u2028line 2"
+        assert pre_by_id["tf:3:tool:1"]["toolStatus"] == "error"
+        assert pre_by_id["tf:7:user"]["text"] == "Aborted post-compaction question"
+
+        with client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws:
+            ws.send_json(_init_msg())
+            assert ws.receive_json()["id"] == 1
+
+            # Append-only rewind back to step_index=7 WITHOUT truncating transcript_full.jsonl
+            _append_jsonl(
+                transcript,
+                {
+                    "step_index": 7,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "created_at": "2026-11-22T16:04:00Z",
+                    "content": "<USER_REQUEST>\nCanonical question\n</USER_REQUEST>",
+                },
+            )
+            _append_jsonl(
+                transcript,
+                {
+                    "step_index": 8,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-22T16:04:05Z",
+                    "content": "Canonical answer",
+                    "tool_calls": [],
+                },
+            )
+            reset_evt = _recv_sync_until(ws, lambda p: p.get("event") == "timeline_reset")
+            assert reset_evt["totalItems"] >= 9
+
+            post_page = client.get(
+                f"/api/sessions/{sid}/messages?limit_turns=20",
+                headers={"host": "127.0.0.1:8000"},
+            ).json()
+            post_by_id = {i["id"]: i for i in post_page["items"]}
+            assert post_by_id["tf:0:user"]["text"] == "Initial prompt\u2028line 2"
+            assert post_by_id["tf:1:agent"]["text"] == "Initial reply."
+            assert post_by_id["tf:5:user"]["text"] == "/compact"
+            assert post_by_id["tf:7:user"]["text"] == "Canonical question"
+            assert post_by_id["tf:8:agent"]["text"] == "Canonical answer"
+
+    runner.engine.close()
+    _assert_self_heal_and_stale_guard(gemini_root, profile_root, tmp_path, sid)
+
+
+def test_metadata_only_session_load_collects_usage_without_storing_or_forwarding_messages(
+    tmp_path: Path,
+) -> None:
+    """Metadata-only ``session/load`` collects usage/commands without messages or DB writes."""
+    capture_path = tmp_path / "metadata_only_capture.jsonl"
+    script = _write_chat_agent_script(tmp_path / "meta_agent.py", capture_path=capture_path)
+    api_cfg = ApiServerConfig(
+        agy_command=(sys.executable, "-u", str(script)),
+        workspace_root=tmp_path,
+        chat_db_path=tmp_path / "cbi_chat.db",
+    )
+    app_cfg = AppConfig(db_path=tmp_path / "idx.db")
+    cwd = str(tmp_path.resolve())
+
+    with TestClient(
+        ApiServerRunner(api_cfg, app_cfg).create_app(),
+        base_url="http://127.0.0.1:8000",
+    ) as client:
+        with client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws:
+            ws.send_json(_init_msg())
+            assert ws.receive_json()["id"] == 1
+
+            ws.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/load",
+                    "params": {
+                        "sessionId": "sess_meta_only",
+                        "cwd": cwd,
+                        "mcpServers": [],
+                        "_meta": {"metadataOnly": True},
+                    },
+                }
+            )
+            cmd_frame = ws.receive_json()
+            assert cmd_frame["method"] == "session/update"
+            assert cmd_frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+
+            usage_frame = ws.receive_json()
+            assert usage_frame["method"] == "session/update"
+            assert usage_frame["params"]["update"]["sessionUpdate"] == "usage_update"
+            assert usage_frame["params"]["update"]["used"] == 4096
+            assert usage_frame["params"]["update"]["size"] == 1048576
+
+            load_resp = ws.receive_json()
+            assert load_resp["id"] == 2
+            assert load_resp["result"] == {}
+
+            state_resp = client.get(
+                "/api/sessions/sess_meta_only/state",
+                headers={"host": "127.0.0.1:8000"},
+            )
+            assert state_resp.status_code == 200
+            state_body = state_resp.json()
+            assert state_body["usage"] == {"used": 4096, "size": 1048576, "cost": None}
+            assert [cmd["name"] for cmd in state_body["available_commands"]] == ["plan"]
+
+        msg_body = client.get(
+            "/api/sessions/sess_meta_only/messages",
+            headers={"host": "127.0.0.1:8000"},
+        ).json()
+        assert msg_body["hydrated"] is False
+        assert msg_body["totalItems"] == 0
+
+    captured = [
+        json.loads(line)
+        for line in capture_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    forwarded_load = next(m for m in captured if m.get("method") == "session/load")
+    assert "_meta" not in forwarded_load["params"]

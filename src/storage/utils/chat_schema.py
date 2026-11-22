@@ -29,7 +29,7 @@ from storage.utils.schema import JsonText
 
 chat_metadata = MetaData()
 
-CHAT_TRANSCRIPT_PARSER_VERSION = 5
+CHAT_TRANSCRIPT_PARSER_VERSION = 6
 
 chat_sessions_table = Table(
     "chat_sessions",

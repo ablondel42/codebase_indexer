@@ -52,24 +52,34 @@ _PLAN_STATUS_MAP: dict[str, str] = {
 }
 
 
-def extract_hydrate_only_flag(raw_params: object) -> tuple[bool, object]:
-    """Consume ``_meta.hydrateOnly`` without disturbing other request metadata."""
+def _extract_bool_meta_flag(raw_params: object, flag_key: str) -> tuple[bool, object]:
+    """Consume boolean ``_meta.<flag_key>`` without disturbing other request metadata."""
     if not isinstance(raw_params, Mapping):
         return False, raw_params
     raw_meta = raw_params.get("_meta")
     if not isinstance(raw_meta, Mapping):
         return False, raw_params
-    raw_flag = raw_meta.get("hydrateOnly")
+    raw_flag = raw_meta.get(flag_key)
     if not isinstance(raw_flag, bool):
         return False, raw_params
 
     copied = dict(raw_params)
-    rem_meta = {k: v for k, v in raw_meta.items() if k != "hydrateOnly"}
+    rem_meta = {k: v for k, v in raw_meta.items() if k != flag_key}
     if rem_meta:
         copied["_meta"] = rem_meta
     else:
         copied.pop("_meta", None)
     return raw_flag, copied
+
+
+def extract_hydrate_only_flag(raw_params: object) -> tuple[bool, object]:
+    """Consume ``_meta.hydrateOnly`` without disturbing other request metadata."""
+    return _extract_bool_meta_flag(raw_params, "hydrateOnly")
+
+
+def extract_metadata_only_flag(raw_params: object) -> tuple[bool, object]:
+    """Consume ``_meta.metadataOnly`` without disturbing other request metadata."""
+    return _extract_bool_meta_flag(raw_params, "metadataOnly")
 
 
 def _describe_embedded_resource(resource: object) -> str:
@@ -371,6 +381,7 @@ __all__ = [
     "attach_chat_meta_to_response",
     "build_update_upsert",
     "extract_hydrate_only_flag",
+    "extract_metadata_only_flag",
     "extract_prompt_user_upsert",
     "extract_tool_locations",
     "extract_tool_text",

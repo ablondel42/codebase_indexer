@@ -29,7 +29,7 @@ from api.models.session import SessionRuntimeState
 from api.services.chat import SessionChatRecorder
 from api.services.process import AgyAcpProcess
 from api.services.prompt import PromptTurnManager
-from api.utils.chat import extract_hydrate_only_flag
+from api.utils.chat import extract_hydrate_only_flag, extract_metadata_only_flag
 from api.utils.formatting import (
     describe_jsonrpc_frame,
     format_raw_frame_for_log,
@@ -483,25 +483,29 @@ class AcpConnectionSession:
         method: str,
         raw_params: object,
         caps: AgentCapabilities,
-    ) -> tuple[str, object, tuple[bool, bool, bool]]:
-        """Route ``hydrateOnly`` resume/load requests against persisted chat hydration state."""
+    ) -> tuple[str, object, tuple[str, bool, bool]]:
+        """Route ``metadataOnly``/``hydrateOnly`` setup requests against chat hydration state."""
+        if method == "session/load":
+            metadata_only, meta_cleaned = extract_metadata_only_flag(raw_params)
+            if metadata_only:
+                return "session/load", meta_cleaned, ("metadata", True, False)
         hydrate_only, cleaned_params = extract_hydrate_only_flag(raw_params)
         if not hydrate_only or method not in ("session/load", "session/resume"):
-            return method, cleaned_params, (False, False, False)
+            return method, cleaned_params, ("none", False, False)
         raw_sid = (
             cleaned_params.get("sessionId")
             if isinstance(cleaned_params, Mapping)
             else None
         )
         if not isinstance(raw_sid, str) or not raw_sid:
-            return method, cleaned_params, (True, False, False)
+            return method, cleaned_params, ("hydrate", False, False)
         outbound, suppress_replay, hydrate_reset = self._chat.resolve_setup_routing(
             method,
             raw_sid,
             caps,
             hydrate_only=True,
         )
-        return outbound, cleaned_params, (True, suppress_replay, hydrate_reset)
+        return outbound, cleaned_params, ("hydrate", suppress_replay, hydrate_reset)
 
     def _validate_and_sanitize_session_params(
         self,
@@ -569,7 +573,9 @@ class AcpConnectionSession:
         target_session = sanitized.get("sessionId")
         tracked_id = target_session if isinstance(target_session, str) else None
         self._pending_rpc_methods[req_id] = (route[0], tracked_id)
-        if route[2][0] and tracked_id is not None:
+        if route[2][0] == "metadata" and tracked_id is not None:
+            self._chat.register_metadata_only_load(req_id, tracked_id)
+        elif route[2][0] == "hydrate" and tracked_id is not None:
             self._chat.register_pending_setup(
                 req_id,
                 tracked_id,
@@ -739,6 +745,8 @@ class AcpConnectionSession:
         """Pre-sync external transcript logs before ``hydrateOnly`` setup routing."""
         method = msg.get("method")
         if self._pre_setup_sync is None or method not in ("session/load", "session/resume"):
+            return
+        if method == "session/load" and extract_metadata_only_flag(msg.get("params"))[0]:
             return
         hydrate_only, cleaned = extract_hydrate_only_flag(msg.get("params"))
         raw_sid = cleaned.get("sessionId") if isinstance(cleaned, Mapping) else None

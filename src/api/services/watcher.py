@@ -17,7 +17,7 @@ from api.utils.transcript import (
     read_transcript_delta,
     resolve_transcript_path,
 )
-from core.models.chat import ChatTimelineItem, ChatTranscriptCursor
+from core.models.chat import ChatSessionRecord, ChatTimelineItem, ChatTranscriptCursor
 from core.models.exceptions import IndexerError
 from core.ports.chat import ChatStoreProtocol
 from core.ports.watch import DirectoryWatchHandleProtocol, WatchEventKind
@@ -303,6 +303,26 @@ class AgyProfileSyncWatcher:
             )
         return full_reset, parsed
 
+    @staticmethod
+    def _has_nonempty_transcript(transcript_path: Path) -> bool:
+        """Return ``True`` when ``transcript_path`` exists and is non-empty."""
+        try:
+            return transcript_path.stat().st_size > 0
+        except OSError as exc:
+            logger.debug("Transcript stat failed for %s: %s", transcript_path, exc)
+            return False
+
+    @staticmethod
+    def _needs_initial_reset(record: ChatSessionRecord | None, has_file_bytes: bool) -> bool:
+        """Return ``True`` when persisted state is missing, unparsed, or self-heal-eligible."""
+        if record is None or record.transcript_step_index is None:
+            return True
+        return (
+            record.total_items == 0
+            and record.transcript_step_index >= 0
+            and has_file_bytes
+        )
+
     async def _persist_transcript_sync(
         self,
         session_id: str,
@@ -311,7 +331,8 @@ class AgyProfileSyncWatcher:
         """Parse delta from ``transcript_path`` and atomically persist items + cursor."""
         record = await asyncio.to_thread(self._store.get_session, session_id)
         had_prior_items = record is not None and record.total_items > 0
-        initial_reset = record is None or record.transcript_step_index is None
+        has_file_bytes = self._has_nonempty_transcript(transcript_path)
+        initial_reset = self._needs_initial_reset(record, has_file_bytes)
         start_offset = 0 if initial_reset or record is None else record.transcript_offset
         last_step = None if initial_reset or record is None else record.transcript_step_index
         full_reset, parsed = await self._parse_with_reset_fallback(
@@ -321,6 +342,14 @@ class AgyProfileSyncWatcher:
             start_offset=start_offset,
             last_step=last_step,
         )
+        if full_reset and not parsed.upserts and had_prior_items and has_file_bytes:
+            logger.warning(
+                "Refusing to wipe %d stored items for '%s' on empty parse of non-empty transcript",
+                record.total_items if record is not None else 0,
+                session_id,
+            )
+            return (), False, None, False
+
         self._update_cached_state(session_id, parsed)
         cursor = ChatTranscriptCursor(
             step_index=parsed.last_step_index,
@@ -344,8 +373,12 @@ class AgyProfileSyncWatcher:
             mark_hydrated=True,
             transcript_cursor=cursor,
         )
-        emit_reset = (full_reset and had_prior_items) or len(stored) > _BULK_RESET_THRESHOLD
-        return stored, full_reset, parsed, emit_reset
+        return (
+            stored,
+            full_reset,
+            parsed,
+            (full_reset and had_prior_items) or len(stored) > _BULK_RESET_THRESHOLD,
+        )
 
     async def _sync_session_locked(
         self,

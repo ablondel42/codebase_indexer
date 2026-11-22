@@ -63,7 +63,6 @@ import {
 import { Trace } from "@/components/ui/trace";
 import {
   DEFAULT_PROMPT_SUGGESTIONS,
-  estimateContextUsage,
   groupMessagesIntoTurns,
   type AssistantTurnBlock,
 } from "@/lib/acp/turn-grouping";
@@ -515,10 +514,6 @@ export function SessionChat({
     () => groupMessagesIntoTurns(replayedMessages),
     [replayedMessages],
   );
-  const contextUsage = React.useMemo(
-    () => estimateContextUsage(replayedMessages),
-    [replayedMessages],
-  );
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -534,10 +529,7 @@ export function SessionChat({
               </span>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <ContextUsageHoverCard
-                usage={contextUsage}
-                sessionUsage={sessionUsage}
-              />
+              <ContextUsageHoverCard sessionUsage={sessionUsage} />
               {sessionCaps.canClose && (
                 <Tooltip>
                   <TooltipTrigger
