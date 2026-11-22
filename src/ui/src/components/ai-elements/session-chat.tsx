@@ -69,11 +69,16 @@ import {
 } from "@/lib/acp/turn-grouping";
 import type {
   AcpActiveSessionMode,
+  AcpAvailableCommand,
+  AcpConfigOption,
+  AcpModelsState,
+  AcpModesState,
   AcpReplayedMessage,
   AcpSessionArtifactContent,
   AcpSessionArtifactSummary,
   AcpSessionCapabilitiesFlags,
   AcpSessionInfo,
+  AcpSessionUsage,
 } from "@/lib/acp/types";
 
 function renderAssistantTraceSteps(steps: AcpReplayedMessage[]) {
@@ -155,6 +160,17 @@ export interface SessionChatProps {
   activeSession: AcpSessionInfo | undefined;
   activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
+  sessionModels?: AcpModelsState | null;
+  sessionModes?: AcpModesState | null;
+  configOptions?: AcpConfigOption[];
+  availableCommands?: AcpAvailableCommand[];
+  sessionUsage?: AcpSessionUsage | null;
+  configBusyId?: string | null;
+  onSetConfigOption?: (
+    configId: string,
+    value: string | boolean,
+  ) => Promise<void>;
+  onSetMode?: (modeId: string) => Promise<void>;
   sessionArtifacts: AcpSessionArtifactSummary[];
   onLoadArtifact: (name: string) => Promise<AcpSessionArtifactContent | null>;
   includeCbiMcp: boolean;
@@ -171,6 +187,14 @@ export function SessionChat({
   activeSession,
   activeSessionMode,
   replayedMessages,
+  sessionModels = null,
+  sessionModes = null,
+  configOptions = [],
+  availableCommands = [],
+  sessionUsage = null,
+  configBusyId = null,
+  onSetConfigOption,
+  onSetMode,
   sessionArtifacts,
   onLoadArtifact,
   includeCbiMcp,
@@ -208,7 +232,10 @@ export function SessionChat({
                 </span>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
-                <ContextUsageHoverCard usage={contextUsage} />
+                <ContextUsageHoverCard
+                  usage={contextUsage}
+                  sessionUsage={sessionUsage}
+                />
                 <SessionArtifactsSheet
                   artifacts={sessionArtifacts}
                   onLoadArtifact={onLoadArtifact}
@@ -248,8 +275,8 @@ export function SessionChat({
                 </EmptyMedia>
                 <EmptyTitle>No active conversation</EmptyTitle>
                 <EmptyDescription>
-                  Load an existing ACP session to replay its thread, or start a
-                  fresh workspace session.
+                  Resume an existing ACP session to replay its thread, or start
+                  a fresh workspace session.
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent className="flex-row justify-center gap-2">
@@ -380,6 +407,13 @@ export function SessionChat({
             promptEnabled={false}
             includeCbiMcp={includeCbiMcp}
             onToggleCbiMcp={onToggleCbiMcp}
+            configOptions={configOptions}
+            sessionModels={sessionModels}
+            sessionModes={sessionModes}
+            availableCommands={availableCommands}
+            configBusyId={configBusyId}
+            onSelectConfigOption={onSetConfigOption}
+            onSelectMode={onSetMode}
           />
         </div>
       </div>

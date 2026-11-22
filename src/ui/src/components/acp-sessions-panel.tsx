@@ -58,11 +58,16 @@ import {
 import { useArchivedSessions } from "@/hooks/use-archived-sessions";
 import type {
   AcpActiveSessionMode,
+  AcpAvailableCommand,
+  AcpConfigOption,
+  AcpModelsState,
+  AcpModesState,
   AcpReplayedMessage,
   AcpSessionArtifactContent,
   AcpSessionArtifactSummary,
   AcpSessionCapabilitiesFlags,
   AcpSessionInfo,
+  AcpSessionUsage,
 } from "@/lib/acp/types";
 
 type SessionsPanelTab = "sessions" | "chat" | "artifacts";
@@ -77,6 +82,17 @@ interface AcpSessionsPanelProps {
   activeSessionId: string | null;
   activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
+  sessionModels: AcpModelsState | null;
+  sessionModes: AcpModesState | null;
+  configOptions: AcpConfigOption[];
+  availableCommands: AcpAvailableCommand[];
+  sessionUsage: AcpSessionUsage | null;
+  configBusyId: string | null;
+  onSetConfigOption: (
+    configId: string,
+    value: string | boolean,
+  ) => Promise<void>;
+  onSetMode: (modeId: string) => Promise<void>;
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
@@ -90,7 +106,6 @@ interface AcpSessionsPanelProps {
   onRefresh: () => Promise<void>;
   onLoadMore: () => Promise<void>;
   onCreateSession: () => Promise<void>;
-  onLoadSession: (session: AcpSessionInfo) => Promise<void>;
   onResumeSession: (session: AcpSessionInfo) => Promise<void>;
   onCloseSession: () => Promise<void>;
   onRefreshArtifacts: () => Promise<void>;
@@ -131,6 +146,14 @@ export function AcpSessionsPanel({
   activeSessionId,
   activeSessionMode,
   replayedMessages,
+  sessionModels,
+  sessionModes,
+  configOptions,
+  availableCommands,
+  sessionUsage,
+  configBusyId,
+  onSetConfigOption,
+  onSetMode,
   sessionArtifacts,
   selectedArtifact,
   artifactsBusy,
@@ -142,7 +165,6 @@ export function AcpSessionsPanel({
   onRefresh,
   onLoadMore,
   onCreateSession,
-  onLoadSession,
   onResumeSession,
   onCloseSession,
   onRefreshArtifacts,
@@ -177,10 +199,7 @@ export function AcpSessionsPanel({
     [sessionArtifacts],
   );
 
-  const handleLoadClick = async (session: AcpSessionInfo) => {
-    await onLoadSession(session);
-    setActiveTab("chat");
-  };
+  const canResumeAny = sessionCaps.canLoad || sessionCaps.canResume;
 
   const handleResumeClick = async (session: AcpSessionInfo) => {
     await onResumeSession(session);
@@ -440,31 +459,6 @@ export function AcpSessionsPanel({
                         </ItemContent>
                         <ItemFooter className="justify-end pt-1">
                           <ButtonGroup>
-                            {sessionCaps.canResume && (
-                              <Tooltip>
-                                <TooltipTrigger
-                                  render={
-                                    <Button
-                                      variant="outline"
-                                      size="xs"
-                                      disabled={sessionBusyId !== null}
-                                      onClick={() =>
-                                        void handleResumeClick(session)
-                                      }
-                                    />
-                                  }
-                                >
-                                  <PlayIcon />
-                                  Resume
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  <p>
-                                    Resume session without history replay
-                                    (session/resume)
-                                  </p>
-                                </TooltipContent>
-                              </Tooltip>
-                            )}
                             <Tooltip>
                               <TooltipTrigger
                                 render={
@@ -472,22 +466,22 @@ export function AcpSessionsPanel({
                                     variant="outline"
                                     size="xs"
                                     disabled={
-                                      !sessionCaps.canLoad ||
-                                      sessionBusyId !== null
+                                      !canResumeAny || sessionBusyId !== null
                                     }
                                     onClick={() =>
-                                      void handleLoadClick(session)
+                                      void handleResumeClick(session)
                                     }
                                   />
                                 }
                               >
-                                {isBusy ? <Spinner /> : null}
-                                Load
+                                {isBusy ? <Spinner /> : <PlayIcon />}
+                                Resume
                               </TooltipTrigger>
                               <TooltipContent>
                                 <p>
-                                  Load session and replay conversation history
-                                  (session/load)
+                                  {sessionCaps.canLoad
+                                    ? "Resume session and replay conversation history"
+                                    : "Resume session"}
                                 </p>
                               </TooltipContent>
                             </Tooltip>
@@ -552,6 +546,14 @@ export function AcpSessionsPanel({
             activeSession={activeSession}
             activeSessionMode={activeSessionMode}
             replayedMessages={replayedMessages}
+            sessionModels={sessionModels}
+            sessionModes={sessionModes}
+            configOptions={configOptions}
+            availableCommands={availableCommands}
+            sessionUsage={sessionUsage}
+            configBusyId={configBusyId}
+            onSetConfigOption={onSetConfigOption}
+            onSetMode={onSetMode}
             sessionArtifacts={sessionArtifacts}
             onLoadArtifact={onLoadArtifactContent}
             includeCbiMcp={includeCbiMcp}
@@ -575,7 +577,7 @@ export function AcpSessionsPanel({
                     </EmptyMedia>
                     <EmptyTitle>No session selected</EmptyTitle>
                     <EmptyDescription>
-                      Load or resume a session to browse its markdown artifacts.
+                      Resume a session to browse its markdown artifacts.
                     </EmptyDescription>
                   </EmptyHeader>
                   <EmptyContent>

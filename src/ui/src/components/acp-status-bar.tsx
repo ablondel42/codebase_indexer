@@ -3,6 +3,7 @@ import {
   PanelRightIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
+  SparklesIcon,
 } from "lucide-react";
 
 import { AcpAuthControls } from "@/components/acp-auth-controls";
@@ -17,6 +18,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type {
+  AcpAntigravityTier,
   AcpAuthenticateOptions,
   AcpAuthStatus,
   AcpConnectionStatus,
@@ -30,6 +32,7 @@ interface AcpStatusBarProps {
   activeMethodId: string | null;
   authenticatingMethodId: string | null;
   canLogout: boolean;
+  accountTier?: AcpAntigravityTier | null;
   sessionCount: number;
   activeSessionId: string | null;
   sessionsPanelOpen: boolean;
@@ -52,6 +55,7 @@ export function AcpStatusBar({
   activeMethodId,
   authenticatingMethodId,
   canLogout,
+  accountTier,
   sessionCount,
   activeSessionId,
   sessionsPanelOpen,
@@ -124,6 +128,34 @@ export function AcpStatusBar({
 
       {status === "ready" && authStatus === "authenticated" && (
         <>
+          {accountTier && (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Badge
+                    variant="secondary"
+                    className="h-7 gap-1.5 px-2.5"
+                  />
+                }
+              >
+                <SparklesIcon className="size-3.5 text-amber-500" />
+                <span>{accountTier.name}</span>
+              </TooltipTrigger>
+              <TooltipContent className="flex flex-col gap-1">
+                <p>Tier: {accountTier.id}</p>
+                {accountTier.upgradeUri && (
+                  <a
+                    href={accountTier.upgradeUri}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline"
+                  >
+                    Manage plan
+                  </a>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          )}
           <Separator orientation="vertical" className="my-1.5" />
           <Toggle
             variant="outline"

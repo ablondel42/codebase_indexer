@@ -12,6 +12,7 @@ from api.models.acp import (
     SessionStepOutcome,
 )
 from api.models.config import ApiServerConfig
+from api.models.session import SessionRuntimeState
 from api.services.session import AcpConnectionSession
 from api.utils.formatting import format_kv_block, format_raw_frame_for_log
 from api.utils.jsonrpc import format_jsonrpc_error
@@ -34,6 +35,14 @@ class AcpWebSocketGateway:
     def active_connection_count(self) -> int:
         """Return number of currently open ``/acp`` WebSocket connections."""
         return len(self._active_sessions)
+
+    def get_session_state(self, session_id: str) -> SessionRuntimeState | None:
+        """Look up live ``SessionRuntimeState`` for ``session_id`` across active connections."""
+        for conn in tuple(self._active_sessions):
+            state = conn.get_session_state(session_id)
+            if state is not None:
+                return state
+        return None
 
     def _is_authorized_upgrade(self, websocket: WebSocket) -> bool:
         """Verify HTTP ``Host`` (anti-DNS-rebinding) and ``Origin`` (anti-CSWSH)."""

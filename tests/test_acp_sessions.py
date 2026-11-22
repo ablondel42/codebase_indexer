@@ -10,7 +10,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from api.models.acp import JSONRPC_INVALID_PARAMS, JSONRPC_METHOD_NOT_FOUND
+from api.models.acp import (
+    ACP_RESOURCE_NOT_FOUND,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_METHOD_NOT_FOUND,
+)
 from api.models.config import ApiServerConfig
 from api.services.server import ApiServerRunner
 from api.utils.formatting import configure_api_terminal_logging
@@ -107,7 +111,165 @@ def _write_session_agent_script(
                     "title": "Created Session",
                     "updatedAt": "2026-11-21T21:00:00Z",
                 }}
+                if params.get("_meta", {{}}).get("emitMetadata"):
+                    reply = {{
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {{
+                            "sessionId": new_id,
+                            "models": {{
+                                "availableModels": [
+                                    {{
+                                        "modelId": "gemini-4-neon-high",
+                                        "name": "Gemini 4 Neon (High)",
+                                    }},
+                                    {{
+                                        "modelId": "gemini-4-carbon-high",
+                                        "name": "Gemini 4 Carbon (High)",
+                                    }},
+                                ],
+                                "currentModelId": "gemini-4-neon-high",
+                            }},
+                            "modes": {{
+                                "currentModeId": "default",
+                                "availableModes": [
+                                    {{
+                                        "id": "default",
+                                        "name": "Default",
+                                        "description": "Ask first",
+                                    }},
+                                    {{
+                                        "id": "plan",
+                                        "name": "Plan",
+                                        "description": "Plan carefully",
+                                    }},
+                                ],
+                            }},
+                            "configOptions": [
+                                {{
+                                    "id": "model",
+                                    "name": "Model",
+                                    "category": "model",
+                                    "type": "select",
+                                    "currentValue": "gemini-4-neon",
+                                    "options": [
+                                        {{"value": "gemini-4-neon", "name": "Gemini 4 Neon"}},
+                                        {{"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"}},
+                                    ],
+                                }},
+                                {{
+                                    "id": "thought_level",
+                                    "name": "Thinking Level",
+                                    "category": "thought_level",
+                                    "type": "select",
+                                    "currentValue": "high",
+                                    "options": [
+                                        {{"value": "low", "name": "Low"}},
+                                        {{"value": "high", "name": "High"}},
+                                        {{"value": "xhigh", "name": "Extra"}},
+                                    ],
+                                }},
+                                {{
+                                    "id": "mode",
+                                    "name": "Mode",
+                                    "category": "mode",
+                                    "type": "select",
+                                    "currentValue": "default",
+                                    "options": [
+                                        {{"value": "default", "name": "Default"}},
+                                        {{"value": "plan", "name": "Plan"}},
+                                    ],
+                                }},
+                            ],
+                            "_meta": {{
+                                "antigravity": {{
+                                    "tier": {{
+                                        "name": "Google AI Ultra",
+                                        "id": "g1-ultra-lite-tier",
+                                        "upgradeUri": "https://antigravity.google/g1-upgrade",
+                                    }}
+                                }}
+                            }},
+                        }},
+                    }}
+                    sys.stdout.write(json.dumps(reply) + "\\n")
+                    for upd in (
+                        {{
+                            "sessionUpdate": "available_commands_update",
+                            "availableCommands": [
+                                {{
+                                    "name": "plan",
+                                    "description": "Plan carefully before executing.",
+                                }},
+                                {{
+                                    "name": "grill-me",
+                                    "description": "Interview me to align on a plan.",
+                                }},
+                            ],
+                        }},
+                        {{
+                            "sessionUpdate": "usage_update",
+                            "used": 0,
+                            "size": 1048576,
+                        }},
+                    ):
+                        sys.stdout.write(
+                            json.dumps({{
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {{"sessionId": new_id, "update": upd}},
+                            }})
+                            + "\\n"
+                        )
+                    sys.stdout.flush()
+                    continue
                 reply = {{"jsonrpc": "2.0", "id": req_id, "result": {{"sessionId": new_id}}}}
+            elif method == "session/set_config_option":
+                cfg_id = params["configId"]
+                val = params["value"]
+                reply = {{
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {{
+                        "configOptions": [
+                            {{
+                                "id": "model",
+                                "name": "Model",
+                                "category": "model",
+                                "type": "select",
+                                "currentValue": val if cfg_id == "model" else "gemini-4-neon",
+                                "options": [
+                                    {{"value": "gemini-4-neon", "name": "Gemini 4 Neon"}},
+                                    {{"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"}},
+                                ],
+                            }},
+                            {{
+                                "id": "thought_level",
+                                "name": "Thinking Level",
+                                "category": "thought_level",
+                                "type": "select",
+                                "currentValue": val if cfg_id == "thought_level" else "high",
+                                "options": [
+                                    {{"value": "low", "name": "Low"}},
+                                    {{"value": "high", "name": "High"}},
+                                ],
+                            }},
+                            {{
+                                "id": "mode",
+                                "name": "Mode",
+                                "category": "mode",
+                                "type": "select",
+                                "currentValue": val if cfg_id == "mode" else "default",
+                                "options": [
+                                    {{"value": "default", "name": "Default"}},
+                                    {{"value": "plan", "name": "Plan"}},
+                                ],
+                            }},
+                        ]
+                    }},
+                }}
+            elif method == "session/set_mode":
+                reply = {{"jsonrpc": "2.0", "id": req_id, "result": {{}}}}
             elif method == "session/load":
                 sid = params["sessionId"]
                 for role_kind, msg_id, text in (
@@ -506,3 +668,141 @@ def test_session_artifacts_endpoints_list_read_and_enforce_containment(tmp_path:
             ).status_code
             in (400, 404)
         )
+
+
+def test_session_runtime_state_collection_config_mutations_and_http_endpoint(
+    tmp_path: Path,
+) -> None:
+    """Collects ``models``, ``modes``, ``configOptions``, ``tier``, commands, & ``usage_update``."""
+    capture_path = tmp_path / "runtime_state_capture.jsonl"
+    script = _write_session_agent_script(
+        tmp_path / "runtime_state_agent.py",
+        capture_path=capture_path,
+    )
+    cwd = str(tmp_path.resolve())
+
+    with (
+        _make_session_client(tmp_path, script) as client,
+        client.websocket_connect("/acp", headers=VALID_WS_HEADERS) as ws,
+    ):
+        ws.send_json(_init_msg())
+        ws.receive_json()
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_config_option",
+                "params": {"sessionId": "sess_missing", "configId": "model", "value": "x"},
+            }
+        )
+        assert ws.receive_json()["error"]["code"] == ACP_RESOURCE_NOT_FOUND
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/new",
+                "params": {"cwd": cwd, "_meta": {"emitMetadata": True}},
+            }
+        )
+        new_resp = ws.receive_json()
+        sid = new_resp["result"]["sessionId"]
+        cmd_notif = ws.receive_json()
+        usage_notif = ws.receive_json()
+        assert cmd_notif["params"]["update"]["sessionUpdate"] == "available_commands_update"
+        assert usage_notif["params"]["update"]["sessionUpdate"] == "usage_update"
+
+        assert (
+            client.get(
+                f"/api/sessions/{sid}/state",
+                headers={"host": "attacker.example:8000"},
+            ).status_code
+            == 403
+        )
+
+        state_resp = client.get(
+            f"/api/sessions/{sid}/state",
+            headers={"host": "127.0.0.1:8000"},
+        )
+        assert state_resp.status_code == 200
+        state = state_resp.json()
+        assert state["models"]["currentModelId"] == "gemini-4-neon-high"
+        assert state["modes"]["currentModeId"] == "default"
+        assert [c["id"] for c in state["config_options"]] == ["model", "thought_level", "mode"]
+        assert state["tier"] == {
+            "id": "g1-ultra-lite-tier",
+            "name": "Google AI Ultra",
+            "upgradeUri": "https://antigravity.google/g1-upgrade",
+        }
+        assert [cmd["name"] for cmd in state["available_commands"]] == ["plan", "grill-me"]
+        assert state["usage"] == {"used": 0, "size": 1048576, "cost": None}
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": sid,
+                    "configId": "model",
+                    "value": "not-an-option",
+                },
+            }
+        )
+        assert ws.receive_json()["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "session/set_config_option",
+                "params": {
+                    "sessionId": sid,
+                    "configId": "model",
+                    "value": "gemini-4-carbon",
+                    "_meta": {"authorization": "Bearer strip-me", "uiSource": "composer"},
+                },
+            }
+        )
+        cfg_resp = ws.receive_json()
+        assert cfg_resp["id"] == 5
+        assert cfg_resp["result"]["configOptions"][0]["currentValue"] == "gemini-4-carbon"
+
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "plan"},
+            }
+        )
+        assert ws.receive_json() == {"jsonrpc": "2.0", "id": 6, "result": {}}
+
+        updated_state = client.get(
+            f"/api/sessions/{sid}/state",
+            headers={"host": "127.0.0.1:8000"},
+        ).json()
+        assert updated_state["config_options"][0]["currentValue"] == "gemini-4-carbon"
+        assert updated_state["modes"]["currentModeId"] == "plan"
+        assert updated_state["config_options"][2]["currentValue"] == "plan"
+
+        ws.send_json(
+            {"jsonrpc": "2.0", "id": 7, "method": "session/close", "params": {"sessionId": sid}}
+        )
+        assert ws.receive_json()["id"] == 7
+        assert (
+            client.get(
+                f"/api/sessions/{sid}/state",
+                headers={"host": "127.0.0.1:8000"},
+            ).status_code
+            == 404
+        )
+
+    captured = [
+        json.loads(line)
+        for line in capture_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    forwarded_cfg = next(m for m in captured if m.get("id") == 5)
+    assert forwarded_cfg["params"]["_meta"] == {"uiSource": "composer"}

@@ -51,6 +51,7 @@ import type {
   AcpPendingConfirmation,
   AcpSessionArtifactContent,
   AcpSessionArtifactSummary,
+  AcpSessionUsage,
 } from "@/lib/acp/types";
 
 export function ToolConfirmationCard({
@@ -205,18 +206,41 @@ export function FileTree({
   );
 }
 
-export function ContextUsageHoverCard({ usage }: { usage: AcpContextUsage }) {
-  const used = usage.input + usage.output + usage.reasoning;
+export function ContextUsageHoverCard({
+  usage,
+  sessionUsage,
+}: {
+  usage: AcpContextUsage;
+  sessionUsage?: AcpSessionUsage | null;
+}) {
+  const hasLiveUsage = Boolean(sessionUsage && sessionUsage.size > 0);
+  const used = hasLiveUsage
+    ? sessionUsage!.used
+    : usage.input + usage.output + usage.reasoning;
+  const limit = hasLiveUsage ? sessionUsage!.size : usage.limit;
   const percent = Math.min(
     100,
-    Math.max(0, Math.round((used / Math.max(1, usage.limit)) * 100)),
+    Math.max(0, Math.round((used / Math.max(1, limit)) * 100)),
   );
 
-  const rows = [
-    { label: "Input", value: usage.input },
-    { label: "Output", value: usage.output },
-    { label: "Reasoning", value: usage.reasoning },
-  ];
+  const rows: { label: string; value: string }[] = hasLiveUsage
+    ? [
+        { label: "Used", value: formatCompactTokens(sessionUsage!.used) },
+        { label: "Window", value: formatCompactTokens(sessionUsage!.size) },
+        ...(sessionUsage!.cost
+          ? [
+              {
+                label: "Cost",
+                value: `${sessionUsage!.cost.amount.toFixed(3)} ${sessionUsage!.cost.currency}`,
+              },
+            ]
+          : []),
+      ]
+    : [
+        { label: "Input", value: formatCompactTokens(usage.input) },
+        { label: "Output", value: formatCompactTokens(usage.output) },
+        { label: "Reasoning", value: formatCompactTokens(usage.reasoning) },
+      ];
 
   return (
     <HoverCard>
@@ -231,16 +255,14 @@ export function ContextUsageHoverCard({ usage }: { usage: AcpContextUsage }) {
         <Progress value={percent} aria-label="Context used">
           <ProgressLabel>Context</ProgressLabel>
           <span className="ml-auto text-xs text-muted-foreground tabular-nums">
-            {formatCompactTokens(used)} / {formatCompactTokens(usage.limit)}
+            {formatCompactTokens(used)} / {formatCompactTokens(limit)}
           </span>
         </Progress>
         <div className="flex flex-col gap-1 text-xs">
           {rows.map((row) => (
             <div key={row.label} className="flex justify-between gap-3">
               <span className="text-muted-foreground">{row.label}</span>
-              <span className="tabular-nums">
-                {formatCompactTokens(row.value)}
-              </span>
+              <span className="tabular-nums">{row.value}</span>
             </div>
           ))}
         </div>

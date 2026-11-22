@@ -80,6 +80,7 @@ function WorkspaceCanvas() {
           activeMethodId={acp.activeMethodId}
           authenticatingMethodId={acp.authenticatingMethodId}
           canLogout={acp.canLogout}
+          accountTier={acp.accountTier}
           sessionCount={acp.sessions.length}
           activeSessionId={acp.activeSessionId}
           sessionsPanelOpen={sessionsPanelOpen}
@@ -138,6 +139,14 @@ function WorkspaceCanvas() {
                 activeSessionId={acp.activeSessionId}
                 activeSessionMode={acp.activeSessionMode}
                 replayedMessages={acp.replayedMessages}
+                sessionModels={acp.sessionModels}
+                sessionModes={acp.sessionModes}
+                configOptions={acp.configOptions}
+                availableCommands={acp.availableCommands}
+                sessionUsage={acp.sessionUsage}
+                configBusyId={acp.configBusyId}
+                onSetConfigOption={acp.setSessionConfigOption}
+                onSetMode={acp.setSessionMode}
                 sessionArtifacts={acp.sessionArtifacts}
                 selectedArtifact={acp.selectedArtifact}
                 artifactsBusy={acp.artifactsBusy}
@@ -149,7 +158,6 @@ function WorkspaceCanvas() {
                 onRefresh={acp.refreshSessions}
                 onLoadMore={acp.loadMoreSessions}
                 onCreateSession={acp.createNewSession}
-                onLoadSession={acp.loadExistingSession}
                 onResumeSession={acp.resumeExistingSession}
                 onCloseSession={acp.closeActiveSession}
                 onRefreshArtifacts={acp.refreshArtifacts}

@@ -7,6 +7,9 @@ import {
   fetchServerDefaults,
   fetchSessionArtifactContent,
   fetchSessionArtifacts,
+  sanitizeAvailableCommands,
+  sanitizeConfigOptions,
+  sanitizeSessionUsage,
 } from "@/lib/acp/client";
 import {
   sanitizeAgentText,
@@ -16,18 +19,53 @@ import {
   ACP_AUTH_REQUIRED_CODE,
   DEFAULT_AUTH_METHOD_ID,
   type AcpActiveSessionMode,
+  type AcpAntigravityTier,
   type AcpAuthenticateOptions,
   type AcpAuthStatus,
+  type AcpAvailableCommand,
+  type AcpConfigOption,
   type AcpConnectionStatus,
   type AcpInitializeResult,
+  type AcpModelsState,
+  type AcpModesState,
   type AcpPlanStep,
   type AcpReplayedMessage,
   type AcpSessionArtifactContent,
   type AcpSessionArtifactSummary,
   type AcpSessionCapabilitiesFlags,
   type AcpSessionInfo,
+  type AcpSessionRuntimeMeta,
+  type AcpSessionSetupResult,
+  type AcpSessionUsage,
   type AcpToolStatus,
 } from "@/lib/acp/types";
+
+const EMPTY_SESSION_META: AcpSessionRuntimeMeta = {
+  models: null,
+  modes: null,
+  configOptions: [],
+  availableCommands: [],
+  usage: null,
+  tier: null,
+};
+
+function syncModesWithOptions(
+  modes: AcpModesState | null,
+  options: AcpConfigOption[],
+): AcpModesState | null {
+  if (!modes) {
+    return null;
+  }
+  const modeOpt = options.find(
+    (opt) =>
+      (opt.category === "mode" || opt.id === "mode") &&
+      typeof opt.currentValue === "string",
+  );
+  if (!modeOpt || typeof modeOpt.currentValue !== "string") {
+    return modes;
+  }
+  return { ...modes, currentModeId: modeOpt.currentValue };
+}
 
 export interface UseAcpConnectionState {
   status: AcpConnectionStatus;
@@ -36,6 +74,7 @@ export interface UseAcpConnectionState {
   activeMethodId: string | null;
   authenticatingMethodId: string | null;
   canLogout: boolean;
+  accountTier: AcpAntigravityTier | null;
   defaultCwd: string;
   agyAppDataDir: string;
   agyProfileDir: string;
@@ -46,6 +85,12 @@ export interface UseAcpConnectionState {
   activeSessionId: string | null;
   activeSessionMode: AcpActiveSessionMode;
   replayedMessages: AcpReplayedMessage[];
+  sessionModels: AcpModelsState | null;
+  sessionModes: AcpModesState | null;
+  configOptions: AcpConfigOption[];
+  availableCommands: AcpAvailableCommand[];
+  sessionUsage: AcpSessionUsage | null;
+  configBusyId: string | null;
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
@@ -70,8 +115,12 @@ export interface UseAcpConnectionState {
   refreshSessions: () => Promise<void>;
   loadMoreSessions: () => Promise<void>;
   createNewSession: () => Promise<void>;
-  loadExistingSession: (session: AcpSessionInfo) => Promise<void>;
   resumeExistingSession: (session: AcpSessionInfo) => Promise<void>;
+  setSessionConfigOption: (
+    configId: string,
+    value: string | boolean,
+  ) => Promise<void>;
+  setSessionMode: (modeId: string) => Promise<void>;
   closeActiveSession: () => Promise<void>;
   deleteExistingSession: (sessionId: string) => Promise<void>;
   reconnect: () => void;
@@ -249,6 +298,13 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [replayedMessages, setReplayedMessages] = useState<
     AcpReplayedMessage[]
   >([]);
+  const [sessionMetaById, setSessionMetaById] = useState<
+    Record<string, AcpSessionRuntimeMeta>
+  >({});
+  const [accountTier, setAccountTier] = useState<AcpAntigravityTier | null>(
+    null,
+  );
+  const [configBusyId, setConfigBusyId] = useState<string | null>(null);
   const [sessionArtifacts, setSessionArtifacts] = useState<
     AcpSessionArtifactSummary[]
   >([]);
@@ -265,6 +321,34 @@ export function useAcpConnection(): UseAcpConnectionState {
   const clearSessionError = useCallback(() => setSessionError(null), []);
   const closeArtifact = useCallback(() => setSelectedArtifact(null), []);
 
+  const mergeSetupMetadata = useCallback((setup: AcpSessionSetupResult) => {
+    if (setup.tier) {
+      setAccountTier(setup.tier);
+    }
+    setSessionMetaById((prev) => {
+      const base = prev[setup.sessionId] ?? EMPTY_SESSION_META;
+      const configOptions =
+        setup.configOptions.length > 0
+          ? setup.configOptions
+          : base.configOptions;
+      const modes = syncModesWithOptions(
+        setup.modes ?? base.modes,
+        configOptions,
+      );
+      return {
+        ...prev,
+        [setup.sessionId]: {
+          models: setup.models ?? base.models,
+          modes,
+          configOptions,
+          availableCommands: base.availableCommands,
+          usage: base.usage,
+          tier: setup.tier ?? base.tier,
+        },
+      };
+    });
+  }, []);
+
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
       if (method !== "session/update") {
@@ -278,6 +362,74 @@ export function useAcpConnection(): UseAcpConnectionState {
       }
       const updateKind =
         typeof update.sessionUpdate === "string" ? update.sessionUpdate : "";
+
+      if (updateKind === "available_commands_update" && sessionId) {
+        const commands = sanitizeAvailableCommands(update.availableCommands);
+        setSessionMetaById((prev) => {
+          const base = prev[sessionId] ?? EMPTY_SESSION_META;
+          return {
+            ...prev,
+            [sessionId]: { ...base, availableCommands: commands },
+          };
+        });
+        return;
+      }
+
+      if (updateKind === "usage_update" && sessionId) {
+        const usage = sanitizeSessionUsage(update);
+        if (usage) {
+          setSessionMetaById((prev) => {
+            const base = prev[sessionId] ?? EMPTY_SESSION_META;
+            return { ...prev, [sessionId]: { ...base, usage } };
+          });
+        }
+        return;
+      }
+
+      if (updateKind === "config_option_update" && sessionId) {
+        const nextOptions = sanitizeConfigOptions(update.configOptions);
+        setSessionMetaById((prev) => {
+          const base = prev[sessionId] ?? EMPTY_SESSION_META;
+          return {
+            ...prev,
+            [sessionId]: {
+              ...base,
+              configOptions: nextOptions,
+              modes: syncModesWithOptions(base.modes, nextOptions),
+            },
+          };
+        });
+        return;
+      }
+
+      if (updateKind === "current_mode_update" && sessionId) {
+        const modeId =
+          typeof update.currentModeId === "string"
+            ? sanitizeAgentText(update.currentModeId, 96)
+            : "";
+        if (modeId) {
+          setSessionMetaById((prev) => {
+            const base = prev[sessionId] ?? EMPTY_SESSION_META;
+            const nextModes: AcpModesState = base.modes
+              ? { ...base.modes, currentModeId: modeId }
+              : { currentModeId: modeId, availableModes: [] };
+            const nextOptions = base.configOptions.map((opt) =>
+              opt.category === "mode" || opt.id === "mode"
+                ? { ...opt, currentValue: modeId }
+                : opt,
+            );
+            return {
+              ...prev,
+              [sessionId]: {
+                ...base,
+                modes: nextModes,
+                configOptions: nextOptions,
+              },
+            };
+          });
+        }
+        return;
+      }
 
       if (updateKind === "session_info_update" && sessionId) {
         const nextTitle =
@@ -444,6 +596,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     setActiveSessionId(null);
     setActiveSessionMode(null);
     setReplayedMessages([]);
+    setSessionMetaById({});
+    setAccountTier(null);
+    setConfigBusyId(null);
     setSessionArtifacts([]);
     setSelectedArtifact(null);
     setAttempt((current) => current + 1);
@@ -609,6 +764,9 @@ export function useAcpConnection(): UseAcpConnectionState {
       setActiveSessionId(null);
       setActiveSessionMode(null);
       setReplayedMessages([]);
+      setSessionMetaById({});
+      setAccountTier(null);
+      setConfigBusyId(null);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
       setAuthStatus("unauthenticated");
@@ -631,6 +789,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     setSessionBusyId("new");
     try {
       const created = await client.createSession(cwd, { includeCbiMcp });
+      mergeSetupMetadata(created);
       setReplayedMessages([]);
       setSessionArtifacts([]);
       setSelectedArtifact(null);
@@ -656,39 +815,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     } finally {
       setSessionBusyId(null);
     }
-  }, [includeCbiMcp]);
-
-  const loadExistingSession = useCallback(
-    async (session: AcpSessionInfo) => {
-      const client = clientRef.current;
-      if (!client) {
-        return;
-      }
-      setSessionError(null);
-      setSessionBusyId(session.sessionId);
-      setReplayedMessages([]);
-      setSessionArtifacts([]);
-      setSelectedArtifact(null);
-      try {
-        const [, artifacts] = await Promise.all([
-          client.loadSession(session.sessionId, session.cwd, {
-            includeCbiMcp,
-          }),
-          safeFetchArtifacts(session.sessionId),
-        ]);
-        setActiveSessionId(session.sessionId);
-        setActiveSessionMode("loaded");
-        setSessionArtifacts(artifacts);
-      } catch (err: unknown) {
-        setSessionError(
-          err instanceof Error ? err.message : "Failed to load session.",
-        );
-      } finally {
-        setSessionBusyId(null);
-      }
-    },
-    [includeCbiMcp],
-  );
+  }, [includeCbiMcp, mergeSetupMetadata]);
 
   const resumeExistingSession = useCallback(
     async (session: AcpSessionInfo) => {
@@ -702,14 +829,15 @@ export function useAcpConnection(): UseAcpConnectionState {
       setSessionArtifacts([]);
       setSelectedArtifact(null);
       try {
-        const [, artifacts] = await Promise.all([
+        const [resumed, artifacts] = await Promise.all([
           client.resumeSession(session.sessionId, session.cwd, {
             includeCbiMcp,
           }),
           safeFetchArtifacts(session.sessionId),
         ]);
+        mergeSetupMetadata(resumed);
         setActiveSessionId(session.sessionId);
-        setActiveSessionMode("resumed");
+        setActiveSessionMode(resumed.replayed ? "loaded" : "resumed");
         setSessionArtifacts(artifacts);
       } catch (err: unknown) {
         setSessionError(
@@ -719,7 +847,91 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessionBusyId(null);
       }
     },
-    [includeCbiMcp],
+    [includeCbiMcp, mergeSetupMetadata],
+  );
+
+  const setSessionConfigOption = useCallback(
+    async (configId: string, value: string | boolean) => {
+      const client = clientRef.current;
+      if (!client || !activeSessionId) {
+        return;
+      }
+      setSessionError(null);
+      setConfigBusyId(configId);
+      try {
+        const refreshed = await client.setSessionConfigOption(
+          activeSessionId,
+          configId,
+          value,
+        );
+        setSessionMetaById((prev) => {
+          const base = prev[activeSessionId] ?? EMPTY_SESSION_META;
+          const nextOptions =
+            refreshed.length > 0
+              ? refreshed
+              : base.configOptions.map((opt) =>
+                  opt.id === configId ? { ...opt, currentValue: value } : opt,
+                );
+          return {
+            ...prev,
+            [activeSessionId]: {
+              ...base,
+              configOptions: nextOptions,
+              modes: syncModesWithOptions(base.modes, nextOptions),
+            },
+          };
+        });
+      } catch (err: unknown) {
+        setSessionError(
+          err instanceof Error
+            ? err.message
+            : `Failed to update '${configId}'.`,
+        );
+      } finally {
+        setConfigBusyId(null);
+      }
+    },
+    [activeSessionId],
+  );
+
+  const setSessionMode = useCallback(
+    async (modeId: string) => {
+      const client = clientRef.current;
+      if (!client || !activeSessionId) {
+        return;
+      }
+      setSessionError(null);
+      setConfigBusyId("mode");
+      try {
+        await client.setSessionMode(activeSessionId, modeId);
+        setSessionMetaById((prev) => {
+          const base = prev[activeSessionId] ?? EMPTY_SESSION_META;
+          const nextModes: AcpModesState = base.modes
+            ? { ...base.modes, currentModeId: modeId }
+            : { currentModeId: modeId, availableModes: [] };
+          const nextOptions = base.configOptions.map((opt) =>
+            opt.category === "mode" || opt.id === "mode"
+              ? { ...opt, currentValue: modeId }
+              : opt,
+          );
+          return {
+            ...prev,
+            [activeSessionId]: {
+              ...base,
+              modes: nextModes,
+              configOptions: nextOptions,
+            },
+          };
+        });
+      } catch (err: unknown) {
+        setSessionError(
+          err instanceof Error ? err.message : "Failed to switch session mode.",
+        );
+      } finally {
+        setConfigBusyId(null);
+      }
+    },
+    [activeSessionId],
   );
 
   const closeActiveSession = useCallback(async () => {
@@ -727,13 +939,19 @@ export function useAcpConnection(): UseAcpConnectionState {
     if (!client || !activeSessionId) {
       return;
     }
+    const closingId = activeSessionId;
     setSessionError(null);
     setSessionBusyId("close");
     try {
-      await client.closeSession(activeSessionId);
+      await client.closeSession(closingId);
       setActiveSessionId(null);
       setActiveSessionMode(null);
       setReplayedMessages([]);
+      setSessionMetaById((prev) => {
+        const next = { ...prev };
+        delete next[closingId];
+        return next;
+      });
       setSessionArtifacts([]);
       setSelectedArtifact(null);
     } catch (err: unknown) {
@@ -758,6 +976,11 @@ export function useAcpConnection(): UseAcpConnectionState {
         setSessions((prev) =>
           prev.filter((item) => item.sessionId !== sessionId),
         );
+        setSessionMetaById((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
         if (activeSessionId === sessionId) {
           setActiveSessionId(null);
           setActiveSessionMode(null);
@@ -835,6 +1058,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     [result],
   );
   const canLogout = Boolean(result?.agentCapabilities?.auth?.logout);
+  const activeMeta = activeSessionId
+    ? (sessionMetaById[activeSessionId] ?? EMPTY_SESSION_META)
+    : EMPTY_SESSION_META;
 
   return {
     status,
@@ -843,6 +1069,7 @@ export function useAcpConnection(): UseAcpConnectionState {
     activeMethodId,
     authenticatingMethodId,
     canLogout,
+    accountTier,
     defaultCwd,
     agyAppDataDir,
     agyProfileDir,
@@ -853,6 +1080,12 @@ export function useAcpConnection(): UseAcpConnectionState {
     activeSessionId,
     activeSessionMode,
     replayedMessages,
+    sessionModels: activeMeta.models,
+    sessionModes: activeMeta.modes,
+    configOptions: activeMeta.configOptions,
+    availableCommands: activeMeta.availableCommands,
+    sessionUsage: activeMeta.usage,
+    configBusyId,
     sessionArtifacts,
     selectedArtifact,
     artifactsBusy,
@@ -872,8 +1105,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     refreshSessions,
     loadMoreSessions,
     createNewSession,
-    loadExistingSession,
     resumeExistingSession,
+    setSessionConfigOption,
+    setSessionMode,
     closeActiveSession,
     deleteExistingSession,
     reconnect,

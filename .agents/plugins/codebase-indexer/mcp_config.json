@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "mcp": {
-      "command": "bash",
-      "args": [".agents/plugins/codebase-indexer/scripts/serve_mcp.sh"],
-      "cwd": "../../.."
-    }
-  }
-}

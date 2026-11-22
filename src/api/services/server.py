@@ -8,9 +8,17 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 
 from api.models.config import ApiServerConfig, HealthStatus
-from api.models.session import SessionArtifactContent, SessionArtifactList
+from api.models.session import (
+    SessionArtifactContent,
+    SessionArtifactList,
+    SessionRuntimeState,
+)
 from api.services.gateway import AcpWebSocketGateway
-from api.utils.artifacts import list_session_artifacts, read_session_artifact
+from api.utils.artifacts import (
+    list_session_artifacts,
+    read_session_artifact,
+    validate_artifact_session_id,
+)
 from api.utils.formatting import configure_api_terminal_logging, format_kv_block
 from api.utils.security import (
     build_agy_acp_command,
@@ -120,6 +128,25 @@ class ApiServerRunner:
             )
         return artifact
 
+    async def _get_session_state_endpoint(
+        self,
+        session_id: str,
+        request: Request,
+    ) -> SessionRuntimeState:
+        """Return live collected ``SessionRuntimeState`` for an active ACP session."""
+        self._verify_http_request(request)
+        try:
+            clean_id = validate_artifact_session_id(session_id)
+        except AcpError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        state = self._gateway.get_session_state(clean_id)
+        if state is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Active session '{clean_id}' not found.",
+            )
+        return state
+
     def create_app(self) -> FastAPI:
         """Validate bind host security rules and build the configured ``FastAPI`` app."""
         validate_bind_host(
@@ -145,6 +172,12 @@ class ApiServerRunner:
             self._health_endpoint,
             methods=["GET"],
             response_model=HealthStatus,
+        )
+        app.add_api_route(
+            "/api/sessions/{session_id}/state",
+            self._get_session_state_endpoint,
+            methods=["GET"],
+            response_model=SessionRuntimeState,
         )
         app.add_api_route(
             "/api/sessions/{session_id}/artifacts",

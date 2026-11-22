@@ -25,6 +25,7 @@ from api.models.acp import (
     SessionStepOutcome,
 )
 from api.models.config import ApiServerConfig
+from api.models.session import SessionRuntimeState
 from api.services.process import AgyAcpProcess
 from api.services.prompt import PromptTurnManager
 from api.utils.formatting import (
@@ -45,6 +46,14 @@ from api.utils.session import (
     SESSION_METHODS,
     check_session_capability,
     prepare_session_params,
+)
+from api.utils.session_state import (
+    apply_config_options_result,
+    apply_mode_change,
+    apply_session_setup_result,
+    apply_session_update_to_state,
+    prepare_set_config_option_params,
+    prepare_set_mode_params,
 )
 from core.models.exceptions import AcpError
 from core.utils.logging import get_logger
@@ -72,7 +81,9 @@ class AcpConnectionSession:
         self._auth_state = AcpAuthState.UNKNOWN
         self._active_auth_method_id: str | None = None
         self._active_session_ids: set[str] = set()
+        self._session_states: dict[str, SessionRuntimeState] = {}
         self._pending_rpc_methods: dict[int | str, tuple[str, str | None]] = {}
+        self._pending_mode_targets: dict[int | str, str] = {}
         self._turns = PromptTurnManager(connection_id)
 
     @property
@@ -124,6 +135,15 @@ class AcpConnectionSession:
     def child_session_ids(self) -> frozenset[str]:
         """Return announced subagent child session IDs on this connection."""
         return self._turns.child_session_ids
+
+    @property
+    def session_states(self) -> Mapping[str, SessionRuntimeState]:
+        """Return read-only mapping of collected ``SessionRuntimeState`` by ``sessionId``."""
+        return dict(self._session_states)
+
+    def get_session_state(self, session_id: str) -> SessionRuntimeState | None:
+        """Return collected ``SessionRuntimeState`` for ``session_id``, or ``None``."""
+        return self._session_states.get(session_id)
 
     def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
         """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
@@ -523,6 +543,53 @@ class AcpConnectionSession:
             return self._turns.prepare_cancel(msg, self.active_session_ids)
         return self._turns.prepare_cancel_request(msg)
 
+    def _prepare_config_or_mode_outbound(
+        self,
+        method: str,
+        req_id: int | str | None,
+        msg: Mapping[str, Any],
+    ) -> dict[str, Any] | SessionStepOutcome:
+        """Validate ``session/set_config_option`` or ``session/set_mode`` against session state."""
+        if "id" not in msg or req_id is None:
+            return SessionStepOutcome(
+                frames=(
+                    format_jsonrpc_error(
+                        None,
+                        JSONRPC_INVALID_REQUEST,
+                        f"'{method}' must be a JSON-RPC request with a non-null id",
+                    ),
+                )
+            )
+        target_gate = self._turns.check_session_target_allowed(
+            method,
+            req_id,
+            msg,
+            self.active_session_ids,
+        )
+        if target_gate is not None:
+            return target_gate
+
+        raw_params = msg.get("params")
+        raw_sid = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
+        current_state = self._session_states.get(raw_sid) if isinstance(raw_sid, str) else None
+        try:
+            session_id, sanitized = (
+                prepare_set_config_option_params(raw_params, current_state)
+                if method == "session/set_config_option"
+                else prepare_set_mode_params(raw_params, current_state)
+            )
+        except (PydanticValidationError, ValueError) as exc:
+            logger.debug("Invalid %s params on %s: %s", method, self._connection_id, exc)
+            detail = str(exc) if isinstance(exc, ValueError) else f"Invalid {method} params"
+            return SessionStepOutcome(
+                frames=(format_jsonrpc_error(req_id, JSONRPC_INVALID_PARAMS, detail),)
+            )
+
+        self._pending_rpc_methods[req_id] = (method, session_id)
+        if method == "session/set_mode":
+            self._pending_mode_targets[req_id] = str(sanitized["modeId"])
+        return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized}
+
     def _dispatch_ready_method(
         self,
         method: str,
@@ -538,6 +605,8 @@ class AcpConnectionSession:
             )
         if method in ("session/prompt", "session/cancel", "$/cancel_request"):
             return self._prepare_prompt_or_cancel(method, req_id, msg)
+        if method in ("session/set_config_option", "session/set_mode"):
+            return self._prepare_config_or_mode_outbound(method, req_id, msg)
         if method in SESSION_METHODS:
             return self._prepare_session_outbound(method, req_id, msg)
 
@@ -637,30 +706,60 @@ class AcpConnectionSession:
         await self._send_bridge_payload_to_agent(prepared)
         return SessionStepOutcome()
 
+    def _record_setup_state(self, session_id: str, res_obj: object) -> None:
+        """Activate ``session_id`` and merge setup metadata into ``_session_states``."""
+        self._active_session_ids.add(session_id)
+        payload = res_obj if isinstance(res_obj, Mapping) else {}
+        self._session_states[session_id] = apply_session_setup_result(
+            self._session_states.get(session_id),
+            session_id,
+            payload,
+        )
+
     def _apply_session_rpc_result(
         self,
         method_name: str,
         tracked_session_id: str | None,
         loaded: Mapping[str, Any],
+        pending_mode_id: str | None = None,
     ) -> None:
-        """Update ``active_session_ids`` from completed ``session/*`` responses."""
+        """Update ``active_session_ids`` and ``_session_states`` from ``session/*`` responses."""
         succeeded = "result" in loaded and "error" not in loaded
+        res_obj = loaded.get("result")
         err_obj = loaded.get("error")
         err_code = err_obj.get("code") if isinstance(err_obj, Mapping) else None
 
-        if method_name == "session/new" and succeeded:
-            res_obj = loaded.get("result")
-            new_id = res_obj.get("sessionId") if isinstance(res_obj, Mapping) else None
+        if method_name == "session/new" and succeeded and isinstance(res_obj, Mapping):
+            new_id = res_obj.get("sessionId")
             if isinstance(new_id, str) and new_id:
-                self._active_session_ids.add(new_id)
+                self._record_setup_state(new_id, res_obj)
         elif method_name in ("session/load", "session/resume") and succeeded and tracked_session_id:
-            self._active_session_ids.add(tracked_session_id)
+            self._record_setup_state(tracked_session_id, res_obj)
+        elif method_name == "session/set_config_option" and succeeded and tracked_session_id:
+            if isinstance(res_obj, Mapping):
+                self._session_states[tracked_session_id] = apply_config_options_result(
+                    self._session_states.get(tracked_session_id),
+                    tracked_session_id,
+                    res_obj,
+                )
+        elif (
+            method_name == "session/set_mode"
+            and succeeded
+            and tracked_session_id
+            and pending_mode_id
+        ):
+            self._session_states[tracked_session_id] = apply_mode_change(
+                self._session_states.get(tracked_session_id),
+                tracked_session_id,
+                pending_mode_id,
+            )
         elif (
             method_name in ("session/close", "session/delete")
             and tracked_session_id
             and (succeeded or err_code == ACP_RESOURCE_NOT_FOUND)
         ):
             self._active_session_ids.discard(tracked_session_id)
+            self._session_states.pop(tracked_session_id, None)
             self._turns.clear_completed_session(tracked_session_id)
 
     def _apply_auth_rpc_result(
@@ -668,10 +767,14 @@ class AcpConnectionSession:
         method_name: str,
         target_id: str | None,
         loaded: Mapping[str, Any],
+        pending_mode_id: str | None = None,
     ) -> None:
         """Transition ``auth_state`` or ``active_session_ids`` when tracked RPCs finish."""
-        if method_name in SESSION_METHODS:
-            self._apply_session_rpc_result(method_name, target_id, loaded)
+        if method_name in SESSION_METHODS or method_name in (
+            "session/set_config_option",
+            "session/set_mode",
+        ):
+            self._apply_session_rpc_result(method_name, target_id, loaded, pending_mode_id)
             return
         succeeded = "result" in loaded and "error" not in loaded
         if method_name == "authenticate":
@@ -702,8 +805,26 @@ class AcpConnectionSession:
         resp_id = extract_request_id(loaded)
         if resp_id is not None and resp_id in self._pending_rpc_methods:
             method_name, auth_method_id = self._pending_rpc_methods.pop(resp_id)
-            self._apply_auth_rpc_result(method_name, auth_method_id, loaded)
+            mode_id = self._pending_mode_targets.pop(resp_id, None)
+            self._apply_auth_rpc_result(method_name, auth_method_id, loaded, mode_id)
         return loaded
+
+    def _observe_forwarded_session_update(self, loaded: Mapping[str, Any]) -> None:
+        """Patch ``_session_states`` from allowed ``session/update`` notifications."""
+        if loaded.get("method") != "session/update" or "id" in loaded:
+            return
+        params = loaded.get("params")
+        update = params.get("update") if isinstance(params, Mapping) else None
+        raw_sid = params.get("sessionId") if isinstance(params, Mapping) else None
+        if not isinstance(raw_sid, str) or not raw_sid or not isinstance(update, Mapping):
+            return
+        next_state = apply_session_update_to_state(
+            self._session_states.get(raw_sid),
+            raw_sid,
+            update,
+        )
+        if next_state is not None:
+            self._session_states[raw_sid] = next_state
 
     async def read_agent_frame(self) -> str | None:
         """Read, validate, and filter the next outbound NDJSON frame emitted by ``agy acp``."""
@@ -720,12 +841,16 @@ class AcpConnectionSession:
         )
         if decision.agent_reply is not None:
             await self._send_bridge_payload_to_agent(decision.agent_reply)
+        if decision.forward_frame:
+            self._observe_forwarded_session_update(loaded)
         return decision.forward_frame
 
     async def close(self) -> None:
         """Cancel pending permissions/turns, close session, and stop ``agy acp``."""
         self._state = AcpConnectionState.CLOSED
         await self._flush_turn_teardown()
+        self._session_states.clear()
+        self._pending_mode_targets.clear()
         await self._process.stop()
 
 
