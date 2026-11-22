@@ -30,10 +30,8 @@ import { ToolRow } from "@/components/ai-elements/tool-trace";
 import {
   CheckpointMarker,
   ContextUsageHoverCard,
-  SessionArtifactsSheet,
   ToolConfirmationCard,
 } from "@/components/ai-elements/turn-prompts-and-files";
-import { Badge } from "@/components/ui/badge";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import {
@@ -74,8 +72,6 @@ import type {
   AcpModelsState,
   AcpModesState,
   AcpReplayedMessage,
-  AcpSessionArtifactContent,
-  AcpSessionArtifactSummary,
   AcpSessionCapabilitiesFlags,
   AcpSessionInfo,
   AcpSessionUsage,
@@ -171,8 +167,6 @@ export interface SessionChatProps {
     value: string | boolean,
   ) => Promise<void>;
   onSetMode?: (modeId: string) => Promise<void>;
-  sessionArtifacts: AcpSessionArtifactSummary[];
-  onLoadArtifact: (name: string) => Promise<AcpSessionArtifactContent | null>;
   includeCbiMcp: boolean;
   onToggleCbiMcp: (enabled: boolean) => void;
   sessionCaps: AcpSessionCapabilitiesFlags;
@@ -195,8 +189,6 @@ export function SessionChat({
   configBusyId = null,
   onSetConfigOption,
   onSetMode,
-  sessionArtifacts,
-  onLoadArtifact,
   includeCbiMcp,
   onToggleCbiMcp,
   sessionCaps,
@@ -223,7 +215,6 @@ export function SessionChat({
           <>
             <div className="flex shrink-0 items-center justify-between gap-2 px-3 py-2">
               <div className="flex min-w-0 items-center gap-2">
-                <Badge variant="secondary">Active</Badge>
                 <span
                   className="truncate text-xs font-medium text-foreground"
                   title={activeSession?.title || activeSessionId}
@@ -235,10 +226,6 @@ export function SessionChat({
                 <ContextUsageHoverCard
                   usage={contextUsage}
                   sessionUsage={sessionUsage}
-                />
-                <SessionArtifactsSheet
-                  artifacts={sessionArtifacts}
-                  onLoadArtifact={onLoadArtifact}
                 />
                 {sessionCaps.canClose && (
                   <Tooltip>

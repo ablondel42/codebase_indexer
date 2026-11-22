@@ -2,13 +2,10 @@ import * as React from "react";
 import {
   ChevronRightIcon,
   FileIcon,
-  FileTextIcon,
   FolderIcon,
   TerminalIcon,
 } from "lucide-react";
 
-import { SessionMessageBody } from "@/components/ai-elements/message-body";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -30,17 +27,6 @@ import {
 } from "@/components/ui/item";
 import { Marker, MarkerContent } from "@/components/ui/marker";
 import { Progress, ProgressLabel } from "@/components/ui/progress";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from "@/components/ui/sheet";
-import { Spinner } from "@/components/ui/spinner";
 import {
   buildFileTree,
   formatCompactTokens,
@@ -49,8 +35,6 @@ import {
 import type {
   AcpContextUsage,
   AcpPendingConfirmation,
-  AcpSessionArtifactContent,
-  AcpSessionArtifactSummary,
   AcpSessionUsage,
 } from "@/lib/acp/types";
 
@@ -268,86 +252,5 @@ export function ContextUsageHoverCard({
         </div>
       </HoverCardContent>
     </HoverCard>
-  );
-}
-
-export function SessionArtifactsSheet({
-  artifacts,
-  onLoadArtifact,
-}: {
-  artifacts: AcpSessionArtifactSummary[];
-  onLoadArtifact: (name: string) => Promise<AcpSessionArtifactContent | null>;
-}) {
-  const [selectedName, setSelectedName] = React.useState<string>("");
-  const [loaded, setLoaded] =
-    React.useState<AcpSessionArtifactContent | null>(null);
-  const [loading, setLoading] = React.useState(false);
-
-  const paths = React.useMemo(
-    () => artifacts.map((item) => item.name),
-    [artifacts],
-  );
-
-  const handleSelect = React.useCallback(
-    async (name: string) => {
-      setSelectedName(name);
-      setLoading(true);
-      try {
-        const result = await onLoadArtifact(name);
-        setLoaded(result);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [onLoadArtifact],
-  );
-
-  if (artifacts.length === 0) {
-    return null;
-  }
-
-  return (
-    <Sheet
-      onOpenChange={(open) => {
-        if (open && !selectedName && artifacts[0]) {
-          void handleSelect(artifacts[0].name);
-        }
-      }}
-    >
-      <SheetTrigger render={<Button variant="outline" size="xs" />}>
-        <FileTextIcon />
-        Artifacts
-        <Badge variant="secondary">{artifacts.length}</Badge>
-      </SheetTrigger>
-      <SheetContent className="sm:max-w-xl">
-        <SheetHeader>
-          <SheetTitle>Session Artifacts</SheetTitle>
-          <SheetDescription>
-            Markdown artifacts generated in this session&apos;s brain directory.
-          </SheetDescription>
-        </SheetHeader>
-        <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
-          <FileTree
-            paths={paths}
-            selected={selectedName}
-            onSelect={(path) => void handleSelect(path)}
-          />
-          <Separator />
-          <ScrollArea className="min-h-0 flex-1 rounded-lg border border-border bg-background/60 p-3">
-            {loading ? (
-              <div className="flex items-center justify-center py-8">
-                <Spinner />
-              </div>
-            ) : loaded ? (
-              <SessionMessageBody text={loaded.content} />
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                Select an artifact above to inspect its contents.
-              </p>
-            )}
-          </ScrollArea>
-        </div>
-      </SheetContent>
-    </Sheet>
   );
 }

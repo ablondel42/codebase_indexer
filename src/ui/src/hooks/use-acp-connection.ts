@@ -94,9 +94,6 @@ export interface UseAcpConnectionState {
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
-  loadArtifactContent: (
-    artifactName: string,
-  ) => Promise<AcpSessionArtifactContent | null>;
   refreshArtifacts: () => Promise<void>;
   openArtifact: (artifactName: string) => Promise<void>;
   closeArtifact: () => void;
@@ -1016,20 +1013,6 @@ export function useAcpConnection(): UseAcpConnectionState {
     }
   }, [activeSessionId]);
 
-  const loadArtifactContent = useCallback(
-    async (artifactName: string): Promise<AcpSessionArtifactContent | null> => {
-      if (!activeSessionId) {
-        return null;
-      }
-      try {
-        return await fetchSessionArtifactContent(activeSessionId, artifactName);
-      } catch {
-        return null;
-      }
-    },
-    [activeSessionId],
-  );
-
   const openArtifact = useCallback(
     async (artifactName: string) => {
       if (!activeSessionId) {
@@ -1089,7 +1072,6 @@ export function useAcpConnection(): UseAcpConnectionState {
     sessionArtifacts,
     selectedArtifact,
     artifactsBusy,
-    loadArtifactContent,
     refreshArtifacts,
     openArtifact,
     closeArtifact,

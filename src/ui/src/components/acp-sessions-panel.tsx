@@ -96,9 +96,6 @@ interface AcpSessionsPanelProps {
   sessionArtifacts: AcpSessionArtifactSummary[];
   selectedArtifact: AcpSessionArtifactContent | null;
   artifactsBusy: boolean;
-  onLoadArtifactContent: (
-    artifactName: string,
-  ) => Promise<AcpSessionArtifactContent | null>;
   sessionCaps: AcpSessionCapabilitiesFlags;
   sessionBusyId: string | null;
   sessionError: string | null;
@@ -157,7 +154,6 @@ export function AcpSessionsPanel({
   sessionArtifacts,
   selectedArtifact,
   artifactsBusy,
-  onLoadArtifactContent,
   sessionCaps,
   sessionBusyId,
   sessionError,
@@ -554,8 +550,6 @@ export function AcpSessionsPanel({
             configBusyId={configBusyId}
             onSetConfigOption={onSetConfigOption}
             onSetMode={onSetMode}
-            sessionArtifacts={sessionArtifacts}
-            onLoadArtifact={onLoadArtifactContent}
             includeCbiMcp={includeCbiMcp}
             onToggleCbiMcp={onToggleCbiMcp}
             sessionCaps={sessionCaps}

@@ -6,7 +6,6 @@ import {
   FileTextIcon,
   PaperclipIcon,
   PlusIcon,
-  SlashIcon,
   XIcon,
 } from "lucide-react";
 
@@ -540,53 +539,6 @@ export function SessionPromptInput({
               </DropdownMenuCheckboxItem>
             </DropdownMenuContent>
           </DropdownMenu>
-
-          {availableCommands.length > 0 && (
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                render={
-                  <InputGroupButton
-                    aria-label="Slash commands"
-                    type="button"
-                    size="xs"
-                    variant="outline"
-                    disabled={!hasActiveSession}
-                  />
-                }
-              >
-                <SlashIcon />
-                <span>Commands</span>
-                <Badge variant="secondary" className="px-1 text-[10px]">
-                  {availableCommands.length}
-                </Badge>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="start"
-                side="top"
-                className="max-h-72 w-72 overflow-y-auto"
-              >
-                <DropdownMenuGroup>
-                  <DropdownMenuLabel>Available Commands</DropdownMenuLabel>
-                  {availableCommands.map((cmd) => (
-                    <DropdownMenuItem
-                      key={cmd.name}
-                      onClick={() => applySlashCommand(cmd.name)}
-                      className="flex flex-col items-start gap-0.5 py-1.5"
-                    >
-                      <span className="font-mono text-xs font-medium">
-                        /{cmd.name}
-                      </span>
-                      {cmd.description && (
-                        <span className="line-clamp-2 text-[11px] text-muted-foreground">
-                          {cmd.description}
-                        </span>
-                      )}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuGroup>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
 
           {activeModeChoices.length > 0 && (
             <DropdownMenu>

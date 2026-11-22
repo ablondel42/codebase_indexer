@@ -150,7 +150,6 @@ function WorkspaceCanvas() {
                 sessionArtifacts={acp.sessionArtifacts}
                 selectedArtifact={acp.selectedArtifact}
                 artifactsBusy={acp.artifactsBusy}
-                onLoadArtifactContent={acp.loadArtifactContent}
                 sessionCaps={acp.sessionCaps}
                 sessionBusyId={acp.sessionBusyId}
                 sessionError={acp.sessionError}
