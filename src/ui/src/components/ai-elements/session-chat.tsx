@@ -106,14 +106,12 @@ function renderAssistantBlocks({
   isLastTurn,
   liveTurnActive,
   isLiveThinking,
-  liveTurnStartedAtMs,
   liveItemIds,
 }: {
   blocks: AssistantTurnBlock[];
   isLastTurn: boolean;
   liveTurnActive: boolean;
   isLiveThinking: boolean;
-  liveTurnStartedAtMs: number | null;
   liveItemIds: ReadonlySet<string>;
 }): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
@@ -157,7 +155,6 @@ function renderAssistantBlocks({
           key={block.id}
           thoughts={block.thoughts}
           running={isThinkingHere}
-          startedAtMs={isThinkingHere ? liveTurnStartedAtMs : null}
           streaming={isStreamingThought}
         />,
       );
@@ -187,27 +184,11 @@ function renderAssistantBlocks({
     }
   });
 
-  const lastBlock = blocks[blocks.length - 1];
-  if (
-    isLastTurn &&
-    (isLiveThinking || (liveTurnActive && blocks.length === 0)) &&
-    lastBlock?.kind !== "thought_group"
-  ) {
-    traceBatch.push(
-      <ReasoningGroup
-        key="__live_tail_thinking__"
-        thoughts={[]}
-        running
-        startedAtMs={liveTurnStartedAtMs}
-      />,
-    );
-  }
-
   flushTraceBatch();
   return nodes;
 }
 
-function isTurnShowingThinkingIndicator({
+function isTurnInThinkingState({
   blocks,
   isLastTurn,
   liveTurnActive,
@@ -426,7 +407,7 @@ function SessionTimelineScroller({
               const isLastTurn = turnIdx === turns.length - 1;
               const isTurnActive =
                 isLastTurn && (liveTurnActive || isLiveThinking);
-              const showingThinking = isTurnShowingThinkingIndicator({
+              const isThinkingState = isTurnInThinkingState({
                 blocks: turn.blocks,
                 isLastTurn,
                 liveTurnActive,
@@ -438,7 +419,6 @@ function SessionTimelineScroller({
                 isLastTurn,
                 liveTurnActive,
                 isLiveThinking,
-                liveTurnStartedAtMs,
                 liveItemIds,
               });
 
@@ -464,10 +444,10 @@ function SessionTimelineScroller({
                           text={turn.replyText}
                           durationSec={turn.durationSec}
                           streaming={isTurnActive}
+                          isThinking={isThinkingState}
                           startedAtMs={
                             isTurnActive ? liveTurnStartedAtMs : null
                           }
-                          hideStatusIndicator={showingThinking}
                         />
                       </MessageContent>
                     </Message>
@@ -482,13 +462,12 @@ function SessionTimelineScroller({
               <MessageScrollerItem messageId="__live_pending_assistant__">
                 <Message>
                   <MessageContent className="gap-3">
-                    <Trace>
-                      <ReasoningGroup
-                        thoughts={[]}
-                        running
-                        startedAtMs={liveTurnStartedAtMs}
-                      />
-                    </Trace>
+                    <AssistantMessageFooter
+                      text=""
+                      streaming
+                      isThinking
+                      startedAtMs={liveTurnStartedAtMs}
+                    />
                   </MessageContent>
                 </Message>
               </MessageScrollerItem>

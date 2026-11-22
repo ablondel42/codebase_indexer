@@ -113,21 +113,221 @@ function HighlightedCodeFence({
   );
 }
 
-function renderInlineCodeText(paragraph: string): React.ReactNode[] {
-  const parts = paragraph.split(/(`[^`]+`)/g);
-  return parts.map((part, idx) => {
-    if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
-      return (
+const INLINE_TOKEN_RE = /\[([^\]\n]+)\]\(([^)\s\n]+)\)|`([^`\n]+)`|\*\*([^*\n]+)\*\*/g;
+const TRAILING_INCOMPLETE_LINK_RE = /\[([^\]\n]+)\]\(([^)\s\n]*)$/;
+const TRAILING_INCOMPLETE_CODE_RE = /`([^`\n]*)$/;
+const TRAILING_INCOMPLETE_BOLD_RE = /\*\*([^*\n]*)$/;
+
+function renderLinkLabel(label: string): {
+  isCode: boolean;
+  text: string;
+} {
+  if (label.startsWith("`") && label.endsWith("`") && label.length >= 2) {
+    return { isCode: true, text: label.slice(1, -1) };
+  }
+  return { isCode: false, text: label };
+}
+
+function renderMarkdownLinkNode(
+  key: string | number,
+  label: string,
+  url: string,
+): React.ReactNode {
+  const parsed = renderLinkLabel(label);
+  const isHttp = url.startsWith("http://") || url.startsWith("https://");
+  if (isHttp) {
+    return (
+      <a
+        key={key}
+        href={url}
+        target="_blank"
+        rel="noreferrer"
+        className="font-medium underline underline-offset-4 hover:text-primary"
+      >
+        {parsed.isCode ? (
+          <code className="rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]">
+            {parsed.text}
+          </code>
+        ) : (
+          parsed.text
+        )}
+      </a>
+    );
+  }
+  return (
+    <code
+      key={key}
+      title={url}
+      className="rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]"
+    >
+      {parsed.text}
+    </code>
+  );
+}
+
+function renderClosedInlineTokens(
+  text: string,
+  keyPrefix: string,
+): { nodes: React.ReactNode[]; tail: string } {
+  const nodes: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let tokenIdx = 0;
+  INLINE_TOKEN_RE.lastIndex = 0;
+
+  for (const match of text.matchAll(INLINE_TOKEN_RE)) {
+    const start = match.index ?? 0;
+    if (start > lastIndex) {
+      nodes.push(
+        <React.Fragment key={`${keyPrefix}-t-${tokenIdx}`}>
+          {text.slice(lastIndex, start)}
+        </React.Fragment>,
+      );
+      tokenIdx += 1;
+    }
+
+    const linkLabel = match[1];
+    const linkUrl = match[2];
+    const codeText = match[3];
+    const boldText = match[4];
+
+    if (linkLabel !== undefined && linkUrl !== undefined) {
+      nodes.push(
+        renderMarkdownLinkNode(`${keyPrefix}-l-${tokenIdx}`, linkLabel, linkUrl),
+      );
+    } else if (codeText !== undefined) {
+      nodes.push(
         <code
-          key={idx}
+          key={`${keyPrefix}-c-${tokenIdx}`}
           className="rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]"
         >
-          {part.slice(1, -1)}
-        </code>
+          {codeText}
+        </code>,
+      );
+    } else if (boldText !== undefined) {
+      nodes.push(
+        <strong key={`${keyPrefix}-b-${tokenIdx}`} className="font-semibold">
+          {boldText}
+        </strong>,
       );
     }
-    return <React.Fragment key={idx}>{part}</React.Fragment>;
-  });
+
+    lastIndex = start + match[0].length;
+    tokenIdx += 1;
+  }
+
+  return {
+    nodes,
+    tail: text.slice(lastIndex),
+  };
+}
+
+function renderInlineFormattedText(
+  paragraph: string,
+  streaming: boolean,
+): React.ReactNode[] {
+  if (!streaming) {
+    const { nodes, tail } = renderClosedInlineTokens(paragraph, "s");
+    if (tail.length > 0) {
+      nodes.push(<React.Fragment key="s-tail">{tail}</React.Fragment>);
+    }
+    return nodes;
+  }
+
+  // Handle an in-flight trailing markdown link first so `[file.py](file:///...`
+  // renders cleanly as `file.py` immediately without flashing raw URL paths or
+  // splitting an inner backtick before the closing parenthesis arrives.
+  const trailingLink = TRAILING_INCOMPLETE_LINK_RE.exec(paragraph);
+  if (trailingLink) {
+    const prefix = paragraph.slice(0, trailingLink.index);
+    const backtickCount = (prefix.match(/`/g) ?? []).length;
+    if (backtickCount % 2 === 0) {
+      const linkLabel = trailingLink[1] ?? "";
+      const partialUrl = trailingLink[2] ?? "";
+      const parsedLabel = renderLinkLabel(linkLabel);
+      const isPartialHttp =
+        partialUrl.startsWith("http://") || partialUrl.startsWith("https://");
+      const nodes = renderInlineFormattedText(prefix, true);
+      if (isPartialHttp && !parsedLabel.isCode) {
+        nodes.push(
+          <span
+            key="trailing-link"
+            className="font-medium underline underline-offset-4"
+          >
+            {parsedLabel.text}
+          </span>,
+        );
+      } else {
+        nodes.push(
+          <code
+            key="trailing-link"
+            className="rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]"
+          >
+            {parsedLabel.text}
+          </code>,
+        );
+      }
+      return nodes;
+    }
+  }
+
+  const { nodes, tail } = renderClosedInlineTokens(paragraph, "d");
+  if (tail.length === 0) {
+    return nodes;
+  }
+
+  const trailingCode = TRAILING_INCOMPLETE_CODE_RE.exec(tail);
+  if (trailingCode) {
+    const before = tail.slice(0, trailingCode.index);
+    const partialCode = trailingCode[1] ?? "";
+    if (before.length > 0) {
+      nodes.push(<React.Fragment key="d-tc-pre">{before}</React.Fragment>);
+    }
+    if (partialCode.length > 0) {
+      nodes.push(
+        <code
+          key="d-tc"
+          className="rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]"
+        >
+          {partialCode}
+        </code>,
+      );
+    }
+    return nodes;
+  }
+
+  const trailingBold = TRAILING_INCOMPLETE_BOLD_RE.exec(tail);
+  if (trailingBold) {
+    const before = tail.slice(0, trailingBold.index);
+    const partialBold = trailingBold[1] ?? "";
+    if (before.length > 0) {
+      nodes.push(<React.Fragment key="d-tb-pre">{before}</React.Fragment>);
+    }
+    if (partialBold.length > 0) {
+      nodes.push(
+        <strong key="d-tb" className="font-semibold">
+          {partialBold}
+        </strong>,
+      );
+    }
+    return nodes;
+  }
+
+  nodes.push(<React.Fragment key="d-tail">{tail}</React.Fragment>);
+  return nodes;
+}
+
+function StreamingCaret({ className }: { className?: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={
+        className ??
+        "inline-block w-0 overflow-visible align-baseline select-none"
+      }
+    >
+      <span className="inline-block h-[1em] w-[1.5px] translate-x-[1px] translate-y-[0.12em] animate-pulse bg-primary/80" />
+    </span>
+  );
 }
 
 export function SessionMessageBody({
@@ -151,7 +351,7 @@ export function SessionMessageBody({
       <div className="flex min-w-0 items-center text-sm leading-relaxed">
         <span
           aria-hidden="true"
-          className="inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80"
+          className="inline-block h-3.5 w-[1.5px] animate-pulse bg-primary/80 select-none"
         />
       </div>
     );
@@ -172,7 +372,7 @@ export function SessionMessageBody({
               {isStreaming && isLastSegment && (
                 <span
                   aria-hidden="true"
-                  className="inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80"
+                  className="inline-block h-3.5 w-[1.5px] animate-pulse bg-primary/80 select-none"
                 />
               )}
             </React.Fragment>
@@ -192,13 +392,8 @@ export function SessionMessageBody({
                   key={pIdx}
                   className="whitespace-pre-wrap wrap-break-word text-foreground"
                 >
-                  {renderInlineCodeText(para)}
-                  {showCursor && (
-                    <span
-                      aria-hidden="true"
-                      className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80 align-text-bottom"
-                    />
-                  )}
+                  {renderInlineFormattedText(para, showCursor)}
+                  {showCursor && <StreamingCaret />}
                 </p>
               );
             })}
@@ -326,23 +521,21 @@ export function AssistantMessageFooter({
   text,
   durationSec,
   streaming = false,
+  isThinking = false,
   startedAtMs = null,
-  hideStatusIndicator = false,
 }: {
   text: string;
   durationSec?: number;
   streaming?: boolean;
+  isThinking?: boolean;
   startedAtMs?: number | null;
-  hideStatusIndicator?: boolean;
 }) {
   const [copied, setCopied] = React.useState(false);
   const [feedback, setFeedback] = React.useState<"like" | "dislike" | null>(
     null,
   );
   const elapsed = useLiveElapsedSeconds(streaming, startedAtMs, durationSec);
-  const showStatus =
-    !hideStatusIndicator &&
-    (streaming || (elapsed !== undefined && elapsed > 0));
+  const showStatus = streaming || (elapsed !== undefined && elapsed > 0);
 
   React.useEffect(() => {
     if (!copied) {
@@ -398,7 +591,10 @@ export function AssistantMessageFooter({
           {streaming ? (
             <>
               <LoaderCircleIcon className="size-3.5 animate-spin" />
-              <span>Working {formatDurationSec(elapsed ?? 0)}</span>
+              <span>
+                {isThinking ? "Thinking" : "Working"}{" "}
+                {formatDurationSec(elapsed ?? 0)}
+              </span>
             </>
           ) : (
             <>

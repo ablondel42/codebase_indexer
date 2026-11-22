@@ -645,13 +645,9 @@ export function useAcpConnection(): UseAcpConnectionState {
       if (streamIds.length > 0) {
         setLiveTurnActive(true);
         setLiveTurnStartedAtMs((prev) => prev ?? Date.now());
-        setLiveItemIds((prev) => {
-          const next = new Set(prev);
-          for (const id of streamIds) {
-            next.add(id);
-          }
-          return next;
-        });
+        setLiveItemIds(new Set([streamIds[streamIds.length - 1]!]));
+      } else {
+        setLiveItemIds(new Set());
       }
       setReplayedMessages((prev) =>
         applyLiveOps(prev, relevant, () => {
@@ -799,14 +795,8 @@ export function useAcpConnection(): UseAcpConnectionState {
       const streamableIds = sync.items
         .filter((item) => item.role === "agent" || item.role === "thought")
         .map((item) => item.id);
-      if (streamableIds.length > 0) {
-        setLiveItemIds((prev) => {
-          const next = new Set(prev);
-          for (const id of streamableIds) {
-            next.add(id);
-          }
-          return next;
-        });
+      if (sync.items.length > 0) {
+        setLiveItemIds(new Set(streamableIds));
       }
       if (sync.items.length > 0) {
         setActiveSessionMode("loaded");

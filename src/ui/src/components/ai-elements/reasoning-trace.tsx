@@ -38,8 +38,10 @@ function StreamingThoughtText({
       {isStreaming && (
         <span
           aria-hidden="true"
-          className="ml-0.5 inline-block h-3 w-1 animate-pulse rounded-[1px] bg-primary/70 align-text-bottom"
-        />
+          className="inline-block w-0 overflow-visible align-baseline select-none"
+        >
+          <span className="inline-block h-[0.95em] w-[1.5px] translate-x-[1px] translate-y-[0.1em] animate-pulse bg-primary/70" />
+        </span>
       )}
     </p>
   );
@@ -48,12 +50,10 @@ function StreamingThoughtText({
 export function ReasoningGroup({
   thoughts,
   running = false,
-  startedAtMs = null,
   streaming = false,
 }: {
   thoughts: ThoughtStep[];
   running?: boolean;
-  startedAtMs?: number | null;
   streaming?: boolean;
 }) {
   const [open, setOpen] = React.useState<boolean>();
@@ -64,33 +64,34 @@ export function ReasoningGroup({
     );
     return sum > 0 ? sum : undefined;
   }, [thoughts]);
-  const fullElapsed = useLiveElapsedSeconds(running, startedAtMs, undefined);
   const thoughtElapsed = useLiveElapsedSeconds(running, null, totalDuration);
+
+  if (thoughts.length === 0) {
+    return null;
+  }
 
   const settledSeconds =
     thoughtElapsed !== undefined && thoughtElapsed > 0
       ? Math.max(1, Math.round(thoughtElapsed))
       : undefined;
   const titleText = running
-    ? `Thinking ${formatDurationSec(fullElapsed ?? 0)}`
+    ? `Thought for ${formatDurationSec(thoughtElapsed ?? 0)}`
     : settledSeconds !== undefined
       ? `Thought for ${formatDurationSec(settledSeconds)}`
       : "Thought";
 
   const line = (
     <TraceLine status={running ? "running" : undefined}>
-      {running && (
-        <TraceIcon>
+      <TraceIcon>
+        {running ? (
           <LoaderCircleIcon className="animate-spin" />
-        </TraceIcon>
-      )}
+        ) : (
+          <CircleCheckIcon />
+        )}
+      </TraceIcon>
       <TraceTitle>{titleText}</TraceTitle>
     </TraceLine>
   );
-
-  if (thoughts.length === 0) {
-    return running ? line : null;
-  }
 
   return (
     <TraceCollapsible open={open ?? running} onOpenChange={setOpen}>
@@ -136,21 +137,24 @@ export function ReasoningRow({
   durationSec?: number;
 }) {
   const [open, setOpen] = React.useState<boolean>();
+  const elapsed = useLiveElapsedSeconds(running, null, durationSec);
   const roundedSec =
-    durationSec !== undefined && durationSec > 0
-      ? Math.max(1, Math.round(durationSec))
+    elapsed !== undefined && elapsed > 0
+      ? Math.max(1, Math.round(elapsed))
       : undefined;
 
   const line = (
     <TraceLine status={running ? "running" : undefined}>
-      {running && (
-        <TraceIcon>
+      <TraceIcon>
+        {running ? (
           <LoaderCircleIcon className="animate-spin" />
-        </TraceIcon>
-      )}
+        ) : (
+          <CircleCheckIcon />
+        )}
+      </TraceIcon>
       <TraceTitle>
         {running
-          ? "Thinking"
+          ? `Thought for ${formatDurationSec(elapsed ?? 0)}`
           : roundedSec !== undefined
             ? `Thought for ${formatDurationSec(roundedSec)}`
             : "Thought"}
