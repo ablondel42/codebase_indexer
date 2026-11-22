@@ -1101,11 +1101,15 @@ def test_background_task_resolution_and_parser_version_self_heal(tmp_path: Path)
                     "status": "DONE",
                     "created_at": "2026-11-22T15:36:04Z",
                     "content": (
-                        "<SYSTEM_MESSAGE>\n"
+                        "The following is a <SYSTEM_MESSAGE> not actually sent by the user. "
+                        "It is provided by the system as important information to pay "
+                        "attention to.\n\n<SYSTEM_MESSAGE>\n"
                         f"[Message] timestamp=2026-11-22T15:36:04Z sender={sid}/task-982 "
                         f'priority=MESSAGE_PRIORITY_HIGH content=Task id "{sid}/task-982" '
                         "finished with result:\nCommand exited with code 0.\n\nCommand output:\n"
-                        f"52 passed\r\n\nLog: file:///tmp/{sid}/task-982.log\n</SYSTEM_MESSAGE>"
+                        f"52 passed\r\n\nLog: file:///tmp/{sid}/task-982.log\n"
+                        "</SYSTEM_MESSAGE>\n\n"
+                        "<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>"
                     ),
                 },
             )
@@ -1126,6 +1130,7 @@ def test_background_task_resolution_and_parser_version_self_heal(tmp_path: Path)
                 lambda p: any(i["id"] == "tf:4:agent" for i in p.get("items", [])),
             )
             assert settled["turnActive"] is False
+            assert "turnStartedAt" not in settled
 
             _append_jsonl(
                 transcript,

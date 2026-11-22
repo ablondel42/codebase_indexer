@@ -108,11 +108,11 @@ export function useLiveElapsedSeconds(
     }
     const sample = () => {
       const origin = startedAtMs ?? fallbackStartRef.current ?? Date.now();
-      const elapsed = Math.max(0.1, (Date.now() - origin) / 1000);
+      const elapsed = Math.max(0, Math.floor((Date.now() - origin) / 1000));
       setLiveSec(elapsed);
     };
     const rafId = window.requestAnimationFrame(sample);
-    const timerId = window.setInterval(sample, 100);
+    const timerId = window.setInterval(sample, 250);
     return () => {
       window.cancelAnimationFrame(rafId);
       window.clearInterval(timerId);
@@ -120,10 +120,12 @@ export function useLiveElapsedSeconds(
   }, [active, startedAtMs]);
 
   if (active) {
-    return liveSec ?? 0.1;
+    return liveSec ?? 0;
   }
   if (settledSec !== undefined && settledSec > 0) {
-    return settledSec;
+    return Math.max(1, Math.round(settledSec));
   }
-  return liveSec;
+  return liveSec !== undefined && liveSec > 0
+    ? Math.max(1, Math.round(liveSec))
+    : liveSec;
 }

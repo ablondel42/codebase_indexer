@@ -325,6 +325,7 @@ function applyLiveOps(
 function mergeSyncedItems(
   prev: AcpReplayedMessage[],
   incoming: AcpReplayedMessage[],
+  hasOlderUnloaded = false,
 ): AcpReplayedMessage[] {
   if (incoming.length === 0) {
     return prev;
@@ -335,19 +336,35 @@ function mergeSyncedItems(
     byId.set(item.id, item);
     order.push(item.id);
   }
+  const oldestLoadedSeq = prev[0]?.seq;
   for (const nextItem of incoming) {
     const existing = byId.get(nextItem.id);
     if (existing) {
       byId.set(nextItem.id, {
         ...existing,
-        ...nextItem,
+        seq: nextItem.seq ?? existing.seq,
+        turnIndex: nextItem.turnIndex ?? existing.turnIndex,
+        createdAt: nextItem.createdAt ?? existing.createdAt,
+        role: nextItem.role ?? existing.role,
         text: nextItem.text || existing.text,
         durationSec: nextItem.durationSec ?? existing.durationSec,
         toolKind: nextItem.toolKind ?? existing.toolKind,
         toolTitle: nextItem.toolTitle ?? existing.toolTitle,
+        toolStatus: nextItem.toolStatus ?? existing.toolStatus,
+        exitCode: nextItem.exitCode ?? existing.exitCode,
         locations: nextItem.locations ?? existing.locations,
+        planTitle: nextItem.planTitle ?? existing.planTitle,
+        planSteps: nextItem.planSteps ?? existing.planSteps,
       });
     } else {
+      if (
+        hasOlderUnloaded &&
+        oldestLoadedSeq !== undefined &&
+        nextItem.seq !== undefined &&
+        nextItem.seq < oldestLoadedSeq
+      ) {
+        continue;
+      }
       byId.set(nextItem.id, nextItem);
       order.push(nextItem.id);
     }
@@ -741,12 +758,16 @@ export function useAcpConnection(): UseAcpConnectionState {
       }
 
       if (sync.turnActive !== undefined) {
-        setLiveTurnActive(sync.turnActive);
-        setLiveTurnStartedAtMs(
-          sync.turnActive
-            ? (parseTimestampMs(sync.turnStartedAt) ?? Date.now())
-            : null,
-        );
+        if (sync.turnActive) {
+          setLiveTurnActive(true);
+          setLiveTurnStartedAtMs(
+            (prev) => parseTimestampMs(sync.turnStartedAt) ?? prev ?? Date.now(),
+          );
+        } else {
+          setLiveTurnActive(false);
+          setIsLiveThinking(false);
+          setLiveTurnStartedAtMs(null);
+        }
       }
 
       if (sync.event === "timeline_reset") {
@@ -790,7 +811,11 @@ export function useAcpConnection(): UseAcpConnectionState {
       if (sync.items.length > 0) {
         setActiveSessionMode("loaded");
         setReplayedMessages((prev) => {
-          const merged = mergeSyncedItems(prev, sync.items);
+          const merged = mergeSyncedItems(
+            prev,
+            sync.items,
+            nextBeforeTurnRef.current !== null,
+          );
           syncKnownTracker(knownTrackerRef.current, merged);
           if (sync.totalItems !== undefined) {
             setTotalMessageItems(sync.totalItems);

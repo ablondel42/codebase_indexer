@@ -61,6 +61,7 @@ class ChatTimelineItemUpsert(FrozenModel):
     text: str = ""
     merge_mode: Literal["append_text", "replace"] = "replace"
     duration_sec: float | None = Field(default=None, ge=0.0)
+    created_at: str | None = None
     tool_kind: str | None = None
     tool_title: str | None = None
     tool_status: str | None = None

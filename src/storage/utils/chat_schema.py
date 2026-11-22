@@ -29,7 +29,7 @@ from storage.utils.schema import JsonText
 
 chat_metadata = MetaData()
 
-CHAT_TRANSCRIPT_PARSER_VERSION = 3
+CHAT_TRANSCRIPT_PARSER_VERSION = 5
 
 chat_sessions_table = Table(
     "chat_sessions",
@@ -222,6 +222,7 @@ def merge_chat_item(
             "plan_steps": (
                 delta.plan_steps if delta.plan_steps is not None else existing.plan_steps
             ),
+            "created_at": delta.created_at if delta.created_at else existing.created_at,
             "updated_at": now_iso,
         }
     )
@@ -250,7 +251,7 @@ def build_new_chat_item(
         locations=delta.locations or (),
         plan_title=delta.plan_title,
         plan_steps=delta.plan_steps or (),
-        created_at=now_iso,
+        created_at=delta.created_at if delta.created_at else now_iso,
         updated_at=now_iso,
     )
 

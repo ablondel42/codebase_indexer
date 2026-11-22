@@ -11,7 +11,6 @@ import {
   TraceCollapsible,
   TraceCollapsibleContent,
   TraceCollapsibleTrigger,
-  TraceDescription,
   TraceIcon,
   TraceLine,
   TraceTitle,
@@ -65,36 +64,27 @@ export function ReasoningGroup({
     );
     return sum > 0 ? sum : undefined;
   }, [thoughts]);
-  const elapsed = useLiveElapsedSeconds(running, startedAtMs, totalDuration);
+  const fullElapsed = useLiveElapsedSeconds(running, startedAtMs, undefined);
+  const thoughtElapsed = useLiveElapsedSeconds(running, null, totalDuration);
 
-  const singleSettled = !running && thoughts.length === 1;
-  const titleText = singleSettled
-    ? elapsed !== undefined && elapsed >= 0.05
-      ? `Thought for ${formatDurationSec(elapsed)}`
-      : "Thought"
-    : running
-      ? "Thinking"
-      : "Thought";
-
-  const stepLabel = thoughts.length >= 2 ? `${thoughts.length} steps` : undefined;
-  const durationLabel = singleSettled
-    ? undefined
-    : elapsed !== undefined && (running || elapsed >= 0.05)
-      ? formatDurationSec(elapsed)
+  const settledSeconds =
+    thoughtElapsed !== undefined && thoughtElapsed > 0
+      ? Math.max(1, Math.round(thoughtElapsed))
       : undefined;
-  const description = [stepLabel, durationLabel].filter(Boolean).join(" · ");
+  const titleText = running
+    ? `Thinking ${formatDurationSec(fullElapsed ?? 0)}`
+    : settledSeconds !== undefined
+      ? `Thought for ${formatDurationSec(settledSeconds)}`
+      : "Thought";
 
   const line = (
     <TraceLine status={running ? "running" : undefined}>
-      <TraceIcon>
-        {running ? (
+      {running && (
+        <TraceIcon>
           <LoaderCircleIcon className="animate-spin" />
-        ) : (
-          <CircleCheckIcon />
-        )}
-      </TraceIcon>
+        </TraceIcon>
+      )}
       <TraceTitle>{titleText}</TraceTitle>
-      {description && <TraceDescription>· {description}</TraceDescription>}
     </TraceLine>
   );
 
@@ -146,20 +136,25 @@ export function ReasoningRow({
   durationSec?: number;
 }) {
   const [open, setOpen] = React.useState<boolean>();
+  const roundedSec =
+    durationSec !== undefined && durationSec > 0
+      ? Math.max(1, Math.round(durationSec))
+      : undefined;
 
   const line = (
     <TraceLine status={running ? "running" : undefined}>
-      <TraceIcon>
-        {running ? (
+      {running && (
+        <TraceIcon>
           <LoaderCircleIcon className="animate-spin" />
-        ) : (
-          <CircleCheckIcon />
-        )}
-      </TraceIcon>
-      <TraceTitle>{running ? "Thinking" : "Thought"}</TraceTitle>
-      {!running && durationSec !== undefined && (
-        <TraceDescription>{durationSec}s</TraceDescription>
+        </TraceIcon>
       )}
+      <TraceTitle>
+        {running
+          ? "Thinking"
+          : roundedSec !== undefined
+            ? `Thought for ${formatDurationSec(roundedSec)}`
+            : "Thought"}
+      </TraceTitle>
     </TraceLine>
   );
 

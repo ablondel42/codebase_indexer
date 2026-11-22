@@ -2,9 +2,10 @@ import * as React from "react";
 import {
   ArrowUpRightIcon,
   CheckIcon,
-  ClockIcon,
+  CircleCheckIcon,
   CopyIcon,
   GlobeIcon,
+  LoaderCircleIcon,
   ThumbsDownIcon,
   ThumbsUpIcon,
 } from "lucide-react";
@@ -326,18 +327,22 @@ export function AssistantMessageFooter({
   durationSec,
   streaming = false,
   startedAtMs = null,
+  hideStatusIndicator = false,
 }: {
   text: string;
   durationSec?: number;
   streaming?: boolean;
   startedAtMs?: number | null;
+  hideStatusIndicator?: boolean;
 }) {
   const [copied, setCopied] = React.useState(false);
   const [feedback, setFeedback] = React.useState<"like" | "dislike" | null>(
     null,
   );
   const elapsed = useLiveElapsedSeconds(streaming, startedAtMs, durationSec);
-  const hasElapsed = streaming || (elapsed !== undefined && elapsed >= 0.05);
+  const showStatus =
+    !hideStatusIndicator &&
+    (streaming || (elapsed !== undefined && elapsed > 0));
 
   React.useEffect(() => {
     if (!copied) {
@@ -347,7 +352,7 @@ export function AssistantMessageFooter({
     return () => window.clearTimeout(timer);
   }, [copied]);
 
-  if (!text && !hasElapsed) {
+  if (!text && !showStatus) {
     return null;
   }
 
@@ -388,12 +393,22 @@ export function AssistantMessageFooter({
           </MessageAction>
         </>
       )}
-      {hasElapsed && (
-        <span className="ml-auto inline-flex items-center gap-1 font-mono text-[11px] text-muted-foreground/80 tabular-nums">
-          <ClockIcon className="size-3" />
-          {streaming
-            ? `Streaming · ${formatDurationSec(elapsed ?? 0.1)}`
-            : formatDurationSec(elapsed ?? 0)}
+      {showStatus && (
+        <span className="ml-auto inline-flex items-center gap-1.5 text-xs text-muted-foreground tabular-nums">
+          {streaming ? (
+            <>
+              <LoaderCircleIcon className="size-3.5 animate-spin" />
+              <span>Working {formatDurationSec(elapsed ?? 0)}</span>
+            </>
+          ) : (
+            <>
+              <CircleCheckIcon className="size-3.5" />
+              <span>
+                Worked for{" "}
+                {formatDurationSec(Math.max(1, Math.round(elapsed ?? 1)))}
+              </span>
+            </>
+          )}
         </span>
       )}
     </MessageFooter>

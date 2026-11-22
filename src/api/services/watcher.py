@@ -262,6 +262,7 @@ class AgyProfileSyncWatcher:
             parsed.pending_batch is None
             and not parsed.pending_tasks
             and parsed.turn_started_at is None
+            and not parsed.turn_active
         ):
             self._sync_states.pop(session_id, None)
             return
@@ -269,6 +270,7 @@ class AgyProfileSyncWatcher:
             pending_batch=parsed.pending_batch,
             pending_tasks=parsed.pending_tasks,
             turn_started_at=parsed.turn_started_at,
+            turn_active=parsed.turn_active,
         )
 
     async def _parse_with_reset_fallback(
@@ -361,6 +363,8 @@ class AgyProfileSyncWatcher:
             return False
 
         self._deferred_sessions.discard(session_id)
+        prev_cached = self._sync_states.get(session_id)
+        was_turn_active = prev_cached.turn_active if prev_cached is not None else False
         stored, reset_performed, parsed, emit_reset = await self._persist_transcript_sync(
             session_id,
             transcript_path,
@@ -372,6 +376,7 @@ class AgyProfileSyncWatcher:
             bool(stored)
             or reset_performed
             or (parsed.turn_active and parsed.turn_started_at is not None)
+            or (was_turn_active and not parsed.turn_active)
         )
         if should_emit:
             summary = await asyncio.to_thread(self._store.get_session, session_id)

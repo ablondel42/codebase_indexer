@@ -35,7 +35,6 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import {
-  formatDurationSec,
   parseStackTrace,
   type FileEditSummary,
   type FileReadSummary,
@@ -235,14 +234,12 @@ export function TerminalRow({
   running = false,
   exitCode,
   failed = false,
-  durationSec,
 }: {
   command: string;
   output: string;
   running?: boolean;
   exitCode?: number | null;
   failed?: boolean;
-  durationSec?: number;
 }) {
   const [open, setOpen] = React.useState<boolean>();
   const isError =
@@ -254,10 +251,6 @@ export function TerminalRow({
       : isError
         ? `Failed to run ${command}`
         : `Ran ${command}`;
-  const durationBadge =
-    !running && durationSec !== undefined && durationSec >= 0.05 ? (
-      <TraceDescription>· {formatDurationSec(durationSec)}</TraceDescription>
-    ) : null;
 
   if (!output.trim()) {
     return (
@@ -266,7 +259,6 @@ export function TerminalRow({
           <TerminalIcon />
         </TraceIcon>
         <TraceTitle>{title}</TraceTitle>
-        {durationBadge}
       </TraceLine>
     );
   }
@@ -282,7 +274,6 @@ export function TerminalRow({
             <TerminalIcon />
           </TraceIcon>
           <TraceTitle>{title}</TraceTitle>
-          {durationBadge}
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent>
@@ -316,7 +307,6 @@ export function TerminalGroup({
         running={cmd.toolStatus === "running"}
         exitCode={cmd.exitCode}
         failed={cmd.toolStatus === "error"}
-        durationSec={cmd.durationSec}
       />
     );
   }
@@ -328,10 +318,6 @@ export function TerminalGroup({
       (c.toolStatus === "error" ||
         (c.exitCode !== undefined && c.exitCode !== null && c.exitCode !== 0)),
   ).length;
-  const totalDuration = commands.reduce(
-    (acc, c) => acc + (c.durationSec ?? 0),
-    0,
-  );
   const status: "running" | "error" | undefined = anyRunning
     ? "running"
     : failedCount > 0
@@ -351,11 +337,6 @@ export function TerminalGroup({
             <TerminalIcon />
           </TraceIcon>
           <TraceTitle>{title}</TraceTitle>
-          {!anyRunning && totalDuration >= 0.05 && (
-            <TraceDescription>
-              · {formatDurationSec(totalDuration)}
-            </TraceDescription>
-          )}
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="flex flex-col gap-2">
@@ -368,7 +349,6 @@ export function TerminalGroup({
               running={cmd.toolStatus === "running"}
               exitCode={cmd.exitCode}
               failed={cmd.toolStatus === "error"}
-              durationSec={cmd.durationSec}
             />
           ))}
         </Trace>
@@ -407,11 +387,6 @@ export function FileEditRow({ edit }: { edit: FileEditSummary }) {
             <span className="text-rose-500">-{edit.removedLines}</span>
           </span>
         )}
-      {!running && edit.durationSec !== undefined && edit.durationSec >= 0.05 && (
-        <TraceDescription>
-          · {formatDurationSec(edit.durationSec)}
-        </TraceDescription>
-      )}
     </TraceLine>
   );
 
@@ -459,11 +434,6 @@ export function FileReadRow({ read }: { read: FileReadSummary }) {
       {read.lineRangeLabel && (
         <TraceDescription className="font-mono text-xs">
           {read.lineRangeLabel}
-        </TraceDescription>
-      )}
-      {!running && read.durationSec !== undefined && read.durationSec >= 0.05 && (
-        <TraceDescription>
-          · {formatDurationSec(read.durationSec)}
         </TraceDescription>
       )}
     </TraceLine>
@@ -534,7 +504,6 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
         running={running}
         exitCode={step.exitCode}
         failed={failed}
-        durationSec={step.durationSec}
       />
     );
   }
@@ -545,11 +514,6 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
       return <StackTraceRow parsed={parsedStack} />;
     }
   }
-
-  const durationBadge =
-    !running && step.durationSec !== undefined && step.durationSec >= 0.05 ? (
-      <TraceDescription>· {formatDurationSec(step.durationSec)}</TraceDescription>
-    ) : null;
 
   const titlePrefix = running
     ? "Running"
@@ -576,7 +540,6 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
               <FileTextIcon />
             </TraceIcon>
             <TraceTitle>{formattedTitle}</TraceTitle>
-            {durationBadge}
             <TraceIcon>
               <ChevronRightIcon />
             </TraceIcon>
@@ -616,7 +579,6 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
           <TerminalIcon />
         </TraceIcon>
         <TraceTitle>{formattedTitle}</TraceTitle>
-        {durationBadge}
       </TraceLine>
     );
   }
@@ -629,7 +591,6 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
             <TerminalIcon />
           </TraceIcon>
           <TraceTitle>{formattedTitle}</TraceTitle>
-          {durationBadge}
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="flex flex-col gap-2">

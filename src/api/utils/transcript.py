@@ -46,7 +46,10 @@ _BG_AGENT_DIRECTIVE_RE = re.compile(
     r"\n*YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:.*",
     re.DOTALL,
 )
-_SYSTEM_MSG_BLOCK_RE = re.compile(r"<SYSTEM_MESSAGE>\s*(.*?)\s*</SYSTEM_MESSAGE>", re.DOTALL)
+_SYSTEM_MSG_BLOCK_RE = re.compile(
+    r"(?:^|\n)<SYSTEM_MESSAGE>[ \t]*\r?\n(.*?)\r?\n</SYSTEM_MESSAGE>",
+    re.DOTALL,
+)
 _TASK_RESULT_RE = re.compile(
     r"\A\[Message\]\s*timestamp=(\S+)\s+sender=\S+\s+priority=\S+\s+"
     r'content=Task id "([^"]+)" (finished|was canceled|failed) with result:\n?(.*)',
@@ -284,6 +287,8 @@ def _extract_background_launch(
 ) -> tuple[str, str, str | None] | None:
     """Return ``(task_id, preview_body, started_at)`` when ``raw_content`` launches a task."""
     normalized = raw_content.replace("\r\n", "\n")
+    if "\nTask Description: Cron:" in normalized:
+        return None
     body = _strip_timestamp_headers(normalized)
     match = _BG_TASK_ID_RE.match(body)
     if match is None:
@@ -398,6 +403,11 @@ def _backfill_planner_duration(
     return batch.model_copy(update={"duration_updated": True})
 
 
+def _opt_iso_str(raw: object) -> str | None:
+    """Return stripped non-empty timestamp string when ``raw`` is a ``str``."""
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
 def _append_planner_upserts(
     step_index: int,
     record: Mapping[str, Any],
@@ -405,6 +415,7 @@ def _append_planner_upserts(
     duration_sec: float | None,
 ) -> tuple[TranscriptToolBatchState | None, bool]:
     """Emit thought, reply, and pending tool upserts for one ``PLANNER_RESPONSE`` step."""
+    raw_created = _opt_iso_str(record.get("created_at"))
     thinking = record.get("thinking")
     planner_item_id: str | None = None
     planner_role: Literal["thought", "agent"] | None = None
@@ -417,6 +428,7 @@ def _append_planner_upserts(
                 role=ChatItemRole.THOUGHT,
                 text=thinking,
                 duration_sec=duration_sec,
+                created_at=raw_created,
                 merge_mode="replace",
             )
         )
@@ -433,6 +445,7 @@ def _append_planner_upserts(
                 role=ChatItemRole.AGENT,
                 text=content,
                 duration_sec=duration_sec if planner_role == "agent" else None,
+                created_at=raw_created,
                 merge_mode="replace",
             )
         )
@@ -446,6 +459,7 @@ def _append_planner_upserts(
                 item_id=f"tf:{step_index}:tool:{idx}",
                 role=ChatItemRole.TOOL,
                 text="",
+                created_at=raw_created,
                 merge_mode="replace",
                 tool_kind=tool_kind,
                 tool_title=tool_title,
@@ -456,26 +470,57 @@ def _append_planner_upserts(
     if not tool_calls:
         return None, str(record.get("status") or "").upper() == "RUNNING"
 
-    raw_created = record.get("created_at")
     batch = TranscriptToolBatchState(
         planner_step=step_index,
         next_tool_idx=0,
         total_tools=len(tool_calls),
         planner_item_id=planner_item_id,
         planner_role=planner_role,
-        planner_created_at=str(raw_created) if isinstance(raw_created, str) else None,
+        planner_created_at=raw_created,
         duration_updated=duration_sec is not None,
     )
     return batch, True
 
 
-def _resolve_generic_tool_status(raw_status: str, exit_code: int | None) -> str:
+def _resolve_generic_tool_status(
+    raw_status: str,
+    exit_code: int | None,
+    *,
+    is_cron: bool = False,
+) -> str:
     """Map raw ``MODEL/GENERIC`` step status and exit code onto UI tool status."""
-    if raw_status == "RUNNING":
+    if raw_status == "RUNNING" and not is_cron:
         return "running"
     if raw_status == "ERROR" or (exit_code is not None and exit_code != 0):
         return "error"
     return "done"
+
+
+def _record_background_launch(
+    item_id: str,
+    bg_launch: tuple[str, str, str | None],
+    tasks_map: dict[str, TranscriptBackgroundTask],
+    upserts: list[ChatTimelineItemUpsert],
+) -> None:
+    """Track an in-flight background command and emit its running preview upsert."""
+    task_id, preview_body, started_at = bg_launch
+    tasks_map[task_id] = TranscriptBackgroundTask(
+        task_id=task_id,
+        item_id=item_id,
+        started_at=started_at,
+    )
+    upserts.append(
+        ChatTimelineItemUpsert(
+            item_id=item_id,
+            role=ChatItemRole.TOOL,
+            text=preview_body,
+            duration_sec=None,
+            created_at=started_at,
+            merge_mode="replace",
+            tool_status="running",
+            exit_code=None,
+        )
+    )
 
 
 def _apply_generic_step(
@@ -487,8 +532,7 @@ def _apply_generic_step(
     """Pair one ``MODEL/GENERIC`` step onto the next pending tool item in ``batch``."""
     updated_batch = _backfill_planner_duration(upserts, batch, record.get("created_at"))
     assert updated_batch is not None
-    tool_idx = updated_batch.next_tool_idx
-    item_id = f"tf:{updated_batch.planner_step}:tool:{tool_idx}"
+    item_id = f"tf:{updated_batch.planner_step}:tool:{updated_batch.next_tool_idx}"
     raw_content = str(record.get("content") or "")
     raw_status = str(record.get("status") or "DONE").upper()
     bg_launch = (
@@ -497,25 +541,12 @@ def _apply_generic_step(
         else None
     )
     if bg_launch is not None:
-        task_id, preview_body, started_at = bg_launch
-        tasks_map[task_id] = TranscriptBackgroundTask(
-            task_id=task_id,
-            item_id=item_id,
-            started_at=started_at,
+        _record_background_launch(item_id, bg_launch, tasks_map, upserts)
+        return updated_batch.model_copy(
+            update={"next_tool_idx": updated_batch.next_tool_idx + 1}
         )
-        upserts.append(
-            ChatTimelineItemUpsert(
-                item_id=item_id,
-                role=ChatItemRole.TOOL,
-                text=preview_body,
-                duration_sec=None,
-                merge_mode="replace",
-                tool_status="running",
-                exit_code=None,
-            )
-        )
-        return updated_batch.model_copy(update={"next_tool_idx": tool_idx + 1})
 
+    is_cron = "\nTask Description: Cron:" in raw_content.replace("\r\n", "\n")
     body, duration_sec, exit_code = clean_generic_tool_output(raw_content)
     upserts.append(
         ChatTimelineItemUpsert(
@@ -523,22 +554,43 @@ def _apply_generic_step(
             role=ChatItemRole.TOOL,
             text=body,
             duration_sec=duration_sec,
+            created_at=_opt_iso_str(record.get("created_at")),
             merge_mode="replace",
-            tool_status=_resolve_generic_tool_status(raw_status, exit_code),
+            tool_status=_resolve_generic_tool_status(raw_status, exit_code, is_cron=is_cron),
             exit_code=exit_code,
         )
     )
-    return updated_batch.model_copy(update={"next_tool_idx": tool_idx + 1})
+    return updated_batch.model_copy(update={"next_tool_idx": updated_batch.next_tool_idx + 1})
 
 
-def _parse_task_completion_message(raw_content: str) -> tuple[str, str, str, str] | None:
-    """Extract ``(msg_ts, task_id, outcome, raw_result)`` from background task notices."""
-    block_match = _SYSTEM_MSG_BLOCK_RE.search(raw_content)
-    inner = block_match.group(1) if block_match is not None else raw_content.strip()
+def _iter_system_message_blocks(raw_content: str) -> tuple[str, ...]:
+    """Extract all standalone ``<SYSTEM_MESSAGE>`` block bodies, or raw stripped text."""
+    blocks = tuple(
+        match.group(1).strip()
+        for match in _SYSTEM_MSG_BLOCK_RE.finditer(raw_content)
+        if match.group(1).strip()
+    )
+    if blocks:
+        return blocks
+    stripped = raw_content.strip()
+    return (stripped,) if stripped else ()
+
+
+def _match_task_completion_block(inner: str) -> tuple[str, str, str, str] | None:
+    """Match a single unwrapped ``<SYSTEM_MESSAGE>`` body against background task results."""
     matched = _TASK_RESULT_RE.match(inner)
     if matched is None:
         return None
     return (matched.group(1), matched.group(2), matched.group(3), matched.group(4))
+
+
+def _parse_task_completion_message(raw_content: str) -> tuple[str, str, str, str] | None:
+    """Extract ``(msg_ts, task_id, outcome, raw_result)`` from background task notices."""
+    for inner in _iter_system_message_blocks(raw_content):
+        parsed = _match_task_completion_block(inner)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _build_task_completion_upsert(
@@ -562,6 +614,7 @@ def _build_task_completion_upsert(
         role=ChatItemRole.TOOL,
         text=_truncate_tool_text(cleaned),
         duration_sec=duration_sec,
+        created_at=_opt_iso_str(fallback_ts) or msg_ts,
         merge_mode="replace",
         tool_status=tool_status,
         exit_code=exit_code,
@@ -590,6 +643,32 @@ def _stop_restarted_tasks(
     tasks_map.clear()
 
 
+def _apply_one_system_block(
+    inner: str,
+    created_at: object,
+    allow_incremental_reset: bool,
+    tasks_map: dict[str, TranscriptBackgroundTask],
+    upserts: list[ChatTimelineItemUpsert],
+) -> tuple[bool | None, bool]:
+    """Process one unwrapped ``<SYSTEM_MESSAGE>`` block; return ``(next_active, needs_reset)``."""
+    parsed_msg = _match_task_completion_block(inner)
+    if parsed_msg is not None:
+        task = tasks_map.pop(parsed_msg[1], None)
+        if task is None:
+            return None, allow_incremental_reset
+        upserts.append(_build_task_completion_upsert(task, parsed_msg, created_at))
+        return True, False
+
+    if (
+        inner.startswith("[Message]")
+        and "All your subagents and background tasks have been stopped" in inner
+        and tasks_map
+    ):
+        _stop_restarted_tasks(tasks_map, upserts, created_at)
+        return False, False
+    return None, False
+
+
 def _apply_system_message_step(
     entry: Mapping[str, Any],
     allow_incremental_reset: bool,
@@ -599,39 +678,38 @@ def _apply_system_message_step(
 ) -> tuple[bool, bool]:
     """Resolve background task completion or restart notices from ``SYSTEM_MESSAGE`` entries."""
     raw_content = str(entry.get("content") or "")
-    parsed_msg = _parse_task_completion_message(raw_content)
-    if parsed_msg is not None:
-        task = tasks_map.pop(parsed_msg[1], None)
-        if task is None:
-            return active, allow_incremental_reset
-        upserts.append(_build_task_completion_upsert(task, parsed_msg, entry.get("created_at")))
-        return True, False
-
-    block_match = _SYSTEM_MSG_BLOCK_RE.search(raw_content)
-    inner = block_match.group(1) if block_match is not None else raw_content.strip()
-    if (
-        inner.startswith("[Message]")
-        and "All your subagents and background tasks have been stopped" in inner
-        and tasks_map
-    ):
-        _stop_restarted_tasks(tasks_map, upserts, entry.get("created_at"))
-        return False, False
-    return active, False
+    created_at = entry.get("created_at")
+    current_active = active
+    for inner in _iter_system_message_blocks(raw_content):
+        block_active, needs_reset = _apply_one_system_block(
+            inner,
+            created_at,
+            allow_incremental_reset,
+            tasks_map,
+            upserts,
+        )
+        if needs_reset:
+            return current_active, True
+        if block_active is not None:
+            current_active = block_active
+    return current_active, False
 
 
 def _planner_duration_hint(
     idx: int,
     entries: Sequence[Mapping[str, Any]],
 ) -> float | None:
-    """Compute exact ``PLANNER_RESPONSE`` duration when its following step is present."""
-    if idx + 1 >= len(entries):
-        return None
-    next_entry = entries[idx + 1]
-    if next_entry.get("type") == "USER_INPUT":
-        return None
+    """Compute bounded ``PLANNER_RESPONSE`` duration from adjacent step timestamps."""
     start_ts = _parse_iso_timestamp(entries[idx].get("created_at"))
-    end_ts = _parse_iso_timestamp(next_entry.get("created_at"))
-    return _round_elapsed_seconds(start_ts, end_ts)
+    if idx + 1 < len(entries):
+        next_entry = entries[idx + 1]
+        if next_entry.get("type") != "USER_INPUT":
+            end_ts = _parse_iso_timestamp(next_entry.get("created_at"))
+            return _round_elapsed_seconds(start_ts, end_ts)
+    if idx > 0 and entries[idx - 1].get("type") == "USER_INPUT":
+        prev_ts = _parse_iso_timestamp(entries[idx - 1].get("created_at"))
+        return _round_elapsed_seconds(prev_ts, start_ts)
+    return None
 
 
 def _apply_user_step(
@@ -641,6 +719,7 @@ def _apply_user_step(
     turn_started_at: str | None,
 ) -> tuple[TranscriptToolBatchState | None, bool, str | None]:
     """Handle one ``USER_EXPLICIT/USER_INPUT`` transcript step."""
+    raw_ca = _opt_iso_str(entry.get("created_at"))
     prompt_text = extract_user_request_text(str(entry.get("content") or ""))
     if prompt_text:
         upserts.append(
@@ -648,12 +727,11 @@ def _apply_user_step(
                 item_id=f"tf:{step_index}:user",
                 role=ChatItemRole.USER,
                 text=prompt_text,
+                created_at=raw_ca,
                 merge_mode="replace",
             )
         )
-    raw_ca = entry.get("created_at")
-    next_started = raw_ca if isinstance(raw_ca, str) else turn_started_at
-    return None, True, next_started
+    return None, True, raw_ca or turn_started_at
 
 
 def _apply_error_step(
@@ -688,16 +766,18 @@ def _handle_model_entry(
     ],
 ) -> tuple[TranscriptToolBatchState | None, bool, str | None, bool]:
     """Handle one ``MODEL/PLANNER_RESPONSE`` or ``MODEL/GENERIC`` transcript entry."""
-    step_index, allow_incremental_reset = context
     batch, active, started_at, upserts, tasks_map = state
-    step_type = str(entries[idx].get("type") or "")
-    if step_type == "PLANNER_RESPONSE":
-        dur = _planner_duration_hint(idx, entries)
-        next_batch, next_active = _append_planner_upserts(step_index, entries[idx], upserts, dur)
-        effective_active = next_active or bool(tasks_map) if next_batch is None else next_active
-        return (next_batch, effective_active, started_at, False)
+    if str(entries[idx].get("type") or "") == "PLANNER_RESPONSE":
+        next_batch, next_active = _append_planner_upserts(
+            context[0],
+            entries[idx],
+            upserts,
+            _planner_duration_hint(idx, entries),
+        )
+        effective = next_active or bool(tasks_map) if next_batch is None else next_active
+        return (next_batch, effective, started_at if effective else None, False)
     if batch is None or batch.next_tool_idx >= batch.total_tools:
-        return (batch, active, started_at, allow_incremental_reset)
+        return (batch, active, started_at, context[1])
     return (_apply_generic_step(entries[idx], batch, tasks_map, upserts), True, started_at, False)
 
 
@@ -721,18 +801,17 @@ def _process_transcript_entry(
     result = (batch, active, started_at, False)
 
     if source == "USER_EXPLICIT" and step_type == "USER_INPUT":
-        user_res = _apply_user_step(context[0], entry, upserts, started_at)
-        result = (*user_res, False)
+        result = (*_apply_user_step(context[0], entry, upserts, started_at), False)
     elif source == "MODEL" and step_type in ("PLANNER_RESPONSE", "GENERIC"):
         result = _handle_model_entry(idx, entries, context, state)
     elif step_type == "ERROR_MESSAGE":
-        err_res = _apply_error_step(context[0], entry, upserts)
-        result = (*err_res, started_at, False)
+        tasks_map.clear()
+        result = (*_apply_error_step(context[0], entry, upserts), None, False)
     elif step_type == "SYSTEM_MESSAGE":
         sys_res = _apply_system_message_step(entry, context[1], tasks_map, upserts, active)
-        result = (batch, sys_res[0], started_at, sys_res[1])
+        result = (batch, sys_res[0], started_at if sys_res[0] else None, sys_res[1])
     elif step_type == "CHECKPOINT":
-        result = (None, bool(tasks_map), started_at, False)
+        result = (None, bool(tasks_map), started_at if tasks_map else None, False)
     return result
 
 

@@ -207,6 +207,35 @@ function renderAssistantBlocks({
   return nodes;
 }
 
+function isTurnShowingThinkingIndicator({
+  blocks,
+  isLastTurn,
+  liveTurnActive,
+  isLiveThinking,
+  liveItemIds,
+}: {
+  blocks: AssistantTurnBlock[];
+  isLastTurn: boolean;
+  liveTurnActive: boolean;
+  isLiveThinking: boolean;
+  liveItemIds: ReadonlySet<string>;
+}): boolean {
+  if (!isLastTurn) {
+    return false;
+  }
+  if (blocks.length === 0) {
+    return isLiveThinking || liveTurnActive;
+  }
+  const lastBlock = blocks[blocks.length - 1]!;
+  if (lastBlock.kind === "thought_group") {
+    const isStreamingThought = lastBlock.thoughts.some((item) =>
+      liveItemIds.has(item.id),
+    );
+    return isLiveThinking || (liveTurnActive && isStreamingThought);
+  }
+  return isLiveThinking;
+}
+
 const EMPTY_LIVE_ITEM_IDS: ReadonlySet<string> = new Set();
 
 export interface SessionChatProps {
@@ -397,6 +426,13 @@ function SessionTimelineScroller({
               const isLastTurn = turnIdx === turns.length - 1;
               const isTurnActive =
                 isLastTurn && (liveTurnActive || isLiveThinking);
+              const showingThinking = isTurnShowingThinkingIndicator({
+                blocks: turn.blocks,
+                isLastTurn,
+                liveTurnActive,
+                isLiveThinking,
+                liveItemIds,
+              });
               const orderedNodes = renderAssistantBlocks({
                 blocks: turn.blocks,
                 isLastTurn,
@@ -431,6 +467,7 @@ function SessionTimelineScroller({
                           startedAtMs={
                             isTurnActive ? liveTurnStartedAtMs : null
                           }
+                          hideStatusIndicator={showingThinking}
                         />
                       </MessageContent>
                     </Message>
@@ -452,11 +489,6 @@ function SessionTimelineScroller({
                         startedAtMs={liveTurnStartedAtMs}
                       />
                     </Trace>
-                    <AssistantMessageFooter
-                      text=""
-                      streaming
-                      startedAtMs={liveTurnStartedAtMs}
-                    />
                   </MessageContent>
                 </Message>
               </MessageScrollerItem>

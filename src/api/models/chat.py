@@ -101,6 +101,7 @@ class TranscriptSessionSyncState(FrozenModel):
     pending_batch: TranscriptToolBatchState | None = None
     pending_tasks: tuple[TranscriptBackgroundTask, ...] = ()
     turn_started_at: str | None = None
+    turn_active: bool = False
 
 
 class TranscriptParseResult(FrozenModel):
