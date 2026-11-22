@@ -86,6 +86,9 @@ interface AcpSessionsPanelProps {
   loadingMessages: boolean;
   loadingOlderMessages: boolean;
   isLiveThinking: boolean;
+  liveTurnActive: boolean;
+  liveTurnStartedAtMs: number | null;
+  liveItemIds: ReadonlySet<string>;
   totalMessageItems: number;
   onLoadOlderMessages: () => Promise<void>;
   sessionModels: AcpModelsState | null;
@@ -153,6 +156,9 @@ export function AcpSessionsPanel({
   loadingMessages,
   loadingOlderMessages,
   isLiveThinking,
+  liveTurnActive,
+  liveTurnStartedAtMs,
+  liveItemIds,
   totalMessageItems,
   onLoadOlderMessages,
   sessionModels,
@@ -556,6 +562,9 @@ export function AcpSessionsPanel({
             loadingMessages={loadingMessages}
             loadingOlderMessages={loadingOlderMessages}
             isLiveThinking={isLiveThinking}
+            liveTurnActive={liveTurnActive}
+            liveTurnStartedAtMs={liveTurnStartedAtMs}
+            liveItemIds={liveItemIds}
             onLoadOlderMessages={onLoadOlderMessages}
             sessionModels={sessionModels}
             sessionModes={sessionModes}

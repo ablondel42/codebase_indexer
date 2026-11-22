@@ -33,9 +33,15 @@ from api.models.acp import (
     SessionStepOutcome,
 )
 from api.models.chat import (
+    ChatSyncEventKind,
+    ChatSyncNotificationParams,
     SessionChatMessageItem,
     SessionChatMessagesResponse,
     SessionChatPlanStep,
+    TranscriptBackgroundTask,
+    TranscriptParseResult,
+    TranscriptSessionSyncState,
+    TranscriptToolBatchState,
 )
 from api.models.config import (
     DEFAULT_AGY_APP_DATA_DIR,
@@ -120,6 +126,8 @@ __all__ = [
     "BlobResourceContents",
     "CancelRequestParams",
     "CancelledPermissionOutcome",
+    "ChatSyncEventKind",
+    "ChatSyncNotificationParams",
     "ClientAuthCapabilities",
     "ClientCapabilities",
     "ClientFsCapabilities",
@@ -190,4 +198,8 @@ __all__ = [
     "SystemPromptTextBlock",
     "TextContentBlock",
     "TextResourceContents",
+    "TranscriptBackgroundTask",
+    "TranscriptParseResult",
+    "TranscriptSessionSyncState",
+    "TranscriptToolBatchState",
 ]

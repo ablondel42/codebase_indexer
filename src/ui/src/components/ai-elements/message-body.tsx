@@ -2,6 +2,7 @@ import * as React from "react";
 import {
   ArrowUpRightIcon,
   CheckIcon,
+  ClockIcon,
   CopyIcon,
   GlobeIcon,
   ThumbsDownIcon,
@@ -9,6 +10,10 @@ import {
 } from "lucide-react";
 
 import { useHighlightedCode } from "@/hooks/use-highlighted-code";
+import {
+  useLiveElapsedSeconds,
+  useStreamingText,
+} from "@/hooks/use-streaming-text";
 import { Button } from "@/components/ui/button";
 import {
   CodeBlock,
@@ -41,6 +46,7 @@ import {
 } from "@/components/ui/trace";
 import {
   extractHostname,
+  formatDurationSec,
   splitMessageSegments,
 } from "@/lib/acp/turn-grouping";
 import type { AcpSourceItem } from "@/lib/acp/types";
@@ -123,38 +129,78 @@ function renderInlineCodeText(paragraph: string): React.ReactNode[] {
   });
 }
 
-export function SessionMessageBody({ text }: { text: string }) {
-  const segments = React.useMemo(() => splitMessageSegments(text), [text]);
+export function SessionMessageBody({
+  text,
+  streaming = false,
+}: {
+  text: string;
+  streaming?: boolean;
+}) {
+  const { displayedText, isStreaming } = useStreamingText(text, streaming);
+  const segments = React.useMemo(
+    () => splitMessageSegments(displayedText),
+    [displayedText],
+  );
 
   if (segments.length === 0) {
-    return null;
+    if (!streaming) {
+      return null;
+    }
+    return (
+      <div className="flex min-w-0 items-center text-sm leading-relaxed">
+        <span
+          aria-hidden="true"
+          className="inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80"
+        />
+      </div>
+    );
   }
 
   return (
     <div className="flex min-w-0 flex-col gap-3 text-sm leading-relaxed">
       {segments.map((segment, idx) => {
+        const isLastSegment = idx === segments.length - 1;
         if (segment.kind === "code") {
           return (
-            <HighlightedCodeFence
-              key={idx}
-              code={segment.code}
-              language={segment.language}
-              incomplete={segment.incomplete}
-            />
+            <React.Fragment key={idx}>
+              <HighlightedCodeFence
+                code={segment.code}
+                language={segment.language}
+                incomplete={segment.incomplete}
+              />
+              {isStreaming && isLastSegment && (
+                <span
+                  aria-hidden="true"
+                  className="inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80"
+                />
+              )}
+            </React.Fragment>
           );
         }
 
         const paragraphs = segment.text.split(/\n{2,}/);
         return (
           <div key={idx} className="flex flex-col gap-2">
-            {paragraphs.map((para, pIdx) => (
-              <p
-                key={pIdx}
-                className="whitespace-pre-wrap wrap-break-word text-foreground"
-              >
-                {renderInlineCodeText(para)}
-              </p>
-            ))}
+            {paragraphs.map((para, pIdx) => {
+              const showCursor =
+                isStreaming &&
+                isLastSegment &&
+                pIdx === paragraphs.length - 1;
+              return (
+                <p
+                  key={pIdx}
+                  className="whitespace-pre-wrap wrap-break-word text-foreground"
+                >
+                  {renderInlineCodeText(para)}
+                  {showCursor && (
+                    <span
+                      aria-hidden="true"
+                      className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-[1px] bg-primary/80 align-text-bottom"
+                    />
+                  )}
+                </p>
+              );
+            })}
             {segment.citations.length > 0 && (
               <div className="flex flex-wrap items-center gap-1.5">
                 {segment.citations.map((citation) => (
@@ -275,11 +321,23 @@ export function UserMessageFooter({ text }: { text: string }) {
   );
 }
 
-export function AssistantMessageFooter({ text }: { text: string }) {
+export function AssistantMessageFooter({
+  text,
+  durationSec,
+  streaming = false,
+  startedAtMs = null,
+}: {
+  text: string;
+  durationSec?: number;
+  streaming?: boolean;
+  startedAtMs?: number | null;
+}) {
   const [copied, setCopied] = React.useState(false);
   const [feedback, setFeedback] = React.useState<"like" | "dislike" | null>(
     null,
   );
+  const elapsed = useLiveElapsedSeconds(streaming, startedAtMs, durationSec);
+  const hasElapsed = streaming || (elapsed !== undefined && elapsed >= 0.05);
 
   React.useEffect(() => {
     if (!copied) {
@@ -289,41 +347,55 @@ export function AssistantMessageFooter({ text }: { text: string }) {
     return () => window.clearTimeout(timer);
   }, [copied]);
 
-  if (!text) {
+  if (!text && !hasElapsed) {
     return null;
   }
 
   return (
-    <MessageFooter className="px-0">
-      <MessageAction
-        label={copied ? "Copied" : "Copy"}
-        onClick={() => {
-          navigator.clipboard
-            .writeText(text)
-            .then(() => setCopied(true))
-            .catch(() => {});
-        }}
-      >
-        {copied ? <CheckIcon /> : <CopyIcon />}
-      </MessageAction>
-      <MessageAction
-        label="Good response"
-        aria-pressed={feedback === "like"}
-        onClick={() => setFeedback(feedback === "like" ? null : "like")}
-      >
-        <ThumbsUpIcon
-          className={feedback === "like" ? "fill-current" : undefined}
-        />
-      </MessageAction>
-      <MessageAction
-        label="Bad response"
-        aria-pressed={feedback === "dislike"}
-        onClick={() => setFeedback(feedback === "dislike" ? null : "dislike")}
-      >
-        <ThumbsDownIcon
-          className={feedback === "dislike" ? "fill-current" : undefined}
-        />
-      </MessageAction>
+    <MessageFooter className="w-full items-center px-0">
+      {text && (
+        <>
+          <MessageAction
+            label={copied ? "Copied" : "Copy"}
+            onClick={() => {
+              navigator.clipboard
+                .writeText(text)
+                .then(() => setCopied(true))
+                .catch(() => {});
+            }}
+          >
+            {copied ? <CheckIcon /> : <CopyIcon />}
+          </MessageAction>
+          <MessageAction
+            label="Good response"
+            aria-pressed={feedback === "like"}
+            onClick={() => setFeedback(feedback === "like" ? null : "like")}
+          >
+            <ThumbsUpIcon
+              className={feedback === "like" ? "fill-current" : undefined}
+            />
+          </MessageAction>
+          <MessageAction
+            label="Bad response"
+            aria-pressed={feedback === "dislike"}
+            onClick={() =>
+              setFeedback(feedback === "dislike" ? null : "dislike")
+            }
+          >
+            <ThumbsDownIcon
+              className={feedback === "dislike" ? "fill-current" : undefined}
+            />
+          </MessageAction>
+        </>
+      )}
+      {hasElapsed && (
+        <span className="ml-auto inline-flex items-center gap-1 font-mono text-[11px] text-muted-foreground/80 tabular-nums">
+          <ClockIcon className="size-3" />
+          {streaming
+            ? `Streaming · ${formatDurationSec(elapsed ?? 0.1)}`
+            : formatDurationSec(elapsed ?? 0)}
+        </span>
+      )}
     </MessageFooter>
   );
 }

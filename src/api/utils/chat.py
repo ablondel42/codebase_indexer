@@ -1,7 +1,7 @@
 """Stateless ACP-to-timeline conversion helpers for persistent session messaging."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from api.models.chat import (
@@ -315,6 +315,8 @@ def _item_to_wire(item: ChatTimelineItem) -> SessionChatMessageItem:
         turnIndex=item.turn_index,
         role=item.role.value,
         text=item.text,
+        durationSec=item.duration_sec,
+        createdAt=item.created_at,
         toolKind=item.tool_kind,
         toolTitle=item.tool_title,
         toolStatus=item.tool_status,
@@ -327,12 +329,17 @@ def _item_to_wire(item: ChatTimelineItem) -> SessionChatMessageItem:
     )
 
 
+def items_to_wire(items: Sequence[ChatTimelineItem]) -> tuple[SessionChatMessageItem, ...]:
+    """Convert a sequence of domain ``ChatTimelineItem`` records to wire items."""
+    return tuple(_item_to_wire(item) for item in items)
+
+
 def history_page_to_wire(page: ChatHistoryPage) -> SessionChatMessagesResponse:
     """Convert a domain ``ChatHistoryPage`` into ``SessionChatMessagesResponse``."""
     return SessionChatMessagesResponse(
         sessionId=page.session_id,
         hydrated=page.hydrated,
-        items=tuple(_item_to_wire(item) for item in page.items),
+        items=items_to_wire(page.items),
         hasMore=page.has_more,
         nextBeforeTurn=page.next_before_turn,
         totalTurns=page.total_turns,
@@ -368,6 +375,7 @@ __all__ = [
     "extract_tool_locations",
     "extract_tool_text",
     "history_page_to_wire",
+    "items_to_wire",
     "map_raw_tool_status",
     "parse_plan_steps",
 ]

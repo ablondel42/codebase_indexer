@@ -16,14 +16,46 @@ import {
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import type { ThoughtStep } from "@/lib/acp/turn-grouping";
+import {
+  useLiveElapsedSeconds,
+  useStreamingText,
+} from "@/hooks/use-streaming-text";
+import {
+  formatDurationSec,
+  type ThoughtStep,
+} from "@/lib/acp/turn-grouping";
+
+function StreamingThoughtText({
+  text,
+  streaming,
+}: {
+  text: string;
+  streaming: boolean;
+}) {
+  const { displayedText, isStreaming } = useStreamingText(text, streaming);
+  return (
+    <p className="min-w-0 whitespace-pre-wrap">
+      {displayedText}
+      {isStreaming && (
+        <span
+          aria-hidden="true"
+          className="ml-0.5 inline-block h-3 w-1 animate-pulse rounded-[1px] bg-primary/70 align-text-bottom"
+        />
+      )}
+    </p>
+  );
+}
 
 export function ReasoningGroup({
   thoughts,
   running = false,
+  startedAtMs = null,
+  streaming = false,
 }: {
   thoughts: ThoughtStep[];
   running?: boolean;
+  startedAtMs?: number | null;
+  streaming?: boolean;
 }) {
   const [open, setOpen] = React.useState<boolean>();
   const totalDuration = React.useMemo(() => {
@@ -33,11 +65,23 @@ export function ReasoningGroup({
     );
     return sum > 0 ? sum : undefined;
   }, [thoughts]);
+  const elapsed = useLiveElapsedSeconds(running, startedAtMs, totalDuration);
 
-  const stepLabel =
-    thoughts.length >= 2 ? `${thoughts.length} steps` : undefined;
-  const durationLabel =
-    !running && totalDuration !== undefined ? `${totalDuration}s` : undefined;
+  const singleSettled = !running && thoughts.length === 1;
+  const titleText = singleSettled
+    ? elapsed !== undefined && elapsed >= 0.05
+      ? `Thought for ${formatDurationSec(elapsed)}`
+      : "Thought"
+    : running
+      ? "Thinking"
+      : "Thought";
+
+  const stepLabel = thoughts.length >= 2 ? `${thoughts.length} steps` : undefined;
+  const durationLabel = singleSettled
+    ? undefined
+    : elapsed !== undefined && (running || elapsed >= 0.05)
+      ? formatDurationSec(elapsed)
+      : undefined;
   const description = [stepLabel, durationLabel].filter(Boolean).join(" · ");
 
   const line = (
@@ -49,7 +93,7 @@ export function ReasoningGroup({
           <CircleCheckIcon />
         )}
       </TraceIcon>
-      <TraceTitle>{running ? "Thinking" : "Thought"}</TraceTitle>
+      <TraceTitle>{titleText}</TraceTitle>
       {description && <TraceDescription>· {description}</TraceDescription>}
     </TraceLine>
   );
@@ -63,7 +107,12 @@ export function ReasoningGroup({
       <TraceCollapsibleTrigger>{line}</TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="max-h-80 overflow-y-auto overscroll-contain pr-2">
         {thoughts.length === 1 ? (
-          <p className="whitespace-pre-wrap text-xs">{thoughts[0]!.text}</p>
+          <div className="text-xs">
+            <StreamingThoughtText
+              text={thoughts[0]!.text}
+              streaming={streaming}
+            />
+          </div>
         ) : (
           <ol className="flex flex-col divide-y divide-border/40 text-xs">
             {thoughts.map((item, idx) => (
@@ -74,7 +123,10 @@ export function ReasoningGroup({
                 <span className="shrink-0 font-mono text-[10px] leading-relaxed text-muted-foreground/60 tabular-nums select-none">
                   {idx + 1}.
                 </span>
-                <p className="min-w-0 whitespace-pre-wrap">{item.text}</p>
+                <StreamingThoughtText
+                  text={item.text}
+                  streaming={streaming && idx === thoughts.length - 1}
+                />
               </li>
             ))}
           </ol>

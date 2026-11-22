@@ -27,11 +27,16 @@ import {
   TraceCollapsible,
   TraceCollapsibleContent,
   TraceCollapsibleTrigger,
+  TraceDescription,
   TraceIcon,
   TraceLine,
   TraceTitle,
 } from "@/components/ui/trace";
-import { parseStackTrace, type ParsedStackTrace } from "@/lib/acp/turn-grouping";
+import {
+  formatDurationSec,
+  parseStackTrace,
+  type ParsedStackTrace,
+} from "@/lib/acp/turn-grouping";
 import type {
   AcpReplayedMessage,
   AcpTestCaseResult,
@@ -226,12 +231,14 @@ export function TerminalRow({
   running = false,
   exitCode,
   failed = false,
+  durationSec,
 }: {
   command: string;
   output: string;
   running?: boolean;
   exitCode?: number | null;
   failed?: boolean;
+  durationSec?: number;
 }) {
   const [open, setOpen] = React.useState<boolean>();
   const isError =
@@ -243,6 +250,10 @@ export function TerminalRow({
       : isError
         ? `Failed to run ${command}`
         : `Ran ${command}`;
+  const durationBadge =
+    !running && durationSec !== undefined && durationSec >= 0.05 ? (
+      <TraceDescription>· {formatDurationSec(durationSec)}</TraceDescription>
+    ) : null;
 
   if (!output.trim()) {
     return (
@@ -251,6 +262,7 @@ export function TerminalRow({
           <TerminalIcon />
         </TraceIcon>
         <TraceTitle>{title}</TraceTitle>
+        {durationBadge}
       </TraceLine>
     );
   }
@@ -266,6 +278,7 @@ export function TerminalRow({
             <TerminalIcon />
           </TraceIcon>
           <TraceTitle>{title}</TraceTitle>
+          {durationBadge}
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent>
@@ -321,9 +334,15 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
         running={running}
         exitCode={step.exitCode}
         failed={failed}
+        durationSec={step.durationSec}
       />
     );
   }
+
+  const durationBadge =
+    !running && step.durationSec !== undefined && step.durationSec >= 0.05 ? (
+      <TraceDescription>· {formatDurationSec(step.durationSec)}</TraceDescription>
+    ) : null;
 
   const titlePrefix = running
     ? "Running"
@@ -348,6 +367,7 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
               <FileTextIcon />
             </TraceIcon>
             <TraceTitle>{formattedTitle}</TraceTitle>
+            {durationBadge}
             <TraceIcon>
               <ChevronRightIcon />
             </TraceIcon>
@@ -387,6 +407,7 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
           <TerminalIcon />
         </TraceIcon>
         <TraceTitle>{formattedTitle}</TraceTitle>
+        {durationBadge}
       </TraceLine>
     );
   }
@@ -399,6 +420,7 @@ export function ToolRow({ step }: { step: AcpReplayedMessage }) {
             <TerminalIcon />
           </TraceIcon>
           <TraceTitle>{formattedTitle}</TraceTitle>
+          {durationBadge}
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="flex flex-col gap-2">

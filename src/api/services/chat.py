@@ -1,6 +1,7 @@
 """Real-time chat recorder and silent hydration coordinator for ACP connections."""
 
 import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -43,6 +44,8 @@ class SessionChatRecorder:
         self._auto_stream_state: dict[str, tuple[str, str]] = {}
         self._active_plan_ids: dict[str, str] = {}
         self._pending_user_echo: dict[str, str] = {}
+        self._item_started_at: dict[tuple[str, str], float] = {}
+        self._active_item_by_session: dict[str, tuple[str, ChatItemRole]] = {}
 
     def resolve_setup_routing(
         self,
@@ -136,6 +139,11 @@ class SessionChatRecorder:
             buffer[-1] = tail.model_copy(
                 update={
                     "text": upsert.text if upsert.text else tail.text,
+                    "duration_sec": (
+                        upsert.duration_sec
+                        if upsert.duration_sec is not None
+                        else tail.duration_sec
+                    ),
                     "tool_kind": (
                         upsert.tool_kind if upsert.tool_kind is not None else tail.tool_kind
                     ),
@@ -195,6 +203,58 @@ class SessionChatRecorder:
                 exc,
             )
 
+    @staticmethod
+    def _rounded_elapsed(start_mono: float, now_mono: float) -> float:
+        """Compute rounded positive elapsed seconds down to tenths."""
+        delta = max(0.0, now_mono - start_mono)
+        return max(0.1, round(delta, 1)) if delta >= 0.05 else 0.1
+
+    def _stamp_previous_item_duration(self, session_id: str, now_mono: float) -> None:
+        """Attach elapsed duration onto the preceding open live item before phase switch."""
+        prev = self._active_item_by_session.pop(session_id, None)
+        if prev is None:
+            return
+        prev_id, prev_role = prev
+        started = self._item_started_at.pop((session_id, prev_id), None)
+        if started is None:
+            return
+        stamp = ChatTimelineItemUpsert(
+            item_id=prev_id,
+            role=prev_role,
+            text="",
+            duration_sec=self._rounded_elapsed(started, now_mono),
+            merge_mode="replace",
+        )
+        self._enqueue_item(self._live_buffers.setdefault(session_id, []), stamp)
+
+    def _track_live_duration(
+        self,
+        session_id: str,
+        upsert: ChatTimelineItemUpsert,
+    ) -> ChatTimelineItemUpsert:
+        """Record monotonic start times and emit ``duration_sec`` on item completion."""
+        now_mono = time.monotonic()
+        if upsert.role == ChatItemRole.TOOL:
+            self._stamp_previous_item_duration(session_id, now_mono)
+            key = (session_id, upsert.item_id)
+            started = self._item_started_at.setdefault(key, now_mono)
+            if upsert.tool_status in ("done", "error", "denied"):
+                self._item_started_at.pop(key, None)
+                return upsert.model_copy(
+                    update={"duration_sec": self._rounded_elapsed(started, now_mono)}
+                )
+            return upsert
+
+        if upsert.role in (ChatItemRole.THOUGHT, ChatItemRole.AGENT):
+            current = self._active_item_by_session.get(session_id)
+            if current is not None and current[0] != upsert.item_id:
+                self._stamp_previous_item_duration(session_id, now_mono)
+            self._item_started_at.setdefault((session_id, upsert.item_id), now_mono)
+            self._active_item_by_session[session_id] = (upsert.item_id, upsert.role)
+        else:
+            self._stamp_previous_item_duration(session_id, now_mono)
+        return upsert
+
     def _apply_live_upsert(
         self,
         session_id: str,
@@ -209,7 +269,8 @@ class SessionChatRecorder:
         else:
             self._pending_user_echo.pop(session_id, None)
 
-        immediate = self._enqueue_item(self._live_buffers.setdefault(session_id, []), upsert)
+        timed_upsert = self._track_live_duration(session_id, upsert)
+        immediate = self._enqueue_item(self._live_buffers.setdefault(session_id, []), timed_upsert)
         self._schedule_flush(session_id, immediate=immediate)
 
     def observe_session_update(self, session_id: str, update: Mapping[str, Any]) -> bool:
@@ -231,12 +292,14 @@ class SessionChatRecorder:
                 self._apply_live_upsert(session_id, upsert)
         return suppressed_mode is None
 
-    async def flush_session(self, session_id: str) -> None:
+    async def flush_session(self, session_id: str, *, finalize_active: bool = False) -> None:
         """Synchronously persist any queued live timeline deltas for ``session_id``."""
         task = self._flush_tasks.pop(session_id, None)
         current_task = asyncio.current_task()
         if task is not None and task is not current_task and not task.done():
             task.cancel()
+        if finalize_active:
+            self._stamp_previous_item_duration(session_id, time.monotonic())
         if self._store is None:
             self._live_buffers.pop(session_id, None)
             return
@@ -279,6 +342,10 @@ class SessionChatRecorder:
         buffered = self._hydration_buffers.pop(session_id, [])
         self._auto_stream_state.pop(session_id, None)
         self._active_plan_ids.pop(session_id, None)
+        self._active_item_by_session.pop(session_id, None)
+        self._item_started_at = {
+            key: val for key, val in self._item_started_at.items() if key[0] != session_id
+        }
         if not succeeded or self._store is None:
             return raw_line
 
@@ -325,6 +392,10 @@ class SessionChatRecorder:
         self._auto_stream_state.pop(session_id, None)
         self._active_plan_ids.pop(session_id, None)
         self._pending_user_echo.pop(session_id, None)
+        self._active_item_by_session.pop(session_id, None)
+        self._item_started_at = {
+            key: val for key, val in self._item_started_at.items() if key[0] != session_id
+        }
         if self._store is None:
             return
         async with self._io_lock:

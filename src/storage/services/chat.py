@@ -7,7 +7,7 @@ from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.engine import Connection
 
 from core.models.chat import (
@@ -16,11 +16,13 @@ from core.models.chat import (
     ChatSessionRecord,
     ChatTimelineItem,
     ChatTimelineItemUpsert,
+    ChatTranscriptCursor,
 )
 from core.utils.logging import get_logger
 from storage.models.options import ConnectionOptions
 from storage.services.connection import ConnectionFactory
 from storage.utils.chat_schema import (
+    CHAT_TRANSCRIPT_PARSER_VERSION,
     advance_turn_cursor,
     build_new_chat_item,
     chat_item_to_row,
@@ -86,8 +88,46 @@ class SqlChatStore:
         finally:
             self._connection_factory.close(conn)
 
+    @staticmethod
+    def _table_columns(conn: Connection, table_name: str) -> set[str]:
+        """Return column names currently present on ``table_name``."""
+        rows = conn.execute(text(f"PRAGMA table_info({table_name})")).mappings().all()
+        return {str(row["name"]) for row in rows}
+
+    def _migrate_schema(self, conn: Connection) -> None:
+        """Apply idempotent column additions and parser-version resets on ``cbi_chat.db``."""
+        session_cols = self._table_columns(conn, "chat_sessions")
+        if "transcript_step_index" not in session_cols:
+            conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN transcript_step_index INTEGER"))
+        if "transcript_offset" not in session_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_sessions ADD COLUMN "
+                    "transcript_offset INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+        if "parser_version" not in session_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE chat_sessions ADD COLUMN "
+                    "parser_version INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+        conn.execute(
+            update(chat_sessions_table)
+            .where(chat_sessions_table.c.parser_version < CHAT_TRANSCRIPT_PARSER_VERSION)
+            .values(
+                transcript_step_index=None,
+                transcript_offset=0,
+                parser_version=CHAT_TRANSCRIPT_PARSER_VERSION,
+            )
+        )
+        item_cols = self._table_columns(conn, "chat_items")
+        if "duration_sec" not in item_cols:
+            conn.execute(text("ALTER TABLE chat_items ADD COLUMN duration_sec REAL"))
+
     def _ensure_schema(self) -> None:
-        """Create ``chat_sessions`` and ``chat_items`` tables and indexes if absent."""
+        """Create ``chat_sessions`` and ``chat_items`` tables and migrate missing columns."""
         with (
             self._lock,
             db_operation(
@@ -97,6 +137,7 @@ class SqlChatStore:
             self._open_conn() as conn,
         ):
             chat_metadata.create_all(conn)
+            self._migrate_schema(conn)
             conn.commit()
 
     @staticmethod
@@ -106,7 +147,7 @@ class SqlChatStore:
         *,
         reset_existing: bool,
         now_iso: str,
-    ) -> tuple[bool, int, int, str | None, int]:
+    ) -> tuple[bool, int, int, str | None, int, int | None, int]:
         """Ensure ``chat_sessions`` row exists and optionally clear prior items."""
         if reset_existing:
             conn.execute(
@@ -128,19 +169,26 @@ class SqlChatStore:
                     last_turn_index=0,
                     last_turn_kind=None,
                     total_items=0,
+                    transcript_step_index=None,
+                    transcript_offset=0,
+                    parser_version=CHAT_TRANSCRIPT_PARSER_VERSION,
                     updated_at=now_iso,
                 )
             )
-            return False, 0, 0, None, 0
+            return False, 0, 0, None, 0, None, 0
         if reset_existing:
-            return bool(row["hydrated"]), 0, 0, None, 0
+            return bool(row["hydrated"]), 0, 0, None, 0, None, 0
         raw_kind = row["last_turn_kind"]
+        raw_step = row["transcript_step_index"]
+        raw_offset = row["transcript_offset"]
         return (
             bool(row["hydrated"]),
             int(row["last_seq"]),
             int(row["last_turn_index"]),
             str(raw_kind) if raw_kind is not None else None,
             int(row["total_items"]),
+            int(raw_step) if raw_step is not None else None,
+            int(raw_offset) if raw_offset is not None else 0,
         )
 
     @staticmethod
@@ -173,10 +221,12 @@ class SqlChatStore:
         conn: Connection,
         session_id: str,
         cursor: tuple[bool, int, int, str | None, int],
+        transcript: tuple[int | None, int],
         updated_at: str,
     ) -> ChatSessionRecord:
-        """Persist updated counters and hydration flag to ``chat_sessions``."""
+        """Persist updated counters, transcript cursor, and hydration flag to ``chat_sessions``."""
         hydrated, last_seq, last_turn_index, last_turn_kind, total_items = cursor
+        step_index, byte_offset = transcript
         conn.execute(
             update(chat_sessions_table)
             .where(chat_sessions_table.c.session_id == session_id)
@@ -186,6 +236,9 @@ class SqlChatStore:
                 last_turn_index=last_turn_index,
                 last_turn_kind=last_turn_kind,
                 total_items=total_items,
+                transcript_step_index=step_index,
+                transcript_offset=byte_offset,
+                parser_version=CHAT_TRANSCRIPT_PARSER_VERSION,
                 updated_at=updated_at,
             )
         )
@@ -195,6 +248,8 @@ class SqlChatStore:
             last_seq=last_seq,
             last_turn_index=last_turn_index,
             total_items=total_items,
+            transcript_step_index=step_index,
+            transcript_offset=byte_offset,
             updated_at=updated_at,
         )
 
@@ -256,16 +311,26 @@ class SqlChatStore:
         existing_by_id[delta.item_id] = created
         return created, next_cursor
 
+    @staticmethod
+    def _resolve_transcript_pair(
+        state: tuple[bool, int, int, str | None, int, int | None, int],
+        transcript_cursor: ChatTranscriptCursor | None,
+    ) -> tuple[int | None, int]:
+        """Choose updated ``(step_index, byte_offset)`` preserving existing values if omitted."""
+        if transcript_cursor is not None:
+            return transcript_cursor.step_index, transcript_cursor.byte_offset
+        return state[5], state[6]
+
     def _execute_upsert_batch(
         self,
         conn: Connection,
         session_id: str,
         items: Sequence[ChatTimelineItemUpsert],
-        flags: tuple[bool, bool],
+        flags: tuple[bool, bool, ChatTranscriptCursor | None],
         now_iso: str,
     ) -> tuple[ChatTimelineItem, ...]:
         """Run one transactional batch of timeline upserts on an open connection."""
-        reset_existing, mark_hydrated = flags
+        reset_existing, mark_hydrated, transcript_cursor = flags
         state = self._load_or_init_session_state(
             conn,
             session_id,
@@ -290,10 +355,43 @@ class SqlChatStore:
             conn,
             session_id,
             (state[0] or mark_hydrated, cursor[0], cursor[1], cursor[2], cursor[3]),
+            self._resolve_transcript_pair(state, transcript_cursor),
             now_iso,
         )
         conn.commit()
         return tuple(sorted(touched.values(), key=lambda entry: entry.seq))
+
+    def _update_session_metadata(
+        self,
+        session_id: str,
+        flags: tuple[bool, bool, ChatTranscriptCursor | None],
+    ) -> ChatSessionRecord:
+        """Update session flags or transcript cursor without inserting new items."""
+        reset_existing, mark_hydrated, transcript_cursor = flags
+        now_iso = utc_now_iso()
+        with (
+            self._lock,
+            db_operation(
+                f"Failed updating metadata for chat session '{session_id}'",
+                context={"session_id": session_id},
+            ),
+            self._open_conn() as conn,
+        ):
+            state = self._load_or_init_session_state(
+                conn,
+                session_id,
+                reset_existing=reset_existing,
+                now_iso=now_iso,
+            )
+            record = self._write_session_summary(
+                conn,
+                session_id,
+                (state[0] or mark_hydrated, state[1], state[2], state[3], state[4]),
+                self._resolve_transcript_pair(state, transcript_cursor),
+                now_iso,
+            )
+            conn.commit()
+            return record
 
     def get_session(self, session_id: str) -> ChatSessionRecord | None:
         """Return persisted metadata for ``session_id``, or ``None`` if unseen."""
@@ -321,31 +419,13 @@ class SqlChatStore:
         session_id: str,
         *,
         reset_existing: bool = False,
+        transcript_cursor: ChatTranscriptCursor | None = None,
     ) -> ChatSessionRecord:
         """Mark ``session_id`` as hydrated, optionally clearing prior partial rows."""
-        now_iso = utc_now_iso()
-        with (
-            self._lock,
-            db_operation(
-                f"Failed marking chat session '{session_id}' hydrated",
-                context={"session_id": session_id},
-            ),
-            self._open_conn() as conn,
-        ):
-            state = self._load_or_init_session_state(
-                conn,
-                session_id,
-                reset_existing=reset_existing,
-                now_iso=now_iso,
-            )
-            record = self._write_session_summary(
-                conn,
-                session_id,
-                (True, state[1], state[2], state[3], state[4]),
-                now_iso,
-            )
-            conn.commit()
-            return record
+        return self._update_session_metadata(
+            session_id,
+            (reset_existing, True, transcript_cursor),
+        )
 
     def upsert_items(
         self,
@@ -354,11 +434,15 @@ class SqlChatStore:
         *,
         reset_existing: bool = False,
         mark_hydrated: bool = False,
+        transcript_cursor: ChatTranscriptCursor | None = None,
     ) -> tuple[ChatTimelineItem, ...]:
         """Atomically append or merge ``items`` for ``session_id`` and return stored rows."""
         if not items:
-            if reset_existing or mark_hydrated:
-                self.mark_session_hydrated(session_id, reset_existing=reset_existing)
+            if reset_existing or mark_hydrated or transcript_cursor is not None:
+                self._update_session_metadata(
+                    session_id,
+                    (reset_existing, mark_hydrated, transcript_cursor),
+                )
             return ()
 
         now_iso = utc_now_iso()
@@ -374,7 +458,7 @@ class SqlChatStore:
                 conn,
                 session_id,
                 items,
-                (reset_existing, mark_hydrated),
+                (reset_existing, mark_hydrated, transcript_cursor),
                 now_iso,
             )
 

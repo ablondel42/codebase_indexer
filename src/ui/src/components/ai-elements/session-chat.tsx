@@ -142,6 +142,8 @@ function renderAssistantTraceSteps(steps: AcpReplayedMessage[]) {
   return nodes;
 }
 
+const EMPTY_LIVE_ITEM_IDS: ReadonlySet<string> = new Set();
+
 export interface SessionChatProps {
   activeSessionId: string | null;
   activeSession: AcpSessionInfo | undefined;
@@ -151,6 +153,9 @@ export interface SessionChatProps {
   loadingMessages?: boolean;
   loadingOlderMessages?: boolean;
   isLiveThinking?: boolean;
+  liveTurnActive?: boolean;
+  liveTurnStartedAtMs?: number | null;
+  liveItemIds?: ReadonlySet<string>;
   onLoadOlderMessages?: () => Promise<void>;
   sessionModels?: AcpModelsState | null;
   sessionModes?: AcpModesState | null;
@@ -179,6 +184,9 @@ function SessionTimelineScroller({
   loadingMessages,
   loadingOlderMessages,
   isLiveThinking,
+  liveTurnActive,
+  liveTurnStartedAtMs,
+  liveItemIds,
   onLoadOlderMessages,
 }: {
   activeSessionMode: AcpActiveSessionMode;
@@ -187,31 +195,25 @@ function SessionTimelineScroller({
   loadingMessages: boolean;
   loadingOlderMessages: boolean;
   isLiveThinking: boolean;
+  liveTurnActive: boolean;
+  liveTurnStartedAtMs: number | null;
+  liveItemIds: ReadonlySet<string>;
   onLoadOlderMessages?: () => Promise<void>;
 }) {
-  const userTurnCount = React.useMemo(
-    () => turns.filter((turn) => turn.kind === "user").length,
-    [turns],
-  );
-  const [pausedAtUserTurnCount, setPausedAtUserTurnCount] = React.useState<
-    number | null
-  >(null);
+  const [scrollbarPaused, setScrollbarPaused] = React.useState(false);
   const lastScrollTopRef = React.useRef(0);
   const draggingScrollbarRef = React.useRef(false);
   const settledInitialRef = React.useRef(false);
 
-  const scrollbarPaused =
-    pausedAtUserTurnCount !== null && pausedAtUserTurnCount === userTurnCount;
-
   React.useEffect(() => {
-    if (turns.length === 0 || loadingMessages) {
+    if ((turns.length === 0 && !liveTurnActive) || loadingMessages) {
       return;
     }
     const rafId = window.requestAnimationFrame(() => {
       settledInitialRef.current = true;
     });
     return () => window.cancelAnimationFrame(rafId);
-  }, [loadingMessages, turns.length]);
+  }, [liveTurnActive, loadingMessages, turns.length]);
 
   const handleViewportPointerDown = (
     event: React.PointerEvent<HTMLDivElement>,
@@ -245,9 +247,9 @@ function SessionTimelineScroller({
 
     const distFromBottom = el.scrollHeight - currentTop - el.clientHeight;
     if (draggingScrollbarRef.current && currentTop < prevTop - 1) {
-      setPausedAtUserTurnCount(userTurnCount);
+      setScrollbarPaused(true);
     } else if (scrollbarPaused && distFromBottom <= 24) {
-      setPausedAtUserTurnCount(null);
+      setScrollbarPaused(false);
     }
 
     if (
@@ -263,6 +265,10 @@ function SessionTimelineScroller({
       void onLoadOlderMessages();
     }
   };
+
+  const showPendingAssistant =
+    liveTurnActive &&
+    (turns.length === 0 || turns[turns.length - 1]?.kind === "user");
 
   return (
     <MessageScrollerProvider
@@ -324,7 +330,18 @@ function SessionTimelineScroller({
               }
 
               const isLastTurn = turnIdx === turns.length - 1;
-              const isThinkingNow = isLastTurn && isLiveThinking;
+              const isTurnActive =
+                isLastTurn && (liveTurnActive || isLiveThinking);
+              const isThinkingNow =
+                isLastTurn &&
+                (isLiveThinking ||
+                  (liveTurnActive && !turn.replyText && turn.thoughts.length > 0));
+              const isReasoningStreaming =
+                isLastTurn &&
+                turn.thoughts.some((item) => liveItemIds.has(item.id));
+              const isReplyStreaming =
+                isLastTurn &&
+                turn.replyItemIds.some((id) => liveItemIds.has(id));
               const hasReasoning = turn.thoughts.length > 0 || isThinkingNow;
               const traceNodes = renderAssistantTraceSteps(turn.steps);
 
@@ -339,6 +356,10 @@ function SessionTimelineScroller({
                               <ReasoningGroup
                                 thoughts={turn.thoughts}
                                 running={isThinkingNow}
+                                startedAtMs={
+                                  isThinkingNow ? liveTurnStartedAtMs : null
+                                }
+                                streaming={isReasoningStreaming}
                               />
                             )}
                             {traceNodes}
@@ -354,12 +375,22 @@ function SessionTimelineScroller({
                           />
                         ))}
                         {turn.replyText && (
-                          <SessionMessageBody text={turn.replyText} />
+                          <SessionMessageBody
+                            text={turn.replyText}
+                            streaming={isReplyStreaming}
+                          />
                         )}
                         {turn.sources.length > 0 && (
                           <SourcesList sources={turn.sources} />
                         )}
-                        <AssistantMessageFooter text={turn.replyText} />
+                        <AssistantMessageFooter
+                          text={turn.replyText}
+                          durationSec={turn.durationSec}
+                          streaming={isTurnActive}
+                          startedAtMs={
+                            isTurnActive ? liveTurnStartedAtMs : null
+                          }
+                        />
                       </MessageContent>
                     </Message>
                   </MessageScrollerItem>
@@ -369,11 +400,29 @@ function SessionTimelineScroller({
                 </React.Fragment>
               );
             })}
+            {showPendingAssistant && (
+              <MessageScrollerItem messageId="__live_pending_assistant__">
+                <Message>
+                  <MessageContent className="gap-3">
+                    <Trace>
+                      <ReasoningGroup
+                        thoughts={[]}
+                        running
+                        startedAtMs={liveTurnStartedAtMs}
+                      />
+                    </Trace>
+                    <AssistantMessageFooter
+                      text=""
+                      streaming
+                      startedAtMs={liveTurnStartedAtMs}
+                    />
+                  </MessageContent>
+                </Message>
+              </MessageScrollerItem>
+            )}
           </MessageScrollerContent>
         </MessageScrollerViewport>
-        <MessageScrollerButton
-          onClick={() => setPausedAtUserTurnCount(null)}
-        />
+        <MessageScrollerButton onClick={() => setScrollbarPaused(false)} />
       </MessageScroller>
     </MessageScrollerProvider>
   );
@@ -388,6 +437,9 @@ export function SessionChat({
   loadingMessages = false,
   loadingOlderMessages = false,
   isLiveThinking = false,
+  liveTurnActive = false,
+  liveTurnStartedAtMs = null,
+  liveItemIds = EMPTY_LIVE_ITEM_IDS,
   onLoadOlderMessages,
   sessionModels = null,
   sessionModes = null,
@@ -504,7 +556,7 @@ export function SessionChat({
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
-        ) : turns.length === 0 ? (
+        ) : turns.length === 0 && !liveTurnActive ? (
           <div className="flex h-full flex-col justify-between p-4">
             {activeSessionMode === "resumed" && (
               <CheckpointMarker label="Session resumed · prior history not replayed" />
@@ -532,6 +584,9 @@ export function SessionChat({
             loadingMessages={loadingMessages}
             loadingOlderMessages={loadingOlderMessages}
             isLiveThinking={isLiveThinking}
+            liveTurnActive={liveTurnActive}
+            liveTurnStartedAtMs={liveTurnStartedAtMs}
+            liveItemIds={liveItemIds}
             onLoadOlderMessages={onLoadOlderMessages}
           />
         )}

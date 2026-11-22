@@ -143,6 +143,9 @@ function WorkspaceCanvas() {
                 loadingMessages={acp.loadingMessages}
                 loadingOlderMessages={acp.loadingOlderMessages}
                 isLiveThinking={acp.isLiveThinking}
+                liveTurnActive={acp.liveTurnActive}
+                liveTurnStartedAtMs={acp.liveTurnStartedAtMs}
+                liveItemIds={acp.liveItemIds}
                 totalMessageItems={acp.totalMessageItems}
                 onLoadOlderMessages={acp.loadOlderMessages}
                 sessionModels={acp.sessionModels}

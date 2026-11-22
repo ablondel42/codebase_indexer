@@ -7,6 +7,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import (
     Boolean,
     Column,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -28,6 +29,8 @@ from storage.utils.schema import JsonText
 
 chat_metadata = MetaData()
 
+CHAT_TRANSCRIPT_PARSER_VERSION = 2
+
 chat_sessions_table = Table(
     "chat_sessions",
     chat_metadata,
@@ -43,6 +46,15 @@ chat_sessions_table = Table(
     Column("last_turn_index", Integer, nullable=False, default=0, server_default=text("0")),
     Column("last_turn_kind", Text, nullable=True),
     Column("total_items", Integer, nullable=False, default=0, server_default=text("0")),
+    Column("transcript_step_index", Integer, nullable=True),
+    Column("transcript_offset", Integer, nullable=False, default=0, server_default=text("0")),
+    Column(
+        "parser_version",
+        Integer,
+        nullable=False,
+        default=CHAT_TRANSCRIPT_PARSER_VERSION,
+        server_default=text(str(CHAT_TRANSCRIPT_PARSER_VERSION)),
+    ),
     Column("updated_at", Text, nullable=False),
 )
 
@@ -60,6 +72,7 @@ chat_items_table = Table(
     Column("item_id", Text, nullable=False),
     Column("role", Text, nullable=False),
     Column("text", Text, nullable=False, default="", server_default=text("''")),
+    Column("duration_sec", Float, nullable=True),
     Column("tool_kind", Text, nullable=True),
     Column("tool_title", Text, nullable=True),
     Column("tool_status", Text, nullable=True),
@@ -141,18 +154,23 @@ def _deserialize_locations(raw: object) -> tuple[str, ...]:
 
 def row_to_chat_session(row: Mapping[Any, Any]) -> ChatSessionRecord:
     """Convert a SQLAlchemy ``chat_sessions`` row mapping into ``ChatSessionRecord``."""
+    raw_step = row["transcript_step_index"]
+    raw_offset = row["transcript_offset"]
     return ChatSessionRecord(
         session_id=str(row["session_id"]),
         hydrated=bool(row["hydrated"]),
         last_seq=int(row["last_seq"]),
         last_turn_index=int(row["last_turn_index"]),
         total_items=int(row["total_items"]),
+        transcript_step_index=int(raw_step) if raw_step is not None else None,
+        transcript_offset=int(raw_offset) if raw_offset is not None else 0,
         updated_at=str(row["updated_at"]),
     )
 
 
 def row_to_chat_item(row: Mapping[Any, Any]) -> ChatTimelineItem:
     """Convert a SQLAlchemy ``chat_items`` row mapping into ``ChatTimelineItem``."""
+    raw_dur = row["duration_sec"]
     return ChatTimelineItem(
         session_id=str(row["session_id"]),
         seq=int(row["seq"]),
@@ -160,6 +178,7 @@ def row_to_chat_item(row: Mapping[Any, Any]) -> ChatTimelineItem:
         item_id=str(row["item_id"]),
         role=ChatItemRole(str(row["role"])),
         text=str(row["text"] or ""),
+        duration_sec=float(raw_dur) if raw_dur is not None else None,
         tool_kind=str(row["tool_kind"]) if row["tool_kind"] is not None else None,
         tool_title=str(row["tool_title"]) if row["tool_title"] is not None else None,
         tool_status=str(row["tool_status"]) if row["tool_status"] is not None else None,
@@ -185,6 +204,9 @@ def merge_chat_item(
     return existing.model_copy(
         update={
             "text": next_text,
+            "duration_sec": (
+                delta.duration_sec if delta.duration_sec is not None else existing.duration_sec
+            ),
             "tool_kind": delta.tool_kind if delta.tool_kind is not None else existing.tool_kind,
             "tool_title": delta.tool_title if delta.tool_title is not None else existing.tool_title,
             "tool_status": (
@@ -220,6 +242,7 @@ def build_new_chat_item(
         item_id=delta.item_id,
         role=delta.role,
         text=delta.text,
+        duration_sec=delta.duration_sec,
         tool_kind=delta.tool_kind,
         tool_title=delta.tool_title,
         tool_status=delta.tool_status,
@@ -241,6 +264,7 @@ def chat_item_to_row(item: ChatTimelineItem) -> dict[str, Any]:
         "item_id": item.item_id,
         "role": str(item.role),
         "text": item.text,
+        "duration_sec": item.duration_sec,
         "tool_kind": item.tool_kind,
         "tool_title": item.tool_title,
         "tool_status": item.tool_status,
@@ -256,6 +280,7 @@ def chat_item_to_row(item: ChatTimelineItem) -> dict[str, Any]:
 
 
 __all__ = [
+    "CHAT_TRANSCRIPT_PARSER_VERSION",
     "advance_turn_cursor",
     "build_new_chat_item",
     "chat_item_to_row",

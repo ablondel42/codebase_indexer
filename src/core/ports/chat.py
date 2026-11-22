@@ -10,6 +10,7 @@ from core.models.chat import (
     ChatSessionRecord,
     ChatTimelineItem,
     ChatTimelineItemUpsert,
+    ChatTranscriptCursor,
 )
 
 
@@ -31,6 +32,7 @@ class ChatStoreProtocol(Protocol):
         session_id: str,
         *,
         reset_existing: bool = False,
+        transcript_cursor: ChatTranscriptCursor | None = None,
     ) -> ChatSessionRecord:
         """Mark ``session_id`` as hydrated, optionally clearing prior partial rows."""
         ...
@@ -42,6 +44,7 @@ class ChatStoreProtocol(Protocol):
         *,
         reset_existing: bool = False,
         mark_hydrated: bool = False,
+        transcript_cursor: ChatTranscriptCursor | None = None,
     ) -> tuple[ChatTimelineItem, ...]:
         """Atomically append or merge ``items`` for ``session_id`` and return stored rows."""
         ...

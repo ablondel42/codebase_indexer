@@ -14,10 +14,16 @@ from core.ports.repositories import (
     TextSearchRepositoryProtocol,
 )
 from core.ports.uow import UnitOfWorkFactoryProtocol, UnitOfWorkProtocol
+from core.ports.watch import (
+    DirectoryWatchHandleProtocol,
+    PathChangeCallback,
+    WatchEventKind,
+)
 
 __all__ = [
     "ChatStoreProtocol",
     "DiagnosticsRepositoryProtocol",
+    "DirectoryWatchHandleProtocol",
     "EdgeRepositoryProtocol",
     "EventCallback",
     "FileRepositoryProtocol",
@@ -25,9 +31,11 @@ __all__ = [
     "LspClientProtocol",
     "LspPoolProtocol",
     "NodeRepositoryProtocol",
+    "PathChangeCallback",
     "ReferenceRefreshRepositoryProtocol",
     "RepoRepositoryProtocol",
     "TextSearchRepositoryProtocol",
     "UnitOfWorkFactoryProtocol",
     "UnitOfWorkProtocol",
+    "WatchEventKind",
 ]

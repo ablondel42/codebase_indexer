@@ -1,6 +1,7 @@
 """Headless and UI-ready ``IndexerEngine`` application facade."""
 
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -14,6 +15,7 @@ from core.models.exceptions import IndexerError
 from core.ports.chat import ChatStoreProtocol
 from core.ports.lsp import LspPoolProtocol
 from core.ports.uow import UnitOfWorkFactoryProtocol
+from core.ports.watch import DirectoryWatchHandleProtocol, PathChangeCallback
 from core.utils.logging import get_logger
 from engine.models.collaborators import (
     CommandCollaborators,
@@ -28,6 +30,7 @@ from graph.services.navigator import GraphNavigator
 from graph.services.references import ReferenceAnalyzer
 from graph.services.risk import RiskAnalyzer
 from indexing.services.batch import BatchIndexer
+from indexing.services.directory_watcher import DirectoryTreeWatcher
 from indexing.services.incremental import IncrementalIndexer
 from indexing.services.lsp_runner import RepoLspCoordinator
 from indexing.services.watcher import RepoWatcher
@@ -72,6 +75,7 @@ class _EngineRuntime:
         self.batch_indexer = BatchIndexer(config=config, lsp_coordinator=self.lsp_coordinator)
         self.incremental_indexer = IncrementalIndexer(config=config)
         self.watcher = RepoWatcher(config=config, incremental=self.incremental_indexer)
+        self.directory_watcher = DirectoryTreeWatcher()
 
     @staticmethod
     def db_key(db_path: Path | str) -> str:
@@ -305,6 +309,14 @@ class IndexerEngine:
     def open_chat_store(self, db_path: Path | str) -> ChatStoreProtocol:
         """Acquire or reuse the persistent ``ChatStoreProtocol`` for ``db_path``."""
         return self._runtime.acquire_chat_store(Path(db_path))
+
+    def watch_directories(
+        self,
+        watches: Sequence[tuple[Path, bool]],
+        on_change: PathChangeCallback,
+    ) -> DirectoryWatchHandleProtocol:
+        """Watch external profile directories without exposing ``watchdog`` types."""
+        return self._runtime.directory_watcher.start(watches, on_change)
 
     def for_db(self, db_path: Path | str | None = None) -> "IndexerEngine":
         """Return an ``IndexerEngine`` targeting ``db_path`` while sharing ``lsp_pool``.

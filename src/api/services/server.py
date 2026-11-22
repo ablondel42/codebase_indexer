@@ -16,6 +16,7 @@ from api.models.session import (
     SessionRuntimeState,
 )
 from api.services.gateway import AcpWebSocketGateway
+from api.services.watcher import AgyProfileSyncWatcher
 from api.utils.artifacts import (
     list_session_artifacts,
     read_session_artifact,
@@ -73,6 +74,34 @@ class ApiServerRunner:
             chat_store if chat_store is not None else self._engine.open_chat_store(chat_db_path)
         )
         self._gateway = AcpWebSocketGateway(self._api_config, chat_store=self._chat_store)
+        watch_enabled = self._should_enable_profile_watch(self._api_config)
+        self._profile_watcher = AgyProfileSyncWatcher(
+            resolve_agy_profile_root(self._api_config),
+            self._chat_store,
+            self._gateway,
+            self._engine,
+            enabled=watch_enabled,
+        )
+        self._gateway.set_sync_callbacks(
+            pre_setup_sync=self._pre_setup_sync,
+            on_prompt_finished=self._profile_watcher.flush_deferred_session,
+        )
+
+    @staticmethod
+    def _should_enable_profile_watch(api_cfg: ApiServerConfig) -> bool:
+        """Enable profile watch automatically for ``agy`` or isolated profile dirs."""
+        if api_cfg.watch_agy_profile is not None:
+            return api_cfg.watch_agy_profile
+        cmd_name = Path(api_cfg.agy_command[0]).name if api_cfg.agy_command else ""
+        return cmd_name == "agy" or api_cfg.agy_gemini_dir is not None
+
+    async def _pre_setup_sync(self, session_id: str) -> bool:
+        """Synchronize ``session_id`` from disk before ACP setup routing executes."""
+        return await self._profile_watcher.sync_session_now(
+            session_id,
+            broadcast=False,
+            defer_if_prompt_active=False,
+        )
 
     @staticmethod
     def _resolve_chat_db_path(api_cfg: ApiServerConfig, engine_db_path: Path) -> Path:
@@ -99,6 +128,11 @@ class ApiServerRunner:
     def chat_store(self) -> ChatStoreProtocol:
         """Return persistent ``ChatStoreProtocol`` used for conversation timelines."""
         return self._chat_store
+
+    @property
+    def profile_watcher(self) -> AgyProfileSyncWatcher:
+        """Return ``AgyProfileSyncWatcher`` synchronizing external Antigravity logs."""
+        return self._profile_watcher
 
     def _verify_http_request(self, request: Request) -> None:
         """Enforce Host anti-DNS-rebinding and Origin allowlist checks on API routes."""
@@ -192,6 +226,11 @@ class ApiServerRunner:
         except AcpError as exc:
             raise HTTPException(status_code=400, detail=exc.message) from exc
         await self._gateway.flush_session_chat(clean_id)
+        await self._profile_watcher.sync_session_now(
+            clean_id,
+            broadcast=False,
+            defer_if_prompt_active=False,
+        )
         page = await asyncio.to_thread(
             self._chat_store.get_history_page,
             ChatPageQuery(
@@ -212,9 +251,11 @@ class ApiServerRunner:
 
         @asynccontextmanager
         async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+            self._profile_watcher.start()
             try:
                 yield
             finally:
+                await self._profile_watcher.stop()
                 await self._gateway.close_all()
 
         app = FastAPI(

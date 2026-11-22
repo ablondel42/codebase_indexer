@@ -18,6 +18,7 @@ from indexing.models.results import (
     LspBatchSummary,
 )
 from indexing.services.batch import BatchIndexer
+from indexing.services.directory_watcher import DirectoryTreeWatcher, DirectoryWatchHandle
 from indexing.services.incremental import IncrementalIndexer
 from indexing.services.linker_runner import RepoLinkCoordinator
 from indexing.services.lsp_runner import RepoLspCoordinator
@@ -29,6 +30,8 @@ __all__ = [
     "BatchIndexOptions",
     "BatchIndexResult",
     "BatchIndexer",
+    "DirectoryTreeWatcher",
+    "DirectoryWatchHandle",
     "EventScheduler",
     "ExtractionFailureEntry",
     "FileChangeEvent",

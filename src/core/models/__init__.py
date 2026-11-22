@@ -9,6 +9,7 @@ from core.models.chat import (
     ChatSessionRecord,
     ChatTimelineItem,
     ChatTimelineItemUpsert,
+    ChatTranscriptCursor,
 )
 from core.models.config import IGNORED_DIRS, AppConfig, build_config
 from core.models.diagnostics import (
@@ -103,6 +104,7 @@ __all__ = [
     "ChatSessionRecord",
     "ChatTimelineItem",
     "ChatTimelineItemUpsert",
+    "ChatTranscriptCursor",
     "CodeMatchItem",
     "CodeSearchQuery",
     "CodeSearchReport",

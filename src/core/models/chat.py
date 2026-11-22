@@ -25,6 +25,13 @@ class ChatPlanStep(FrozenModel):
     status: Literal["done", "running", "pending"] = "pending"
 
 
+class ChatTranscriptCursor(FrozenModel):
+    """Monotonic byte and step cursor for incremental ``transcript_full.jsonl`` tailing."""
+
+    step_index: int = Field(ge=-1)
+    byte_offset: int = Field(ge=0)
+
+
 class ChatTimelineItem(FrozenModel):
     """Persisted ordered item belonging to an ACP conversation timeline."""
 
@@ -34,6 +41,7 @@ class ChatTimelineItem(FrozenModel):
     item_id: str
     role: ChatItemRole
     text: str = ""
+    duration_sec: float | None = Field(default=None, ge=0.0)
     tool_kind: str | None = None
     tool_title: str | None = None
     tool_status: str | None = None
@@ -52,6 +60,7 @@ class ChatTimelineItemUpsert(FrozenModel):
     role: ChatItemRole
     text: str = ""
     merge_mode: Literal["append_text", "replace"] = "replace"
+    duration_sec: float | None = Field(default=None, ge=0.0)
     tool_kind: str | None = None
     tool_title: str | None = None
     tool_status: str | None = None
@@ -69,6 +78,8 @@ class ChatSessionRecord(FrozenModel):
     last_seq: int = Field(default=0, ge=0)
     last_turn_index: int = Field(default=0, ge=0)
     total_items: int = Field(default=0, ge=0)
+    transcript_step_index: int | None = None
+    transcript_offset: int = Field(default=0, ge=0)
     updated_at: str
 
 
@@ -100,4 +111,5 @@ __all__ = [
     "ChatSessionRecord",
     "ChatTimelineItem",
     "ChatTimelineItemUpsert",
+    "ChatTranscriptCursor",
 ]

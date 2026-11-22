@@ -30,6 +30,7 @@ class ApiServerConfig(FrozenModel):
     enable_cbi_mcp: bool = True
     cbi_db_path: Path | None = None
     chat_db_path: Path | None = None
+    watch_agy_profile: bool | None = None
     max_connections: int = Field(default=4, ge=1)
     max_frame_bytes: int = Field(default=1_048_576, ge=4096)
     initialize_timeout_seconds: float = Field(default=15.0, gt=0.0)

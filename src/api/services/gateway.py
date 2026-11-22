@@ -2,6 +2,7 @@
 
 import asyncio
 import secrets
+from collections.abc import Awaitable, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -37,11 +38,31 @@ class AcpWebSocketGateway:
         self._config = config
         self._chat_store = chat_store
         self._active_sessions: set[AcpConnectionSession] = set()
+        self._socket_entries: dict[AcpConnectionSession, tuple[WebSocket, asyncio.Lock]] = {}
+        self._pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None
+        self._on_prompt_finished: Callable[[str], Awaitable[None]] | None = None
+
+    def set_sync_callbacks(
+        self,
+        *,
+        pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None,
+        on_prompt_finished: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
+        """Attach optional external profile sync hooks used during setup and prompt end."""
+        self._pre_setup_sync = pre_setup_sync
+        self._on_prompt_finished = on_prompt_finished
 
     @property
     def active_connection_count(self) -> int:
         """Return number of currently open ``/acp`` WebSocket connections."""
         return len(self._active_sessions)
+
+    def has_active_prompt(self, session_id: str) -> bool:
+        """Return ``True`` when any active socket is executing a prompt for ``session_id``."""
+        return any(
+            session_id in conn.active_prompt_session_ids
+            for conn in tuple(self._active_sessions)
+        )
 
     def get_session_state(self, session_id: str) -> SessionRuntimeState | None:
         """Look up live ``SessionRuntimeState`` for ``session_id`` across active connections."""
@@ -90,10 +111,47 @@ class AcpWebSocketGateway:
             return None
         return str(raw_text)
 
-    async def _emit_outcome(self, websocket: WebSocket, outcome: SessionStepOutcome) -> bool:
+    async def _send_text_locked(
+        self,
+        session: AcpConnectionSession,
+        websocket: WebSocket,
+        frame: str,
+    ) -> None:
+        """Send one WebSocket frame under the connection's send lock."""
+        entry = self._socket_entries.get(session)
+        if entry is None:
+            await websocket.send_text(frame)
+            return
+        async with entry[1]:
+            await websocket.send_text(frame)
+
+    async def broadcast_notification(self, frame: str) -> None:
+        """Push one serialized notification frame to all ready ``/acp`` WebSockets."""
+        targets = [
+            (sess, ws, lock)
+            for sess, (ws, lock) in list(self._socket_entries.items())
+            if sess.state == AcpConnectionState.READY
+        ]
+        for sess, ws, lock in targets:
+            async with lock:
+                try:
+                    await ws.send_text(frame)
+                except (WebSocketDisconnect, RuntimeError, OSError) as exc:
+                    logger.debug(
+                        "[%s] Skipping notification push on closed WebSocket: %s",
+                        sess.connection_id,
+                        exc,
+                    )
+
+    async def _emit_outcome(
+        self,
+        session: AcpConnectionSession,
+        websocket: WebSocket,
+        outcome: SessionStepOutcome,
+    ) -> bool:
         """Send response frames in ``outcome`` and return ``False`` when closing."""
         for frame in outcome.frames:
-            await websocket.send_text(frame)
+            await self._send_text_locked(session, websocket, frame)
         if outcome.close_code is not None:
             await websocket.close(code=outcome.close_code)
             return False
@@ -110,7 +168,7 @@ class AcpWebSocketGateway:
             if raw_text is None:
                 continue
             outcome = await session.handle_init_frame(raw_text)
-            if not await self._emit_outcome(websocket, outcome):
+            if not await self._emit_outcome(session, websocket, outcome):
                 return False
         return session.state == AcpConnectionState.READY
 
@@ -125,7 +183,7 @@ class AcpWebSocketGateway:
             if raw_text is None:
                 continue
             outcome = await session.handle_ready_frame(raw_text)
-            if not await self._emit_outcome(websocket, outcome):
+            if not await self._emit_outcome(session, websocket, outcome):
                 break
 
     async def _forward_agent_frames(
@@ -142,7 +200,7 @@ class AcpWebSocketGateway:
             if frame:
                 label, pretty = format_raw_frame_for_log(frame)
                 logger.info("[%s] agy -> UI (%s)\n%s", session.connection_id, label, pretty)
-                await websocket.send_text(frame)
+                await self._send_text_locked(session, websocket, frame)
 
     async def _run_ready_relay(
         self,
@@ -219,8 +277,11 @@ class AcpWebSocketGateway:
             connection_id,
             self._config,
             chat_store=self._chat_store,
+            pre_setup_sync=self._pre_setup_sync,
+            on_prompt_finished=self._on_prompt_finished,
         )
         self._active_sessions.add(session)
+        self._socket_entries[session] = (websocket, asyncio.Lock())
         try:
             await websocket.accept(
                 headers=[(b"acp-connection-id", connection_id.encode("ascii"))]
@@ -238,12 +299,14 @@ class AcpWebSocketGateway:
             )
             await self._drive_session(websocket, session)
         finally:
+            self._socket_entries.pop(session, None)
             self._active_sessions.discard(session)
             await session.close()
 
     async def close_all(self) -> None:
         """Terminate all active ACP sessions during FastAPI shutdown."""
         sessions = list(self._active_sessions)
+        self._socket_entries.clear()
         self._active_sessions.clear()
         for session in sessions:
             await session.close()

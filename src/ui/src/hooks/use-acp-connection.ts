@@ -8,6 +8,7 @@ import {
   fetchSessionArtifactContent,
   fetchSessionArtifacts,
   fetchSessionMessages,
+  parseChatSyncNotification,
   sanitizeAvailableCommands,
   sanitizeConfigOptions,
   sanitizeSessionUsage,
@@ -91,6 +92,9 @@ export interface UseAcpConnectionState {
   loadingMessages: boolean;
   loadingOlderMessages: boolean;
   isLiveThinking: boolean;
+  liveTurnActive: boolean;
+  liveTurnStartedAtMs: number | null;
+  liveItemIds: ReadonlySet<string>;
   totalMessageItems: number;
   loadOlderMessages: () => Promise<void>;
   sessionModels: AcpModelsState | null;
@@ -318,6 +322,52 @@ function applyLiveOps(
   return next;
 }
 
+function mergeSyncedItems(
+  prev: AcpReplayedMessage[],
+  incoming: AcpReplayedMessage[],
+): AcpReplayedMessage[] {
+  if (incoming.length === 0) {
+    return prev;
+  }
+  const byId = new Map<string, AcpReplayedMessage>();
+  const order: string[] = [];
+  for (const item of prev) {
+    byId.set(item.id, item);
+    order.push(item.id);
+  }
+  for (const nextItem of incoming) {
+    const existing = byId.get(nextItem.id);
+    if (existing) {
+      byId.set(nextItem.id, {
+        ...existing,
+        ...nextItem,
+        text: nextItem.text || existing.text,
+        durationSec: nextItem.durationSec ?? existing.durationSec,
+        toolKind: nextItem.toolKind ?? existing.toolKind,
+        toolTitle: nextItem.toolTitle ?? existing.toolTitle,
+        locations: nextItem.locations ?? existing.locations,
+      });
+    } else {
+      byId.set(nextItem.id, nextItem);
+      order.push(nextItem.id);
+    }
+  }
+  const merged = order.map((id) => byId.get(id)!);
+  merged.sort(
+    (a, b) =>
+      (a.seq ?? Number.MAX_SAFE_INTEGER) - (b.seq ?? Number.MAX_SAFE_INTEGER),
+  );
+  return merged;
+}
+
+function parseTimestampMs(raw: string | null | undefined): number | null {
+  if (!raw) {
+    return null;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function mapRawToolStatus(rawStatus: unknown): AcpToolStatus {
   if (typeof rawStatus !== "string") {
     return "done";
@@ -446,6 +496,8 @@ export function useAcpConnection(): UseAcpConnectionState {
   const loadingOlderRef = useRef(false);
   const pendingLiveOpsRef = useRef<LiveMessageOp[]>([]);
   const rafFlushIdRef = useRef<number | null>(null);
+  const selectedArtifactNameRef = useRef<string | null>(null);
+  const silentSessionsTimerRef = useRef<number | null>(null);
   const knownTrackerRef = useRef<KnownTimelineTracker>({
     ids: new Set(),
     lastRole: null,
@@ -477,6 +529,13 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [isLiveThinking, setIsLiveThinking] = useState(false);
+  const [liveTurnActive, setLiveTurnActive] = useState(false);
+  const [liveTurnStartedAtMs, setLiveTurnStartedAtMs] = useState<number | null>(
+    null,
+  );
+  const [liveItemIds, setLiveItemIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [totalMessageItems, setTotalMessageItems] = useState(0);
   const [sessionMetaById, setSessionMetaById] = useState<
     Record<string, AcpSessionRuntimeMeta>
@@ -493,6 +552,10 @@ export function useAcpConnection(): UseAcpConnectionState {
   const [artifactsBusy, setArtifactsBusy] = useState(false);
   const [sessionBusyId, setSessionBusyId] = useState<string | null>(null);
 
+  useEffect(() => {
+    selectedArtifactNameRef.current = selectedArtifact?.name ?? null;
+  }, [selectedArtifact]);
+
   const [error, setError] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
@@ -507,6 +570,10 @@ export function useAcpConnection(): UseAcpConnectionState {
       rafFlushIdRef.current = null;
     }
     pendingLiveOpsRef.current = [];
+    if (silentSessionsTimerRef.current !== null) {
+      window.clearTimeout(silentSessionsTimerRef.current);
+      silentSessionsTimerRef.current = null;
+    }
   }, []);
 
   const resetTimelineState = useCallback(
@@ -522,6 +589,9 @@ export function useAcpConnection(): UseAcpConnectionState {
       setLoadingMessages(false);
       setLoadingOlderMessages(false);
       setIsLiveThinking(false);
+      setLiveTurnActive(false);
+      setLiveTurnStartedAtMs(null);
+      setLiveItemIds(new Set());
       setTotalMessageItems(0);
     },
     [cancelPendingLiveFlush],
@@ -547,6 +617,24 @@ export function useAcpConnection(): UseAcpConnectionState {
       const lastOp = relevant[relevant.length - 1];
       if (lastOp) {
         setIsLiveThinking(lastOp.kind === "chunk" && lastOp.role === "thought");
+      }
+      const streamIds = relevant
+        .filter(
+          (item): item is Extract<LiveMessageOp, { kind: "chunk" }> =>
+            item.kind === "chunk" &&
+            (item.role === "agent" || item.role === "thought"),
+        )
+        .map((item) => item.id);
+      if (streamIds.length > 0) {
+        setLiveTurnActive(true);
+        setLiveTurnStartedAtMs((prev) => prev ?? Date.now());
+        setLiveItemIds((prev) => {
+          const next = new Set(prev);
+          for (const id of streamIds) {
+            next.add(id);
+          }
+          return next;
+        });
       }
       setReplayedMessages((prev) =>
         applyLiveOps(prev, relevant, () => {
@@ -588,8 +676,142 @@ export function useAcpConnection(): UseAcpConnectionState {
     });
   }, []);
 
+  const scheduleSilentSessionsRefresh = useCallback(() => {
+    if (silentSessionsTimerRef.current !== null) {
+      return;
+    }
+    silentSessionsTimerRef.current = window.setTimeout(() => {
+      silentSessionsTimerRef.current = null;
+      const client = clientRef.current;
+      if (!client) {
+        return;
+      }
+      const cwd = defaultCwdRef.current;
+      void client
+        .listSessions(cwd ? { cwd } : undefined)
+        .then((page) => {
+          setSessions(page.sessions);
+          setNextCursor(page.nextCursor ?? null);
+        })
+        .catch(() => {});
+    }, 150);
+  }, []);
+
+  const handleChatSyncNotification = useCallback(
+    (params: Record<string, unknown>) => {
+      const sync = parseChatSyncNotification(params);
+      if (!sync) {
+        return;
+      }
+      if (sync.event === "sessions_changed") {
+        scheduleSilentSessionsRefresh();
+        return;
+      }
+      const activeSid = activeSessionIdRef.current;
+      if (sync.event === "items_upserted" && sync.sessionId) {
+        const nowIso = new Date().toISOString();
+        setSessions((prev) =>
+          prev.map((item) =>
+            item.sessionId === sync.sessionId
+              ? { ...item, updatedAt: nowIso }
+              : item,
+          ),
+        );
+      }
+      if (!sync.sessionId || !activeSid || sync.sessionId !== activeSid) {
+        return;
+      }
+      if (sync.event === "artifacts_changed") {
+        void safeFetchArtifacts(activeSid).then((arts) => {
+          if (activeSessionIdRef.current === activeSid) {
+            setSessionArtifacts(arts);
+          }
+        });
+        const openName = selectedArtifactNameRef.current;
+        if (openName) {
+          void fetchSessionArtifactContent(activeSid, openName)
+            .then((content) => {
+              if (activeSessionIdRef.current === activeSid) {
+                setSelectedArtifact(content);
+              }
+            })
+            .catch(() => {});
+        }
+        return;
+      }
+
+      if (sync.turnActive !== undefined) {
+        setLiveTurnActive(sync.turnActive);
+        setLiveTurnStartedAtMs(
+          sync.turnActive
+            ? (parseTimestampMs(sync.turnStartedAt) ?? Date.now())
+            : null,
+        );
+      }
+
+      if (sync.event === "timeline_reset") {
+        setIsLiveThinking(Boolean(sync.turnActive));
+        setLiveItemIds(new Set());
+        void fetchSessionMessages(activeSid, { limitTurns: 8 })
+          .then((page) => {
+            if (activeSessionIdRef.current !== activeSid) {
+              return;
+            }
+            nextBeforeTurnRef.current = page.nextBeforeTurn;
+            setHasMoreMessages(page.hasMore);
+            setTotalMessageItems(page.totalItems);
+            syncKnownTracker(knownTrackerRef.current, page.items);
+            setReplayedMessages(page.items);
+            if (page.items.length > 0) {
+              setActiveSessionMode("loaded");
+            }
+          })
+          .catch(() => {});
+        return;
+      }
+
+      const lastSynced = sync.items[sync.items.length - 1];
+      setIsLiveThinking(
+        Boolean(sync.turnActive) &&
+          (sync.items.length === 0 || lastSynced?.role === "thought"),
+      );
+      const streamableIds = sync.items
+        .filter((item) => item.role === "agent" || item.role === "thought")
+        .map((item) => item.id);
+      if (streamableIds.length > 0) {
+        setLiveItemIds((prev) => {
+          const next = new Set(prev);
+          for (const id of streamableIds) {
+            next.add(id);
+          }
+          return next;
+        });
+      }
+      if (sync.items.length > 0) {
+        setActiveSessionMode("loaded");
+        setReplayedMessages((prev) => {
+          const merged = mergeSyncedItems(prev, sync.items);
+          syncKnownTracker(knownTrackerRef.current, merged);
+          if (sync.totalItems !== undefined) {
+            setTotalMessageItems(sync.totalItems);
+          } else {
+            setTotalMessageItems(merged.length);
+          }
+          return merged;
+        });
+      } else if (sync.totalItems !== undefined) {
+        setTotalMessageItems(sync.totalItems);
+      }
+    },
+    [scheduleSilentSessionsRefresh],
+  );
+
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
+      if (method === "cbi/chat_sync") {
+        handleChatSyncNotification(params);
+        return;
+      }
       if (method !== "session/update") {
         return;
       }
@@ -795,7 +1017,7 @@ export function useAcpConnection(): UseAcpConnectionState {
         text: cleanChunk,
       });
     },
-    [enqueueLiveOp],
+    [enqueueLiveOp, handleChatSyncNotification],
   );
 
   const reconnect = useCallback(() => {
@@ -1035,6 +1257,9 @@ export function useAcpConnection(): UseAcpConnectionState {
       nextBeforeTurnRef.current = page.nextBeforeTurn;
       setHasMoreMessages(page.hasMore);
       setTotalMessageItems(page.totalItems);
+      setLiveTurnActive(false);
+      setLiveTurnStartedAtMs(null);
+      setLiveItemIds(new Set());
       setReplayedMessages((prev) => {
         if (prev.length === 0) {
           syncKnownTracker(knownTrackerRef.current, page.items);
@@ -1382,6 +1607,9 @@ export function useAcpConnection(): UseAcpConnectionState {
     loadingMessages,
     loadingOlderMessages,
     isLiveThinking,
+    liveTurnActive,
+    liveTurnStartedAtMs,
+    liveItemIds,
     totalMessageItems,
     loadOlderMessages,
     sessionModels: activeMeta.models,

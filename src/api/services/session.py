@@ -1,7 +1,7 @@
 """ACP connection initialization state machine and agent bridge session."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from pydantic import ValidationError as PydanticValidationError
@@ -74,6 +74,8 @@ class AcpConnectionSession:
         *,
         process: AgyAcpProcess | None = None,
         chat_store: ChatStoreProtocol | None = None,
+        pre_setup_sync: Callable[[str], Awaitable[bool]] | None = None,
+        on_prompt_finished: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """Create a new uninitialized session bound to ``connection_id``."""
         self._connection_id = connection_id
@@ -90,6 +92,8 @@ class AcpConnectionSession:
         self._pending_mode_targets: dict[int | str, str] = {}
         self._turns = PromptTurnManager(connection_id)
         self._chat = SessionChatRecorder(connection_id, chat_store)
+        self._pre_setup_sync = pre_setup_sync
+        self._on_prompt_finished = on_prompt_finished
 
     @property
     def connection_id(self) -> str:
@@ -731,6 +735,16 @@ class AcpConnectionSession:
                 )
                 break
 
+    async def _maybe_pre_sync_hydrate(self, msg: Mapping[str, Any]) -> None:
+        """Pre-sync external transcript logs before ``hydrateOnly`` setup routing."""
+        method = msg.get("method")
+        if self._pre_setup_sync is None or method not in ("session/load", "session/resume"):
+            return
+        hydrate_only, cleaned = extract_hydrate_only_flag(msg.get("params"))
+        raw_sid = cleaned.get("sessionId") if isinstance(cleaned, Mapping) else None
+        if hydrate_only and isinstance(raw_sid, str) and raw_sid:
+            await self._pre_setup_sync(raw_sid)
+
     async def handle_ready_frame(self, raw_text: str) -> SessionStepOutcome:
         """Validate and forward a post-initialization JSON-RPC frame to ``agy acp``."""
         msg, parse_err = parse_client_frame(raw_text, max_bytes=self._config.max_frame_bytes)
@@ -744,6 +758,7 @@ class AcpConnectionSession:
             frame_label,
             indent_json_payload(msg),
         )
+        await self._maybe_pre_sync_hydrate(msg)
         prepared = self._prepare_ready_outbound(msg)
         if isinstance(prepared, SessionStepOutcome):
             return self._log_rejection_outcome(prepared)
@@ -955,7 +970,9 @@ class AcpConnectionSession:
         if forward_frame and not self._observe_forwarded_session_update(loaded):
             forward_frame = ""
         if prompt_session_id is not None:
-            await self._chat.flush_session(prompt_session_id)
+            await self._chat.flush_session(prompt_session_id, finalize_active=True)
+            if self._on_prompt_finished is not None:
+                await self._on_prompt_finished(prompt_session_id)
         if completed_rpc is not None:
             forward_frame = await self._finalize_chat_rpc_effect(
                 completed_rpc,
