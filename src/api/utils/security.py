@@ -11,6 +11,10 @@ from api.models.acp import (
     LATEST_ACP_VERSION,
     AuthenticateParams,
     AuthMethod,
+    ClientAuthCapabilities,
+    ClientCapabilities,
+    ClientFsCapabilities,
+    ClientSessionCapabilities,
     InitializeParams,
 )
 from api.models.config import DEFAULT_AGY_APP_DATA_DIR, ApiServerConfig
@@ -271,6 +275,30 @@ def sanitize_meta_dict(meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return cleaned or None
 
 
+def _serialize_capability_dict(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy an extensible capability mapping while scrubbing nested ``_meta``."""
+    cleaned = {str(key): val for key, val in raw.items() if key != "_meta"}
+    raw_meta = raw.get("_meta")
+    if isinstance(raw_meta, Mapping):
+        scrubbed = sanitize_meta_dict(raw_meta)
+        if scrubbed is not None:
+            cleaned["_meta"] = scrubbed
+    return cleaned
+
+
+def _serialize_client_session_caps(session_caps: ClientSessionCapabilities) -> dict[str, Any]:
+    """Serialize ``ClientSessionCapabilities`` while preserving empty ``{}`` capability objects."""
+    out: dict[str, Any] = {}
+    if session_caps.notices is not None:
+        out["notices"] = _serialize_capability_dict(session_caps.notices)
+    if session_caps.compaction is not None:
+        out["compaction"] = _serialize_capability_dict(session_caps.compaction)
+    scrubbed_meta = sanitize_meta_dict(session_caps.meta)
+    if scrubbed_meta is not None:
+        out["_meta"] = scrubbed_meta
+    return out
+
+
 def clamp_client_capabilities(params: InitializeParams) -> dict[str, Any]:
     """Clamp client ``initialize`` parameters to safe bridge-supported capabilities."""
     safe_caps: dict[str, Any] = {
@@ -280,13 +308,13 @@ def clamp_client_capabilities(params: InitializeParams) -> dict[str, Any]:
     }
     raw_caps = params.client_capabilities
     if raw_caps.elicitation is not None:
-        safe_caps["elicitation"] = raw_caps.elicitation
+        safe_caps["elicitation"] = _serialize_capability_dict(raw_caps.elicitation)
     if raw_caps.plan is not None:
-        safe_caps["plan"] = raw_caps.plan
+        safe_caps["plan"] = _serialize_capability_dict(raw_caps.plan)
     if raw_caps.session is not None:
-        safe_caps["session"] = raw_caps.session
+        safe_caps["session"] = _serialize_client_session_caps(raw_caps.session)
     if raw_caps.subagents is not None:
-        safe_caps["subagents"] = raw_caps.subagents
+        safe_caps["subagents"] = _serialize_capability_dict(raw_caps.subagents)
 
     sanitized: dict[str, Any] = {
         "protocolVersion": min(params.protocol_version, LATEST_ACP_VERSION),
@@ -301,6 +329,21 @@ def clamp_client_capabilities(params: InitializeParams) -> dict[str, Any]:
     if scrubbed_meta is not None:
         sanitized["_meta"] = scrubbed_meta
     return sanitized
+
+
+def build_effective_client_capabilities(params: InitializeParams) -> ClientCapabilities:
+    """Return post-clamp ``ClientCapabilities`` enforced on an initialized connection."""
+    raw = params.client_capabilities
+    return ClientCapabilities(
+        auth=ClientAuthCapabilities(terminal=False),
+        fs=ClientFsCapabilities(readTextFile=False, writeTextFile=False),
+        terminal=False,
+        elicitation=raw.elicitation,
+        plan=raw.plan,
+        session=raw.session,
+        subagents=raw.subagents,
+        _meta=sanitize_meta_dict(raw.meta),
+    )
 
 
 def find_advertised_auth_method(
@@ -332,6 +375,7 @@ __all__ = [
     "SAFE_ENV_KEYS",
     "SAFE_ENV_PREFIXES",
     "build_agy_acp_command",
+    "build_effective_client_capabilities",
     "build_sanitized_agy_env",
     "clamp_client_capabilities",
     "extract_host_name",

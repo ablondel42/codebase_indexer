@@ -67,6 +67,16 @@ class ClientFsCapabilities(FrozenModel):
     write_text_file: bool = Field(default=False, alias="writeTextFile")
 
 
+class ClientSessionCapabilities(FrozenModel):
+    """Session-scoped client capabilities advertised during ``initialize``."""
+
+    model_config = _WIRE_MODEL_CONFIG
+
+    notices: dict[str, Any] | None = None
+    compaction: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
 class ClientCapabilities(FrozenModel):
     """Capabilities advertised by the client during ``initialize``."""
 
@@ -77,7 +87,7 @@ class ClientCapabilities(FrozenModel):
     terminal: bool = False
     elicitation: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
-    session: dict[str, Any] | None = None
+    session: ClientSessionCapabilities | None = None
     subagents: dict[str, Any] | None = None
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
@@ -243,6 +253,7 @@ __all__ = [
     "ClientAuthCapabilities",
     "ClientCapabilities",
     "ClientFsCapabilities",
+    "ClientSessionCapabilities",
     "ImplementationInfo",
     "InitializeParams",
     "InitializeResult",

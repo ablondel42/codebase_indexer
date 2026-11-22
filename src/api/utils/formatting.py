@@ -16,6 +16,7 @@ logger = get_logger("api.utils.formatting")
 
 API_CONSOLE_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 API_CONSOLE_DATEFMT: str = "%H:%M:%S"
+BINARY_LOG_PREVIEW_LIMIT: int = 128
 
 
 def _redact_named_pairs(items: list[Any] | tuple[Any, ...]) -> list[Any]:
@@ -107,6 +108,27 @@ def _collapse_diff_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     return collapsed
 
 
+def _collapse_binary_media_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize large base64 ``data`` or ``blob`` payloads in multimodal ACP blocks."""
+    copied = {str(key): val for key, val in mapping.items()}
+    raw_data = copied.get("data")
+    if (
+        copied.get("type") in ("image", "audio")
+        and isinstance(raw_data, str)
+        and len(raw_data) > BINARY_LOG_PREVIEW_LIMIT
+    ):
+        copied["data"] = f"<base64 {len(raw_data)} chars>"
+        return copied
+    raw_blob = copied.get("blob")
+    if (
+        "uri" in copied
+        and isinstance(raw_blob, str)
+        and len(raw_blob) > BINARY_LOG_PREVIEW_LIMIT
+    ):
+        copied["blob"] = f"<base64 {len(raw_blob)} chars>"
+    return copied
+
+
 def _format_multiline_str(text: str, depth: int) -> str:
     """Render a multiline string as an indented ``|`` block with real line breaks."""
     child_pad = "  " * (depth + 1)
@@ -117,7 +139,7 @@ def _format_multiline_str(text: str, depth: int) -> str:
 
 def _format_mapping_for_log(mapping: Mapping[str, Any], depth: int) -> str:
     """Render a mapping with 2-space indentation and multiline string blocks."""
-    prepared = _collapse_diff_mapping(mapping)
+    prepared = _collapse_binary_media_mapping(_collapse_diff_mapping(mapping))
     if not prepared:
         return "{}"
     pad = "  " * depth
@@ -229,6 +251,7 @@ def configure_api_terminal_logging(*, debug: bool = False) -> None:
 __all__ = [
     "API_CONSOLE_DATEFMT",
     "API_CONSOLE_FORMAT",
+    "BINARY_LOG_PREVIEW_LIMIT",
     "configure_api_terminal_logging",
     "describe_jsonrpc_frame",
     "format_kv_block",

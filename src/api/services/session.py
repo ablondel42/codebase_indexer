@@ -17,20 +17,25 @@ from api.models.acp import (
     AcpConnectionState,
     AgentCapabilities,
     AuthenticateParams,
+    ClientCapabilities,
     InitializeParams,
     InitializeResult,
     LogoutParams,
+    PromptCapabilities,
     SessionStepOutcome,
 )
 from api.models.config import ApiServerConfig
 from api.services.process import AgyAcpProcess
+from api.services.prompt import PromptTurnManager
 from api.utils.formatting import (
     describe_jsonrpc_frame,
     format_raw_frame_for_log,
     indent_json_payload,
 )
 from api.utils.jsonrpc import extract_request_id, format_jsonrpc_error, parse_client_frame
+from api.utils.prompt import scrub_outbound_message_meta
 from api.utils.security import (
+    build_effective_client_capabilities,
     clamp_client_capabilities,
     find_advertised_auth_method,
     sanitize_authenticate_params,
@@ -63,10 +68,12 @@ class AcpConnectionSession:
         self._process = process if process is not None else AgyAcpProcess(config)
         self._state = AcpConnectionState.UNINITIALIZED
         self._initialize_result: InitializeResult | None = None
+        self._client_capabilities = ClientCapabilities()
         self._auth_state = AcpAuthState.UNKNOWN
         self._active_auth_method_id: str | None = None
         self._active_session_ids: set[str] = set()
         self._pending_rpc_methods: dict[int | str, tuple[str, str | None]] = {}
+        self._turns = PromptTurnManager(connection_id)
 
     @property
     def connection_id(self) -> str:
@@ -84,6 +91,11 @@ class AcpConnectionSession:
         return self._initialize_result
 
     @property
+    def client_capabilities(self) -> ClientCapabilities:
+        """Return clamped ``ClientCapabilities`` negotiated during ``initialize``."""
+        return self._client_capabilities
+
+    @property
     def auth_state(self) -> AcpAuthState:
         """Return current ACP authentication state observed on this connection."""
         return self._auth_state
@@ -97,6 +109,21 @@ class AcpConnectionSession:
     def active_session_ids(self) -> frozenset[str]:
         """Return set of session IDs currently active on this connection."""
         return frozenset(self._active_session_ids)
+
+    @property
+    def active_prompt_session_ids(self) -> frozenset[str]:
+        """Return session IDs currently executing a ``session/prompt`` turn."""
+        return self._turns.active_prompt_session_ids
+
+    @property
+    def pending_permission_ids(self) -> frozenset[int | str]:
+        """Return pending ``session/request_permission`` JSON-RPC request IDs."""
+        return self._turns.pending_permission_ids
+
+    @property
+    def child_session_ids(self) -> frozenset[str]:
+        """Return announced subagent child session IDs on this connection."""
+        return self._turns.child_session_ids
 
     def _log_rejection_outcome(self, outcome: SessionStepOutcome) -> SessionStepOutcome:
         """Log any JSON-RPC error frames in ``outcome`` with clean terminal indentation."""
@@ -270,7 +297,10 @@ class AcpConnectionSession:
         )
         await self._process.send_line(outbound)
         raw_line, agent_msg = await self._await_agent_init_response(req_id)
-        return await self._finalize_init_response(req_id, raw_line, agent_msg)
+        outcome = await self._finalize_init_response(req_id, raw_line, agent_msg)
+        if self._state == AcpConnectionState.READY:
+            self._client_capabilities = build_effective_client_capabilities(init_params)
+        return outcome
 
     async def handle_init_frame(self, raw_text: str) -> SessionStepOutcome:
         """Process one incoming WebSocket frame while waiting for ``initialize``."""
@@ -421,7 +451,7 @@ class AcpConnectionSession:
         req_id: int | str | None,
         msg: Mapping[str, Any],
     ) -> dict[str, Any] | SessionStepOutcome:
-        """Enforce capability and parameter security gates for ``session/*`` methods."""
+        """Enforce capability, child-session, and parameter gates for ``session/*`` methods."""
         if "id" not in msg or req_id is None:
             return SessionStepOutcome(
                 frames=(
@@ -432,6 +462,15 @@ class AcpConnectionSession:
                     ),
                 )
             )
+        target_gate = self._turns.check_session_target_allowed(
+            method,
+            req_id,
+            msg,
+            self.active_session_ids,
+        )
+        if target_gate is not None:
+            return target_gate
+
         caps = (
             self._initialize_result.agent_capabilities
             if self._initialize_result is not None
@@ -461,13 +500,75 @@ class AcpConnectionSession:
         self._pending_rpc_methods[req_id] = (method, tracked_id)
         return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": sanitized_params}
 
+    def _prepare_prompt_or_cancel(
+        self,
+        method: str,
+        req_id: int | str | None,
+        msg: Mapping[str, Any],
+    ) -> dict[str, Any] | SessionStepOutcome | None:
+        """Dispatch ``session/prompt``, ``session/cancel``, and ``$/cancel_request`` frames."""
+        if method == "session/prompt":
+            prompt_caps = (
+                self._initialize_result.agent_capabilities.prompt_capabilities
+                if self._initialize_result is not None
+                else PromptCapabilities()
+            )
+            return self._turns.prepare_prompt(
+                req_id,
+                msg,
+                self.active_session_ids,
+                prompt_caps,
+            )
+        if method == "session/cancel":
+            return self._turns.prepare_cancel(msg, self.active_session_ids)
+        return self._turns.prepare_cancel_request(msg)
+
+    def _dispatch_ready_method(
+        self,
+        method: str,
+        req_id: int | str | None,
+        msg: Mapping[str, Any],
+    ) -> dict[str, Any] | SessionStepOutcome | None:
+        """Route a validated post-initialization JSON-RPC ``method`` call or notification."""
+        if method in ("authenticate", "logout"):
+            return (
+                self._prepare_authenticate_outbound(req_id, msg)
+                if method == "authenticate"
+                else self._prepare_logout_outbound(req_id, msg)
+            )
+        if method in ("session/prompt", "session/cancel", "$/cancel_request"):
+            return self._prepare_prompt_or_cancel(method, req_id, msg)
+        if method in SESSION_METHODS:
+            return self._prepare_session_outbound(method, req_id, msg)
+
+        target_gate = self._turns.check_session_target_allowed(
+            method,
+            req_id,
+            msg,
+            self.active_session_ids,
+        )
+        return target_gate if target_gate is not None else scrub_outbound_message_meta(msg)
+
     def _prepare_ready_outbound(
         self,
         msg: Mapping[str, Any],
-    ) -> dict[str, Any] | SessionStepOutcome:
-        """Dispatch post-init validation for ``initialize``, auth, and ``session/*`` calls."""
+    ) -> dict[str, Any] | SessionStepOutcome | None:
+        """Dispatch post-init validation for requests, notifications, and client responses."""
+        if "method" not in msg:
+            return self._turns.prepare_client_response(msg)
+
         req_id = extract_request_id(msg)
         method = msg.get("method")
+        if not isinstance(method, str) or not method:
+            return SessionStepOutcome(
+                frames=(
+                    format_jsonrpc_error(
+                        req_id,
+                        JSONRPC_INVALID_REQUEST,
+                        "Invalid JSON-RPC method",
+                    ),
+                )
+            )
         if method == "initialize":
             return SessionStepOutcome(
                 frames=(
@@ -478,13 +579,34 @@ class AcpConnectionSession:
                     ),
                 )
             )
-        if method == "authenticate":
-            return self._prepare_authenticate_outbound(req_id, msg)
-        if method == "logout":
-            return self._prepare_logout_outbound(req_id, msg)
-        if isinstance(method, str) and method in SESSION_METHODS:
-            return self._prepare_session_outbound(method, req_id, msg)
-        return dict(msg)
+        return self._dispatch_ready_method(method, req_id, msg)
+
+    async def _send_bridge_payload_to_agent(self, payload: Mapping[str, Any]) -> None:
+        """Log and write one bridge-generated or sanitized JSON-RPC payload to ``agy``."""
+        out_label = describe_jsonrpc_frame(payload)
+        logger.info(
+            "[%s] Bridge -> agy (%s)\n%s",
+            self._connection_id,
+            out_label,
+            indent_json_payload(payload),
+        )
+        await self._process.send_line(payload)
+
+    async def _flush_turn_teardown(self, session_id: str | None = None) -> None:
+        """Best-effort send cancelled permission outcomes and turn cancellations to ``agy``."""
+        messages = self._turns.drain_teardown_messages(session_id)
+        if not messages or not self._process.is_alive:
+            return
+        for item in messages:
+            try:
+                await self._send_bridge_payload_to_agent(item)
+            except AcpError as exc:
+                logger.debug(
+                    "[%s] Ignoring teardown write error to ACP subprocess: %s",
+                    self._connection_id,
+                    exc,
+                )
+                break
 
     async def handle_ready_frame(self, raw_text: str) -> SessionStepOutcome:
         """Validate and forward a post-initialization JSON-RPC frame to ``agy acp``."""
@@ -502,15 +624,17 @@ class AcpConnectionSession:
         prepared = self._prepare_ready_outbound(msg)
         if isinstance(prepared, SessionStepOutcome):
             return self._log_rejection_outcome(prepared)
+        if prepared is None:
+            return SessionStepOutcome()
 
-        out_label = describe_jsonrpc_frame(prepared)
-        logger.info(
-            "[%s] Bridge -> agy (%s)\n%s",
-            self._connection_id,
-            out_label,
-            indent_json_payload(prepared),
-        )
-        await self._process.send_line(prepared)
+        method = prepared.get("method")
+        if method in ("session/close", "session/delete"):
+            raw_params = prepared.get("params")
+            sess_id = raw_params.get("sessionId") if isinstance(raw_params, Mapping) else None
+            if isinstance(sess_id, str):
+                await self._flush_turn_teardown(sess_id)
+
+        await self._send_bridge_payload_to_agent(prepared)
         return SessionStepOutcome()
 
     def _apply_session_rpc_result(
@@ -537,6 +661,7 @@ class AcpConnectionSession:
             and (succeeded or err_code == ACP_RESOURCE_NOT_FOUND)
         ):
             self._active_session_ids.discard(tracked_session_id)
+            self._turns.clear_completed_session(tracked_session_id)
 
     def _apply_auth_rpc_result(
         self,
@@ -559,15 +684,15 @@ class AcpConnectionSession:
             self._auth_state = AcpAuthState.UNAUTHENTICATED
             self._active_auth_method_id = None
 
-    def _observe_agent_frame(self, raw_line: str) -> None:
-        """Update tracked authentication state from agent JSON-RPC responses."""
+    def _observe_agent_frame(self, raw_line: str) -> Mapping[str, Any] | None:
+        """Update tracked authentication/session state and return parsed JSON mapping."""
         try:
             loaded = json.loads(raw_line)
         except json.JSONDecodeError as exc:
             logger.debug("Skipping non-JSON agent frame in auth observer: %s", exc)
-            return
+            return None
         if not isinstance(loaded, Mapping):
-            return
+            return None
 
         err_obj = loaded.get("error")
         if isinstance(err_obj, Mapping) and err_obj.get("code") == ACP_AUTH_REQUIRED:
@@ -578,17 +703,29 @@ class AcpConnectionSession:
         if resp_id is not None and resp_id in self._pending_rpc_methods:
             method_name, auth_method_id = self._pending_rpc_methods.pop(resp_id)
             self._apply_auth_rpc_result(method_name, auth_method_id, loaded)
+        return loaded
 
     async def read_agent_frame(self) -> str | None:
-        """Read the next outbound NDJSON frame emitted by ``agy acp``."""
+        """Read, validate, and filter the next outbound NDJSON frame emitted by ``agy acp``."""
         raw_line = await self._process.read_line()
-        if raw_line:
-            self._observe_agent_frame(raw_line)
-        return raw_line
+        if not raw_line:
+            return raw_line
+        loaded = self._observe_agent_frame(raw_line)
+        if loaded is None:
+            return raw_line
+        decision = self._turns.inspect_agent_frame(
+            raw_line,
+            loaded,
+            self._client_capabilities,
+        )
+        if decision.agent_reply is not None:
+            await self._send_bridge_payload_to_agent(decision.agent_reply)
+        return decision.forward_frame
 
     async def close(self) -> None:
-        """Close the session and terminate its backing ``agy acp`` subprocess."""
+        """Cancel pending permissions/turns, close session, and stop ``agy acp``."""
         self._state = AcpConnectionState.CLOSED
+        await self._flush_turn_teardown()
         await self._process.stop()
 
 

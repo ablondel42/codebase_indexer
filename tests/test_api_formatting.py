@@ -55,3 +55,30 @@ def test_format_raw_frame_collapses_diff_blocks_into_unified_diff() -> None:
     assert "--- a/session-chat.tsx" in pretty
     assert "+++ b/session-chat.tsx" in pretty
     assert "-remove_me" in pretty
+
+
+def test_indent_json_payload_collapses_large_base64_media_and_blobs() -> None:
+    """Large ``image``/``audio`` ``data`` and resource ``blob`` fields summarize cleanly."""
+    big_b64 = "A" * 300
+    small_b64 = "QUJDRA=="
+    payload = {
+        "prompt": [
+            {"type": "image", "mimeType": "image/png", "data": big_b64},
+            {"type": "image", "mimeType": "image/png", "data": small_b64},
+            {
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///workspace/archive.bin",
+                    "mimeType": "application/octet-stream",
+                    "blob": big_b64,
+                },
+            },
+        ]
+    }
+
+    rendered = indent_json_payload(payload, indent_spaces=2)
+
+    assert '"data": "<base64 300 chars>"' in rendered
+    assert f'"data": "{small_b64}"' in rendered
+    assert '"blob": "<base64 300 chars>"' in rendered
+    assert big_b64 not in rendered
