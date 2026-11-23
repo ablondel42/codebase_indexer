@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Self, TypeAlias
 
+from pydantic import BaseModel, Field
+
 from ..storage import db
 
 __all__ = [
@@ -14,6 +16,7 @@ __all__ = [
     "QuotaExceededError",
     "SERVICE_NAME",
     "TaskRecord",
+    "TaskSummary",
     "TaskWorker",
     "build_worker",
     "run_batch",
@@ -42,12 +45,18 @@ class QuotaExceededError(RuntimeError):
     """Raised when a task or batch exceeds allowed limits."""
 
 
-# --- 4. Dataclass / Schema Model (ClassDef + Call decorator + AnnAssign fields) ---
+# --- 4. Dataclass & Pydantic Schema Models (ClassDef + external venv base + fields) ---
 @dataclass(slots=True)
 class TaskRecord:
     task_id: int
     title: str
     tags: list[str] = field(default_factory=list)
+
+
+class TaskSummary(BaseModel):
+    task_id: int
+    title: str
+    tag_count: int = Field(default=0, ge=0)
 
 
 # --- 5. Base Class & Subclass (class attrs, dunder, class/static/property, sync & async) ---
@@ -87,9 +96,13 @@ class TaskWorker(BaseWorker):
             raise QuotaExceededError(f"Too many tags: {tag_count}")
 
         self._processed += 1
+        summary = TaskSummary(
+            task_id=record.task_id,
+            title=cleaned_title,
+            tag_count=tag_count,
+        )
         return {
-            "id": record.task_id,
-            "title": cleaned_title,
+            **summary.model_dump(),
             "tags": clean_tags,
             "service": SERVICE_NAME,
         }
