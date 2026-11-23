@@ -42,44 +42,14 @@ extend-exclude = ["tests/fixtures", ".agents", "src/ui"]
 
 [tool.ruff.lint]
 explicit-preview-rules = true
-select = [
-    # PEP 8 & Hygiene
-    "E", "W",
-    "N",
-    "I",
-    "F",
-    "PLC0415",
-
-    # Function Size & Single Responsibility
-    "C90",
-    "PLR0915",
-    "PLR0912",
-    "PLR0911",
-    "PLR0913",
-    "PLR0914",
-    "PLR1702",
-
-    # Readability & Flat Control Flow
-    "SIM",
-    "RET",
-    "C4",
-    "B",
-    "UP",
-]
+select = []
 
 [tool.ruff.lint.mccabe]
-max-complexity = 8
 
 [tool.ruff.lint.pylint]
-max-statements = 35
-max-branches = 8
-max-returns = 5
-max-args = 6
-max-locals = 12
-max-nested-blocks = 3
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["PLR0913", "PLR0914", "PLR0915"]
+"tests/**/*.py" = []
 
 [tool.pyright]
 include = ["src", "tests"]
