@@ -1,10 +1,8 @@
-pyright-errors.json
 .DS_Store
 *.db
 *.db-wal
 *.db-shm
 *.db-journal
-build-plan-phases
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
