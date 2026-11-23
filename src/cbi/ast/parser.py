@@ -1,6 +1,7 @@
 """Extract symbol definitions and their kinds from Python source using stdlib ast."""
 
 import ast
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -29,6 +30,7 @@ class SymbolNode:
     location: str
     start_line: int
     end_line: int
+    ast_hash: str | None = None
     decorators: tuple[str, ...] = ()
 
 
@@ -57,109 +59,184 @@ def _target_nodes(target: ast.expr) -> list[ast.Name]:
     return []
 
 
-class _SymbolVisitor(ast.NodeVisitor):
-    def __init__(self, filepath: str, module: str = "") -> None:
-        self.symbols: list[SymbolNode] = []
-        self._filepath: str = filepath
-        self._scope: list[str] = [module] if module else []
-        self._context: list[_ScopeContext] = ["module"]
+def _is_trivial_stmt(stmt: ast.stmt) -> bool:
+    if isinstance(stmt, ast.Pass):
+        return True
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and stmt.value.value is Ellipsis
+    )
 
-    def _qualname(self, name: str) -> str:
-        return ".".join([*self._scope, name])
 
-    def _add(
-        self,
-        name: str,
-        kind: SymbolKind,
-        node: ast.stmt,
-        *,
-        decorators: list[ast.expr] | None = None,
-        line: int | None = None,
-        col_offset: int | None = None,
-    ) -> None:
-        loc_line = line if line is not None else node.lineno
-        loc_col = (col_offset if col_offset is not None else node.col_offset) + 1
-        dec_names = tuple(ast.unparse(d) for d in decorators) if decorators else ()
-        self.symbols.append(
-            SymbolNode(
-                name=name,
-                qualname=self._qualname(name),
-                kind=kind,
-                location=f"{self._filepath}:{loc_line}:{loc_col}",
-                start_line=node.lineno,
-                end_line=node.end_lineno or node.lineno,
-                decorators=dec_names,
-            )
+def _body_hash(body: list[ast.stmt]) -> str | None:
+    stmts = body
+    if (
+        stmts
+        and isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, ast.Constant)
+        and isinstance(stmts[0].value.value, str)
+    ):
+        stmts = stmts[1:]
+
+    if not stmts or all(_is_trivial_stmt(s) for s in stmts):
+        return None
+
+    canonical = "\n".join(ast.dump(s, include_attributes=False) for s in stmts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_symbol(
+    name: str,
+    kind: SymbolKind,
+    stmt: ast.stmt,
+    *,
+    filepath: str,
+    scope: tuple[str, ...],
+    ast_hash: str | None = None,
+    decorators: list[ast.expr] | None = None,
+    line: int | None = None,
+    col_offset: int | None = None,
+) -> SymbolNode:
+    loc_line = line if line is not None else stmt.lineno
+    loc_col = (col_offset if col_offset is not None else stmt.col_offset) + 1
+    first_line = decorators[0].lineno if decorators else stmt.lineno
+    dec_names = tuple(ast.unparse(d) for d in decorators) if decorators else ()
+    return SymbolNode(
+        name=name,
+        qualname=".".join([*scope, name]),
+        kind=kind,
+        location=f"{filepath}:{loc_line}:{loc_col}",
+        start_line=first_line,
+        end_line=stmt.end_lineno or stmt.lineno,
+        ast_hash=ast_hash,
+        decorators=dec_names,
+    )
+
+
+def _walk_callable(
+    stmt: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    is_async: bool,
+    filepath: str,
+    scope: tuple[str, ...],
+    context: _ScopeContext,
+    out: list[SymbolNode],
+) -> None:
+    in_class = context == "class"
+    if in_class and _is_property(stmt.decorator_list):
+        kind: SymbolKind = "property"
+    elif in_class:
+        kind = "async_method" if is_async else "method"
+    else:
+        kind = "async_function" if is_async else "function"
+
+    out.append(
+        _make_symbol(
+            stmt.name,
+            kind,
+            stmt,
+            filepath=filepath,
+            scope=scope,
+            ast_hash=_body_hash(stmt.body),
+            decorators=stmt.decorator_list,
         )
+    )
+    _walk_body(stmt.body, filepath, (*scope, stmt.name), "function", out)
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._add(node.name, "class", node, decorators=node.decorator_list)
-        self._scope.append(node.name)
-        self._context.append("class")
-        self.generic_visit(node)
-        self._context.pop()
-        self._scope.pop()
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._visit_callable(node, is_async=False)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._visit_callable(node, is_async=True)
-
-    def _visit_callable(
-        self, node: ast.FunctionDef | ast.AsyncFunctionDef, *, is_async: bool
-    ) -> None:
-        in_class = self._context[-1] == "class"
-        if in_class and _is_property(node.decorator_list):
-            kind: SymbolKind = "property"
-        elif in_class:
-            kind = "async_method" if is_async else "method"
-        else:
-            kind = "async_function" if is_async else "function"
-
-        self._add(node.name, kind, node, decorators=node.decorator_list)
-        self._scope.append(node.name)
-        self._context.append("function")
-        self.generic_visit(node)
-        self._context.pop()
-        self._scope.pop()
-
-    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
-        if self._context[-1] != "function":
-            self._add(node.name.id, "type_alias", node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        ctx = self._context[-1]
-        if ctx == "function" or not isinstance(node.target, ast.Name):
-            return
-
-        name = node.target.id
-        if _is_type_alias(node.annotation):
-            kind: SymbolKind = "type_alias"
-        elif ctx == "class":
-            kind = "field"
-        else:
-            kind = "constant" if name.isupper() else "variable"
-        self._add(name, kind, node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        ctx = self._context[-1]
-        if ctx == "function":
-            return
-
-        for target in node.targets:
-            for name_node in _target_nodes(target):
-                name = name_node.id
-                kind: SymbolKind = (
-                    "field" if ctx == "class" else ("constant" if name.isupper() else "variable")
+def _walk_stmt(
+    stmt: ast.stmt,
+    filepath: str,
+    scope: tuple[str, ...],
+    context: _ScopeContext,
+    out: list[SymbolNode],
+) -> None:
+    match stmt:
+        case ast.ClassDef():
+            out.append(
+                _make_symbol(
+                    stmt.name,
+                    "class",
+                    stmt,
+                    filepath=filepath,
+                    scope=scope,
+                    ast_hash=_body_hash(stmt.body),
+                    decorators=stmt.decorator_list,
                 )
-                self._add(
-                    name,
-                    kind,
-                    node,
-                    line=name_node.lineno,
-                    col_offset=name_node.col_offset,
+            )
+            _walk_body(stmt.body, filepath, (*scope, stmt.name), "class", out)
+
+        case ast.FunctionDef():
+            _walk_callable(
+                stmt, is_async=False, filepath=filepath, scope=scope, context=context, out=out
+            )
+
+        case ast.AsyncFunctionDef():
+            _walk_callable(
+                stmt, is_async=True, filepath=filepath, scope=scope, context=context, out=out
+            )
+
+        case ast.TypeAlias() if context != "function":
+            out.append(
+                _make_symbol(
+                    stmt.name.id,
+                    "type_alias",
+                    stmt,
+                    filepath=filepath,
+                    scope=scope,
+                    line=stmt.name.lineno,
+                    col_offset=stmt.name.col_offset,
                 )
+            )
+
+        case ast.AnnAssign(target=ast.Name(id=name)) if context != "function":
+            if _is_type_alias(stmt.annotation):
+                kind: SymbolKind = "type_alias"
+            elif context == "class":
+                kind = "field"
+            else:
+                kind = "constant" if name.isupper() else "variable"
+            out.append(_make_symbol(name, kind, stmt, filepath=filepath, scope=scope))
+
+        case ast.Assign() if context != "function":
+            for target in stmt.targets:
+                for name_node in _target_nodes(target):
+                    name = name_node.id
+                    assign_kind: SymbolKind = (
+                        "field"
+                        if context == "class"
+                        else ("constant" if name.isupper() else "variable")
+                    )
+                    out.append(
+                        _make_symbol(
+                            name,
+                            assign_kind,
+                            stmt,
+                            filepath=filepath,
+                            scope=scope,
+                            line=name_node.lineno,
+                            col_offset=name_node.col_offset,
+                        )
+                    )
+
+        case _:
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, ast.stmt):
+                    _walk_stmt(child, filepath, scope, context, out)
+                elif isinstance(child, ast.ExceptHandler | ast.match_case):
+                    _walk_body(child.body, filepath, scope, context, out)
+
+
+def _walk_body(
+    stmts: list[ast.stmt],
+    filepath: str,
+    scope: tuple[str, ...],
+    context: _ScopeContext,
+    out: list[SymbolNode],
+) -> None:
+    for stmt in stmts:
+        _walk_stmt(stmt, filepath, scope, context, out)
 
 
 def extract_symbols(
@@ -169,9 +246,10 @@ def extract_symbols(
     raw_name = str(filename)
     full_path = raw_name if raw_name == "<memory>" else str(Path(filename).resolve())
     tree = ast.parse(source, filename=full_path)
-    visitor = _SymbolVisitor(filepath=full_path, module=module)
-    visitor.visit(tree)
-    return visitor.symbols
+    initial_scope = (module,) if module else ()
+    symbols: list[SymbolNode] = []
+    _walk_body(tree.body, full_path, initial_scope, "module", symbols)
+    return symbols
 
 
 if __name__ == "__main__":
@@ -182,4 +260,5 @@ if __name__ == "__main__":
         module="cbi.ast.mock",
     )
     for sym in extracted:
-        print(f"{sym.kind:<15} {sym.qualname:<42} {sym.location}")
+        digest = sym.ast_hash or "-"
+        print(f"{sym.kind:<15} {sym.name:<19} {digest:<18} {sym.qualname:<38} {sym.location}")
