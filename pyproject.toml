@@ -33,6 +33,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
@@ -42,14 +43,7 @@ extend-exclude = ["tests/fixtures", ".agents", "src/ui"]
 
 [tool.ruff.lint]
 explicit-preview-rules = true
-select = []
-
-[tool.ruff.lint.mccabe]
-
-[tool.ruff.lint.pylint]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = []
+select = ["E", "W", "F", "I", "N", "B", "UP", "SIM", "C4", "RET", "PLC0415"]
 
 [tool.pyright]
 include = ["src", "tests"]

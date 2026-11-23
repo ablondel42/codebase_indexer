@@ -8,7 +8,6 @@ from typing import Any, Self, TypeAlias
 
 from pydantic import BaseModel, Field
 
-from ..storage import db
 
 __all__ = [
     "DEFAULT_RETRIES",
@@ -27,7 +26,6 @@ Payload: TypeAlias = dict[str, Any]
 
 DEFAULT_RETRIES = 3
 SERVICE_NAME: str = "cbi-mock"
-STORAGE_BACKEND: str = db.__name__
 ROUTES: dict[str, Callable[..., Any]] = {}
 
 
@@ -64,7 +62,7 @@ class BaseWorker:
     kind = "base"
 
     def describe(self) -> str:
-        return f"{self.kind}:{STORAGE_BACKEND}"
+        return f"{self.kind}:STORAGE_BACKEND"
 
 
 class TaskWorker(BaseWorker):
@@ -132,3 +130,4 @@ async def run_batch(records: list[TaskRecord]) -> list[Payload]:
         except QuotaExceededError as exc:
             results.append(format_error(exc))
     return results
+
