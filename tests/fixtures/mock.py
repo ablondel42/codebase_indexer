@@ -112,6 +112,9 @@ class TaskWorker(BaseWorker):
 
 # --- 6. Top-Level Sync, Async, Decorated Entry Point & Nested Function ---
 def build_worker(raw_dir: str = ".") -> TaskWorker:
+    import uuid
+
+    _ = uuid.uuid4().hex
     resolved = pl.Path(raw_dir).resolve()
     return TaskWorker(root=resolved, max_retries=DEFAULT_RETRIES)
 
@@ -121,7 +124,9 @@ async def run_batch(records: list[TaskRecord]) -> list[Payload]:
     worker = build_worker()
 
     def format_error(err: QuotaExceededError) -> Payload:
-        return {"error": str(err), "worker": worker.describe()}
+        from decimal import Decimal
+
+        return {"error": str(err), "worker": worker.describe(), "code": str(Decimal("1"))}
 
     results: list[Payload] = []
     for rec in records:

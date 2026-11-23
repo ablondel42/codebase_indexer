@@ -25,6 +25,9 @@ SymbolKind: TypeAlias = Literal[
 _ScopeContext: TypeAlias = Literal["module", "class", "init", "function"]
 _PROPERTY_DECORATORS: frozenset[str] = frozenset({"property", "cached_property", "computed_field"})
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
+_DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
+    {"__pycache__", "venv", ".venv", "node_modules", "build", "dist"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,17 +81,15 @@ class _WalkState:
             )
         )
 
-    def add_external(
-        self, name: str, qualname: str, stmt: ast.stmt, alias: ast.alias
-    ) -> None:
+    def add_external(self, name: str, qualname: str, alias: ast.alias) -> None:
         self.add(
             SymbolNode(
                 name=name,
                 qualname=qualname,
                 kind="external",
                 location=f"{self.filepath}:{alias.lineno}:{alias.col_offset + 1}",
-                start_line=stmt.lineno,
-                end_line=stmt.end_lineno or stmt.lineno,
+                start_line=alias.lineno,
+                end_line=alias.end_lineno or alias.lineno,
             )
         )
 
@@ -108,6 +109,8 @@ def _is_type_alias(annotation: ast.expr) -> bool:
         return annotation.id == "TypeAlias"
     if isinstance(annotation, ast.Attribute):
         return annotation.attr == "TypeAlias"
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value == "TypeAlias" or annotation.value.endswith(".TypeAlias")
     return False
 
 
@@ -132,6 +135,8 @@ def _is_main_guard(test: ast.expr) -> bool:
 def _target_nodes(target: ast.expr) -> list[ast.Name]:
     if isinstance(target, ast.Name):
         return [target]
+    if isinstance(target, ast.Starred):
+        return _target_nodes(target.value)
     if isinstance(target, ast.Tuple | ast.List):
         return [name_node for elt in target.elts for name_node in _target_nodes(elt)]
     return []
@@ -144,6 +149,8 @@ def _self_attr_nodes(target: ast.expr) -> list[ast.Attribute]:
         and target.value.id == "self"
     ):
         return [target]
+    if isinstance(target, ast.Starred):
+        return _self_attr_nodes(target.value)
     if isinstance(target, ast.Tuple | ast.List):
         return [attr for elt in target.elts for attr in _self_attr_nodes(elt)]
     return []
@@ -152,11 +159,19 @@ def _self_attr_nodes(target: ast.expr) -> list[ast.Attribute]:
 def _is_trivial_stmt(stmt: ast.stmt) -> bool:
     if isinstance(stmt, ast.Pass):
         return True
-    return (
+    if (
         isinstance(stmt, ast.Expr)
         and isinstance(stmt.value, ast.Constant)
         and stmt.value.value is Ellipsis
-    )
+    ):
+        return True
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        return (
+            (isinstance(exc, ast.Name) and exc.id == "NotImplementedError")
+            or (isinstance(exc, ast.Attribute) and exc.attr == "NotImplementedError")
+        )
+    return False
 
 
 def _body_hash(body: list[ast.stmt]) -> str | None:
@@ -226,7 +241,11 @@ def _walk_assign(
     if context not in {"module", "class"}:
         return
 
-    if isinstance(stmt, ast.AnnAssign) and _is_type_alias(stmt.annotation):
+    if (
+        isinstance(stmt, ast.AnnAssign)
+        and stmt.value is not None
+        and _is_type_alias(stmt.annotation)
+    ):
         if isinstance(stmt.target, ast.Name):
             state.add_symbol(stmt.target.id, "type_alias", stmt, scope, pos=stmt.target)
         return
@@ -248,7 +267,7 @@ def _walk_import(stmt: ast.Import | ast.ImportFrom, state: _WalkState) -> None:
             if alias.name.split(".", 1)[0] in state.internal_pkgs:
                 continue
             short_name = alias.name.rsplit(".", 1)[-1]
-            state.add_external(short_name, alias.name, stmt, alias)
+            state.add_external(short_name, alias.name, alias)
         return
 
     if stmt.level > 0 or not stmt.module:
@@ -257,7 +276,7 @@ def _walk_import(stmt: ast.Import | ast.ImportFrom, state: _WalkState) -> None:
         return
     for alias in stmt.names:
         if alias.name != "*":
-            state.add_external(alias.name, f"{stmt.module}.{alias.name}", stmt, alias)
+            state.add_external(alias.name, f"{stmt.module}.{alias.name}", alias)
 
 
 def _walk_stmt(
@@ -290,7 +309,7 @@ def _walk_stmt(
         case ast.Assign() | ast.AnnAssign():
             _walk_assign(stmt, scope, context, state)
 
-        case ast.Import() | ast.ImportFrom() if context == "module":
+        case ast.Import() | ast.ImportFrom():
             _walk_import(stmt, state)
 
         case ast.If() if context == "module" and _is_main_guard(stmt.test):
@@ -321,16 +340,23 @@ def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
         root = Path(raw_root).resolve()
         if not root.is_dir():
             continue
-        if (root / "__init__.py").exists():
+        if (root / "__init__.py").exists() and root.name.isidentifier():
             names.add(root.name)
         for entry in root.iterdir():
-            if entry.name.startswith((".", "__pycache__")):
+            if entry.name.startswith(".") or entry.name in _DISCOVER_SKIP_DIRS:
                 continue
-            if entry.is_dir() and (
-                (entry / "__init__.py").exists() or any(entry.glob("*.py"))
+            if (
+                entry.is_dir()
+                and entry.name.isidentifier()
+                and ((entry / "__init__.py").exists() or any(entry.glob("*.py")))
             ):
                 names.add(entry.name)
-            elif entry.is_file() and entry.suffix == ".py" and entry.stem != "__init__":
+            elif (
+                entry.is_file()
+                and entry.suffix == ".py"
+                and entry.stem != "__init__"
+                and entry.stem.isidentifier()
+            ):
                 names.add(entry.stem)
     return frozenset(names)
 
@@ -365,19 +391,17 @@ def extract_symbols(
     if module:
         mod_name = module.rsplit(".", 1)[-1]
         mod_qualname = module
-        initial_scope: tuple[str, ...] = (module,)
     elif raw_name == "<memory>":
         mod_name = "<module>"
         mod_qualname = "<module>"
-        initial_scope = ()
     else:
         mod_name = module_name_from_path(full_path)
         mod_qualname = mod_name
-        initial_scope = (mod_name,)
+    initial_scope: tuple[str, ...] = (mod_qualname,)
 
     internal = set(internal_packages)
-    if module:
-        internal.add(module.split(".", 1)[0])
+    if mod_qualname != "<module>":
+        internal.add(mod_qualname.split(".", 1)[0])
 
     total_lines = max(len(source.splitlines()), 1)
     state = _WalkState(filepath=full_path, internal_pkgs=frozenset(internal))
