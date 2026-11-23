@@ -105,6 +105,7 @@ class ClientRequestDispatcher:
         self._active_url_elicitation_ids: set[str] = set()
         self._host_tasks: dict[int | str, asyncio.Task[None]] = {}
         self._host_task_sessions: dict[int | str, str] = {}
+        self._started_host_tasks: set[int | str] = set()
 
     @property
     def pending_permission_ids(self) -> frozenset[int | str]:
@@ -218,10 +219,12 @@ class ClientRequestDispatcher:
         req_id: int | str,
         method: str,
         session_id: str,
-        coro: Coroutine[Any, Any, FrozenModel],
+        coro_factory: Callable[[], Coroutine[Any, Any, FrozenModel]],
     ) -> AgentFrameDecision:
         """Execute a host FS/terminal operation asynchronously without blocking stdout."""
-        task = asyncio.create_task(self._execute_host_coro(req_id, method, session_id, coro))
+        task = asyncio.create_task(
+            self._execute_host_coro(req_id, method, session_id, coro_factory)
+        )
         self._host_tasks[req_id] = task
         self._host_task_sessions[req_id] = session_id
         return AgentFrameDecision(forward_frame="")
@@ -231,19 +234,20 @@ class ClientRequestDispatcher:
         req_id: int | str,
         method: str,
         session_id: str,
-        coro: Coroutine[Any, Any, FrozenModel],
+        coro_factory: Callable[[], Coroutine[Any, Any, FrozenModel]],
     ) -> None:
         """Run host operation coroutine, send JSON-RPC reply to agent, and log latency."""
         started = time.monotonic()
         reply: dict[str, Any] | None = None
         try:
+            self._started_host_tasks.add(req_id)
             with AcpLogContext.bind(
                 connection_id=self._connection_id,
                 session_id=session_id,
                 request_id=req_id,
                 method=method,
             ):
-                result_model = await coro
+                result_model = await coro_factory()
                 reply = {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -265,6 +269,7 @@ class ClientRequestDispatcher:
             logger.warning("[%s] Host %s failed: %s", self._connection_id, method, exc)
             reply = build_jsonrpc_error_dict(req_id, JSONRPC_INTERNAL_ERROR, "Internal error")
         finally:
+            self._started_host_tasks.discard(req_id)
             self._host_tasks.pop(req_id, None)
             self._host_task_sessions.pop(req_id, None)
 
@@ -303,12 +308,16 @@ class ClientRequestDispatcher:
             else self._config.capabilities.fs_write
         )
         if policy == CapabilityPolicy.HOST:
-            coro: Coroutine[Any, Any, FrozenModel] = (
-                self._fs.read_text_file(parsed, root_set)
-                if isinstance(parsed, ReadTextFileParams)
-                else self._fs.write_text_file(parsed, root_set)
+            return self._spawn_host_task(
+                req_id,
+                method,
+                parsed.session_id,
+                lambda: (
+                    self._fs.read_text_file(parsed, root_set)
+                    if isinstance(parsed, ReadTextFileParams)
+                    else self._fs.write_text_file(parsed, root_set)
+                ),
             )
-            return self._spawn_host_task(req_id, method, parsed.session_id, coro)
         return self._relay_fs_call(raw_line, req_id, method, parsed, ws_caps, root_set)
 
     def _handle_fs_request(
@@ -465,8 +474,12 @@ class ClientRequestDispatcher:
         session_id = str(getattr(parsed, "session_id", ""))
         root_set = resolve_root_set(session_id)
         if policy == CapabilityPolicy.HOST:
-            coro = self._build_host_terminal_coro(method, parsed, root_set)
-            return self._spawn_host_task(req_id, method, session_id, coro)
+            return self._spawn_host_task(
+                req_id,
+                method,
+                session_id,
+                lambda: self._build_host_terminal_coro(method, parsed, root_set),
+            )
         return self._relay_terminal_call(raw_line, req_id, method, parsed, ws_caps, root_set)
 
     def _handle_agent_extension_request(
@@ -596,6 +609,11 @@ class ClientRequestDispatcher:
             return AgentFrameDecision(forward_frame="")
         host_task = self._host_tasks.get(target_id)
         if host_task is not None:
+            if target_id not in self._started_host_tasks:
+                self._host_tasks.pop(target_id, None)
+                self._host_task_sessions.pop(target_id, None)
+                host_task.cancel()
+                return self._error_reply(target_id, ACP_REQUEST_CANCELLED, "Request cancelled")
             host_task.cancel()
             return AgentFrameDecision(forward_frame="")
         if target_id in self._pending_relayed:
@@ -709,6 +727,7 @@ class ClientRequestDispatcher:
             tasks = list(self._host_tasks.values())
             self._host_tasks.clear()
             self._host_task_sessions.clear()
+            self._started_host_tasks.clear()
             self._active_url_elicitation_ids.clear()
             await self._cancel_tasks_and_release(tasks, None)
             return replies

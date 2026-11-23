@@ -8,6 +8,8 @@ version = "0.2.0"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
     "mcp>=2.0",
     "sqlalchemy>=2.0",
     "watchdog>=3.0.0",

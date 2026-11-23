@@ -1,11 +1,6 @@
 """Public helper re-exports for ``api.utils``."""
 
-from api.utils.config_loader import (
-    deep_merge_config_dicts,
-    load_env_config_overrides,
-    load_toml_config_file,
-    resolve_acp_server_config,
-)
+from api.utils.config_loader import resolve_acp_server_config
 from api.utils.elicitation import (
     build_cancelled_elicitation_response,
     check_elicitation_mode_supported,
@@ -144,7 +139,6 @@ __all__ = [
     "classify_jsonrpc_message",
     "collect_descendant_session_ids",
     "decode_terminal_buffer",
-    "deep_merge_config_dicts",
     "describe_jsonrpc_frame",
     "discard_descendant_live_state",
     "encode_stdio_line",
@@ -168,8 +162,6 @@ __all__ = [
     "is_sensitive_write_path",
     "is_session_update_allowed",
     "is_valid_extension_method",
-    "load_env_config_overrides",
-    "load_toml_config_file",
     "negotiate_client_capabilities",
     "normalize_origin",
     "parse_client_frame",

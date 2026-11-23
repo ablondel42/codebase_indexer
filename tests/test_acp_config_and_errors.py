@@ -84,6 +84,19 @@ def _write_error_matrix_agent(script_path: Path) -> Path:
                 }
             elif method == "session/new":
                 reply = {"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "s_err"}}
+            elif method == "_ext/slow":
+                for inner in sys.stdin:
+                    inner_s = inner.strip()
+                    if not inner_s:
+                        continue
+                    imsg = json.loads(inner_s)
+                    if imsg.get("method") == "$/cancel_request":
+                        break
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32800, "message": "Cancelled"},
+                }
             elif method == "session/prompt":
                 cancel_seen = False
                 for inner in sys.stdin:
@@ -149,11 +162,14 @@ def test_fail_closed_defaults_and_three_layer_config_precedence(tmp_path: Path) 
         encoding="utf-8",
     )
 
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text("CBI_ACP__LOGGING__LEVEL=INFO\n", encoding="utf-8")
+
     env = {
-        "CBI_ACP_PORT": "8200",
+        "CBI_ACP__TRANSPORT__PORT": "8200",
         "CBI_ACP__CAPABILITIES__FS_READ": "host",
+        "CBI_ACP__CAPABILITIES__AUTH_TERMINAL": "relay",
         "CBI_ACP__MCP__ALLOWED_STDIO_COMMANDS": '["/bin/echo", "/usr/bin/python3"]',
-        "CBI_ACP_LOG_LEVEL": "INFO",
     }
     cli_overrides: dict[str, Any] = {
         "transport": {"port": 8300},
@@ -161,12 +177,14 @@ def test_fail_closed_defaults_and_three_layer_config_precedence(tmp_path: Path) 
     }
     resolved = resolve_acp_server_config(
         config_file=toml_file,
+        env_file=dotenv_file,
         environ=env,
         cli_overrides=cli_overrides,
     )
     assert resolved.transport.port == 8300
     assert resolved.transport.max_connections == 6
     assert resolved.capabilities.fs_read == CapabilityPolicy.HOST
+    assert resolved.capabilities.auth_terminal == RelayOnlyPolicy.RELAY
     assert resolved.mcp.allowed_stdio_commands == ("/bin/echo", "/usr/bin/python3")
     assert resolved.logging.format == LogFormat.PRETTY
     assert resolved.logging.level == "INFO"
@@ -301,6 +319,17 @@ def test_full_jsonrpc_and_acp_error_code_matrix_and_notification_silence(tmp_pat
         ws.send_json(
             {"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 7}}
         )
-        cancelled_reply = ws.receive_json()
-        assert cancelled_reply["id"] == 7
-        assert cancelled_reply["error"]["code"] == ACP_REQUEST_CANCELLED
+        prompt_cancelled = ws.receive_json()
+        assert prompt_cancelled == {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {"stopReason": "cancelled"},
+        }
+
+        ws.send_json({"jsonrpc": "2.0", "id": 8, "method": "_ext/slow", "params": {}})
+        ws.send_json(
+            {"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 8}}
+        )
+        rpc_cancelled = ws.receive_json()
+        assert rpc_cancelled["id"] == 8
+        assert rpc_cancelled["error"]["code"] == ACP_REQUEST_CANCELLED

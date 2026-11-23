@@ -1,10 +1,18 @@
 """Composed immutable ACP v1 WebSocket server configuration models."""
 
 import ipaddress
+from contextvars import ContextVar
 from enum import StrEnum
 from pathlib import Path
 
 from pydantic import Field, SecretStr, model_validator
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 from core.models.base import FrozenModel
 from core.utils.logging import get_logger
@@ -263,10 +271,50 @@ class AcpServerConfig(FrozenModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 
+ACP_SETTINGS_SOURCES_CTX: ContextVar[tuple[Path | None, Path | None]] = ContextVar(
+    "acp_settings_sources_ctx",
+    default=(None, Path(".env")),
+)
+
+
+class AcpSettings(AcpServerConfig, BaseSettings):
+    """Settings loader composing TOML, ``.env``, ``CBI_ACP__*`` env, and CLI overrides."""
+
+    model_config = SettingsConfigDict(
+        frozen=True,
+        extra="forbid",
+        populate_by_name=True,
+        env_prefix="CBI_ACP__",
+        env_nested_delimiter="__",
+        env_file_encoding="utf-8",
+    )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Apply strict precedence: ``init`` (CLI) > ``env`` > ``.env`` > ``TOML``."""
+        del dotenv_settings, file_secret_settings
+        toml_file, dotenv_file = ACP_SETTINGS_SOURCES_CTX.get()
+        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+        if dotenv_file is not None:
+            sources.append(DotEnvSettingsSource(settings_cls, env_file=dotenv_file))
+        if toml_file is not None:
+            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=toml_file))
+        return tuple(sources)
+
+
 ApiServerConfig = AcpServerConfig
 
 __all__ = [
+    "ACP_SETTINGS_SOURCES_CTX",
     "AcpServerConfig",
+    "AcpSettings",
     "AgentConfig",
     "ApiServerConfig",
     "CapabilityPolicy",

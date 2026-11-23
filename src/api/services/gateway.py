@@ -184,8 +184,14 @@ class AcpWebSocketGateway:
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        first_exc: BaseException | None = None
         for task in done:
-            task.result()
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None and first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
 
     @staticmethod
     async def _send_error_and_close(

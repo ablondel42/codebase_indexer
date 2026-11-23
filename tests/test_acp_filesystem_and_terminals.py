@@ -37,6 +37,7 @@ def _write_ops_agent(script_path: Path, *, scenario_file: Path | None = None) ->
         f"""
         import json
         import sys
+        import time
         from pathlib import Path
 
         LOG = {str(scenario_file)!r} if {scenario_file is not None!r} else None
@@ -93,6 +94,8 @@ def _write_ops_agent(script_path: Path, *, scenario_file: Path | None = None) ->
                 cmd = json.loads(params["prompt"][0]["text"])
                 results = []
                 for step in cmd["steps"]:
+                    if step.get("delaySeconds"):
+                        time.sleep(step["delaySeconds"])
                     step_id = step["id"]
                     send({{
                         "jsonrpc": "2.0",
@@ -398,6 +401,7 @@ def test_host_terminal_security_nonblocking_concurrency_and_cleanup(tmp_path: Pa
                     "id": 405,
                     "method": "terminal/output",
                     "params": {"sessionId": sid, "terminalId": term_id},
+                    "delaySeconds": 0.25,
                 },
             ],
             cancel_id=404,
