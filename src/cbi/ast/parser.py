@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import tokenize
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +27,18 @@ _ScopeContext: TypeAlias = Literal["module", "class", "init", "function"]
 _PROPERTY_DECORATORS: frozenset[str] = frozenset({"property", "cached_property", "computed_field"})
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
 _DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
-    {"__pycache__", "venv", ".venv", "node_modules", "build", "dist"}
+    {
+        "__pycache__",
+        "__pypackages__",
+        "venv",
+        ".venv",
+        ".tox",
+        ".nox",
+        "site-packages",
+        "node_modules",
+        "build",
+        "dist",
+    }
 )
 
 
@@ -191,16 +203,16 @@ def _body_hash(body: list[ast.stmt]) -> str | None:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def _walk_callable(
+def _record_callable(
     stmt: ast.FunctionDef | ast.AsyncFunctionDef,
     *,
     is_async: bool,
     scope: tuple[str, ...],
     context: _ScopeContext,
     state: _WalkState,
-) -> None:
+) -> _ScopeContext | None:
     if _has_decorator(stmt.decorator_list, _OVERLOAD_DECORATORS):
-        return
+        return None
 
     in_class = context == "class"
     if in_class and _has_decorator(stmt.decorator_list, _PROPERTY_DECORATORS):
@@ -218,10 +230,7 @@ def _walk_callable(
         ast_hash=_body_hash(stmt.body),
         decorators=stmt.decorator_list,
     )
-    body_ctx: _ScopeContext = (
-        "init" if in_class and stmt.name in {"__init__", "__post_init__"} else "function"
-    )
-    _walk_body(stmt.body, (*scope, stmt.name), body_ctx, state)
+    return "init" if in_class and stmt.name in {"__init__", "__post_init__"} else "function"
 
 
 def _walk_assign(
@@ -279,58 +288,66 @@ def _walk_import(stmt: ast.Import | ast.ImportFrom, state: _WalkState) -> None:
             state.add_external(alias.name, f"{stmt.module}.{alias.name}", alias)
 
 
-def _walk_stmt(
-    stmt: ast.stmt,
-    scope: tuple[str, ...],
-    context: _ScopeContext,
-    state: _WalkState,
-) -> None:
-    match stmt:
-        case ast.ClassDef():
-            state.add_symbol(
-                stmt.name,
-                "class",
-                stmt,
-                scope,
-                ast_hash=_body_hash(stmt.body),
-                decorators=stmt.decorator_list,
-            )
-            _walk_body(stmt.body, (*scope, stmt.name), "class", state)
-
-        case ast.FunctionDef():
-            _walk_callable(stmt, is_async=False, scope=scope, context=context, state=state)
-
-        case ast.AsyncFunctionDef():
-            _walk_callable(stmt, is_async=True, scope=scope, context=context, state=state)
-
-        case ast.TypeAlias() if context in {"module", "class"}:
-            state.add_symbol(stmt.name.id, "type_alias", stmt, scope, pos=stmt.name)
-
-        case ast.Assign() | ast.AnnAssign():
-            _walk_assign(stmt, scope, context, state)
-
-        case ast.Import() | ast.ImportFrom():
-            _walk_import(stmt, state)
-
-        case ast.If() if context == "module" and _is_main_guard(stmt.test):
-            _walk_body(stmt.orelse, scope, context, state)
-
-        case _:
-            for child in ast.iter_child_nodes(stmt):
-                if isinstance(child, ast.stmt):
-                    _walk_stmt(child, scope, context, state)
-                elif isinstance(child, ast.ExceptHandler | ast.match_case):
-                    _walk_body(child.body, scope, context, state)
-
-
 def _walk_body(
     stmts: list[ast.stmt],
     scope: tuple[str, ...],
     context: _ScopeContext,
     state: _WalkState,
 ) -> None:
-    for stmt in stmts:
-        _walk_stmt(stmt, scope, context, state)
+    stack: list[tuple[ast.stmt, tuple[str, ...], _ScopeContext]] = [
+        (stmt, scope, context) for stmt in reversed(stmts)
+    ]
+    while stack:
+        stmt, cur_scope, cur_ctx = stack.pop()
+        match stmt:
+            case ast.ClassDef():
+                state.add_symbol(
+                    stmt.name,
+                    "class",
+                    stmt,
+                    cur_scope,
+                    ast_hash=_body_hash(stmt.body),
+                    decorators=stmt.decorator_list,
+                )
+                child_scope = (*cur_scope, stmt.name)
+                stack.extend((child, child_scope, "class") for child in reversed(stmt.body))
+
+            case ast.FunctionDef():
+                body_ctx = _record_callable(
+                    stmt, is_async=False, scope=cur_scope, context=cur_ctx, state=state
+                )
+                if body_ctx is not None:
+                    child_scope = (*cur_scope, stmt.name)
+                    stack.extend((child, child_scope, body_ctx) for child in reversed(stmt.body))
+
+            case ast.AsyncFunctionDef():
+                body_ctx = _record_callable(
+                    stmt, is_async=True, scope=cur_scope, context=cur_ctx, state=state
+                )
+                if body_ctx is not None:
+                    child_scope = (*cur_scope, stmt.name)
+                    stack.extend((child, child_scope, body_ctx) for child in reversed(stmt.body))
+
+            case ast.TypeAlias() if cur_ctx in {"module", "class"}:
+                state.add_symbol(stmt.name.id, "type_alias", stmt, cur_scope, pos=stmt.name)
+
+            case ast.Assign() | ast.AnnAssign():
+                _walk_assign(stmt, cur_scope, cur_ctx, state)
+
+            case ast.Import() | ast.ImportFrom():
+                _walk_import(stmt, state)
+
+            case ast.If() if cur_ctx == "module" and _is_main_guard(stmt.test):
+                stack.extend((child, cur_scope, cur_ctx) for child in reversed(stmt.orelse))
+
+            case _:
+                children: list[ast.stmt] = []
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.stmt):
+                        children.append(child)
+                    elif isinstance(child, ast.ExceptHandler | ast.match_case):
+                        children.extend(child.body)
+                stack.extend((child, cur_scope, cur_ctx) for child in reversed(children))
 
 
 def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
@@ -338,7 +355,7 @@ def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
     names: set[str] = set()
     for raw_root in roots:
         root = Path(raw_root).resolve()
-        if not root.is_dir():
+        if not root.is_dir() or (root / "pyvenv.cfg").exists():
             continue
         if (root / "__init__.py").exists() and root.name.isidentifier():
             names.add(root.name)
@@ -348,6 +365,7 @@ def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
             if (
                 entry.is_dir()
                 and entry.name.isidentifier()
+                and not (entry / "pyvenv.cfg").exists()
                 and ((entry / "__init__.py").exists() or any(entry.glob("*.py")))
             ):
                 names.add(entry.name)
@@ -367,13 +385,17 @@ def module_name_from_path(
     """Convert a Python file path into its dotted module name (stripping __init__)."""
     path = Path(filepath).resolve()
     if src_root is None:
-        return path.parent.name if path.name == "__init__.py" else path.stem
+        if path.name == "__init__.py":
+            return path.parent.name if path.parent.name.isidentifier() else "__init__"
+        return path.stem
 
     root = Path(src_root).resolve()
     parts = list(path.relative_to(root).with_suffix("").parts)
     if parts and parts[-1] == "__init__":
         parts.pop()
-    return ".".join(parts) if parts else root.name
+    if parts:
+        return ".".join(parts)
+    return root.name if root.name.isidentifier() else "__init__"
 
 
 def extract_symbols(
@@ -386,7 +408,8 @@ def extract_symbols(
     """Parse Python source and return module, class, field, and callable symbol nodes."""
     raw_name = str(filename)
     full_path = raw_name if raw_name == "<memory>" else str(Path(filename).resolve())
-    tree = ast.parse(source, filename=full_path)
+    clean_source = source.removeprefix("\ufeff")
+    tree = ast.parse(clean_source, filename=full_path)
 
     if module:
         mod_name = module.rsplit(".", 1)[-1]
@@ -403,7 +426,7 @@ def extract_symbols(
     if mod_qualname != "<module>":
         internal.add(mod_qualname.split(".", 1)[0])
 
-    total_lines = max(len(source.splitlines()), 1)
+    total_lines = max(len(clean_source.splitlines()), 1)
     state = _WalkState(filepath=full_path, internal_pkgs=frozenset(internal))
     state.add(
         SymbolNode(
@@ -434,8 +457,10 @@ def parse_file(
         )
     else:
         internal = internal_packages
+    with tokenize.open(path) as handle:
+        source = handle.read()
     return extract_symbols(
-        path.read_text(encoding="utf-8"),
+        source,
         filename=path,
         module=mod,
         internal_packages=internal,
