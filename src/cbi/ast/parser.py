@@ -1,13 +1,12 @@
 """Extract symbol definitions and their kinds from Python source using stdlib ast."""
 
 import ast
-import bisect
 import hashlib
-import io
 import sys
 import tokenize
+import warnings
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, TypeAlias
 
@@ -35,7 +34,7 @@ _PROPERTY_DECORATORS: frozenset[str] = frozenset(
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
 _STATICMETHOD_DECORATORS: frozenset[str] = frozenset({"staticmethod", "abstractstaticmethod"})
 _CLASSMETHOD_DECORATORS: frozenset[str] = frozenset({"classmethod", "abstractclassmethod"})
-_RECEIVER_NAMES: frozenset[str] = frozenset({"self", "cls", "mcs", "metacls"})
+_MAX_FILE_BYTES: int = 2 * 1024 * 1024
 _DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
     {
         "__pycache__",
@@ -69,32 +68,21 @@ class SymbolNode:
 @dataclass(slots=True)
 class _WalkState:
     filepath: str
-    source: str
     lines_utf8: tuple[bytes, ...]
     internal_pkgs: frozenset[str] = frozenset()
     symbols: list[SymbolNode] = field(default_factory=list)
-    seen: set[str] = field(default_factory=set)
-    _name_tokens: list[tuple[int, int]] | None = None
-
-    def _nth_name_from(self, line: int, col_offset: int, skip: int) -> tuple[int, int]:
-        if self._name_tokens is None:
-            self._name_tokens = [
-                (tok.start[0], len(tok.line[: tok.start[1]].encode("utf-8")))
-                for tok in tokenize.generate_tokens(io.StringIO(self.source).readline)
-                if tok.type == tokenize.NAME
-            ]
-        idx = bisect.bisect_left(self._name_tokens, (line, col_offset))
-        return self._name_tokens[idx + skip]
+    index_by_qualname: dict[str, int] = field(default_factory=dict)
 
     def def_pos(
         self, stmt: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
     ) -> tuple[int, int]:
+        """Return (line, col_offset) pointing at the class or function identifier."""
         if isinstance(stmt, ast.ClassDef):
-            prefix, skip = b"class ", 1
+            prefix = b"class "
         elif isinstance(stmt, ast.AsyncFunctionDef):
-            prefix, skip = b"async def ", 2
+            prefix = b"async def "
         else:
-            prefix, skip = b"def ", 1
+            prefix = b"def "
         expected = prefix + stmt.name.encode("utf-8")
         row = self.lines_utf8[stmt.lineno - 1]
         after = stmt.col_offset + len(expected)
@@ -102,18 +90,20 @@ class _WalkState:
             after == len(row) or row[after] in b"([: \t\\#"
         ):
             return stmt.lineno, stmt.col_offset + len(prefix)
-        return self._nth_name_from(stmt.lineno, stmt.col_offset, skip)
+        return stmt.lineno, stmt.col_offset
 
     def attr_pos(self, node: ast.Attribute) -> tuple[int, int]:
+        """Return (line, col_offset) pointing at the attribute name on a dot access."""
         end_ln = node.end_lineno or node.lineno
         end_col = node.end_col_offset or 0
         dot_attr = b"." + node.attr.encode("utf-8")
         row = self.lines_utf8[end_ln - 1]
         if end_col >= len(dot_attr) and row[end_col - len(dot_attr) : end_col] == dot_attr:
             return end_ln, end_col - len(dot_attr) + 1
-        return self._nth_name_from(node.lineno, node.col_offset, 1)
+        return node.lineno, node.col_offset
 
     def import_pos(self, alias: ast.alias, short_name: str) -> tuple[int, int]:
+        """Return (line, col_offset) pointing at the short imported symbol name."""
         if "." not in alias.name:
             return alias.lineno, alias.col_offset
         row = self.lines_utf8[alias.lineno - 1]
@@ -124,12 +114,37 @@ class _WalkState:
             after == len(row) or row[after] in b" \t,;\\#)"
         ):
             return alias.lineno, after - len(short_b)
-        return self._nth_name_from(alias.lineno, alias.col_offset, alias.name.count("."))
+        return alias.lineno, alias.col_offset
 
     def add(self, node: SymbolNode) -> None:
-        if node.name != "_" and node.qualname not in self.seen:
-            self.seen.add(node.qualname)
+        """Record a symbol node once unless it is '_' or its qualname already exists."""
+        if node.name != "_" and node.qualname not in self.index_by_qualname:
+            self.index_by_qualname[node.qualname] = len(self.symbols)
             self.symbols.append(node)
+
+    def merge_property_accessor(
+        self,
+        qualname: str,
+        accessor_kind: Literal["setter", "deleter"],
+        end_line: int,
+        acc_hash: str | None,
+    ) -> bool:
+        """Fold a @prop.setter or @prop.deleter span and hash into its property node."""
+        idx = self.index_by_qualname.get(qualname)
+        if idx is None or self.symbols[idx].kind != "property":
+            return False
+        prev = self.symbols[idx]
+        if prev.ast_hash is None and acc_hash is None:
+            merged_hash = None
+        else:
+            raw = f"{prev.ast_hash or ''}|{accessor_kind}:{acc_hash or ''}".encode()
+            merged_hash = hashlib.sha256(raw).hexdigest()[:16]
+        self.symbols[idx] = replace(
+            prev,
+            end_line=max(prev.end_line, end_line),
+            ast_hash=merged_hash,
+        )
+        return True
 
     def add_symbol(
         self,
@@ -143,6 +158,7 @@ class _WalkState:
         ast_hash: str | None = None,
         decorators: list[ast.expr] | None = None,
     ) -> None:
+        """Build and register an internal SymbolNode for the given AST statement."""
         first_line = decorators[0].lineno if decorators else stmt.lineno
         dec_names = tuple(ast.unparse(d) for d in decorators) if decorators else ()
         self.add(
@@ -161,6 +177,7 @@ class _WalkState:
         )
 
     def add_external(self, name: str, qualname: str, alias: ast.alias) -> None:
+        """Build and register an external SymbolNode for an import alias."""
         line, col_offset = self.import_pos(alias, name)
         self.add(
             SymbolNode(
@@ -183,6 +200,7 @@ class _WalkState:
         end_line: int,
         ast_hash: str | None,
     ) -> None:
+        """Build and register a parameter SymbolNode for a callable argument."""
         self.add(
             SymbolNode(
                 name=arg.arg,
@@ -199,6 +217,7 @@ class _WalkState:
 
 
 def _has_decorator(decorators: list[ast.expr], names: frozenset[str]) -> bool:
+    """Return True if any decorator's simple or attribute name is in names."""
     for raw in decorators:
         dec = raw.func if isinstance(raw, ast.Call) else raw
         if isinstance(dec, ast.Name) and dec.id in names:
@@ -208,7 +227,25 @@ def _has_decorator(decorators: list[ast.expr], names: frozenset[str]) -> bool:
     return False
 
 
+def _property_accessor_kind(
+    decorators: list[ast.expr], name: str
+) -> Literal["setter", "deleter"] | None:
+    """Return 'setter' or 'deleter' when decorators match @<name>.setter/.deleter."""
+    for raw in decorators:
+        if (
+            isinstance(raw, ast.Attribute)
+            and isinstance(raw.value, ast.Name)
+            and raw.value.id == name
+        ):
+            if raw.attr == "setter":
+                return "setter"
+            if raw.attr == "deleter":
+                return "deleter"
+    return None
+
+
 def _is_type_alias(annotation: ast.expr) -> bool:
+    """Return True if annotation denotes typing.TypeAlias (including string forms)."""
     if isinstance(annotation, ast.Name):
         return annotation.id == "TypeAlias"
     if isinstance(annotation, ast.Attribute):
@@ -219,6 +256,7 @@ def _is_type_alias(annotation: ast.expr) -> bool:
 
 
 def _is_final_annotation(annotation: ast.expr) -> bool:
+    """Return True if annotation denotes typing.Final or Final[...]."""
     base = annotation.value if isinstance(annotation, ast.Subscript) else annotation
     if isinstance(base, ast.Name):
         return base.id == "Final"
@@ -231,6 +269,7 @@ def _is_final_annotation(annotation: ast.expr) -> bool:
 
 
 def _is_main_guard(test: ast.expr) -> bool:
+    """Return True if test matches __name__ == '__main__' in either operand order."""
     if not (
         isinstance(test, ast.Compare)
         and len(test.ops) == 1
@@ -249,6 +288,7 @@ def _is_main_guard(test: ast.expr) -> bool:
 
 
 def _target_nodes(target: ast.expr) -> list[ast.Name]:
+    """Collect all ast.Name assignment targets, recursing into unpacking."""
     if isinstance(target, ast.Name):
         return [target]
     if isinstance(target, ast.Starred):
@@ -258,21 +298,23 @@ def _target_nodes(target: ast.expr) -> list[ast.Name]:
     return []
 
 
-def _self_attr_nodes(target: ast.expr) -> list[ast.Attribute]:
+def _receiver_attr_nodes(target: ast.expr, receiver: str) -> list[ast.Attribute]:
+    """Collect all <receiver>.<attr> assignment targets, recursing into unpacking."""
     if (
         isinstance(target, ast.Attribute)
         and isinstance(target.value, ast.Name)
-        and target.value.id == "self"
+        and target.value.id == receiver
     ):
         return [target]
     if isinstance(target, ast.Starred):
-        return _self_attr_nodes(target.value)
+        return _receiver_attr_nodes(target.value, receiver)
     if isinstance(target, ast.Tuple | ast.List):
-        return [attr for elt in target.elts for attr in _self_attr_nodes(elt)]
+        return [attr for elt in target.elts for attr in _receiver_attr_nodes(elt, receiver)]
     return []
 
 
 def _is_trivial_stmt(stmt: ast.stmt) -> bool:
+    """Return True if stmt is pass, Ellipsis (...), or raise NotImplementedError."""
     if isinstance(stmt, ast.Pass):
         return True
     if (
@@ -291,6 +333,7 @@ def _is_trivial_stmt(stmt: ast.stmt) -> bool:
 
 
 def _body_hash(body: list[ast.stmt]) -> str | None:
+    """Compute a 16-char SHA-256 structural hash of non-trivial body statements."""
     stmts = body
     if (
         stmts
@@ -303,8 +346,12 @@ def _body_hash(body: list[ast.stmt]) -> str | None:
     if not stmts or all(_is_trivial_stmt(s) for s in stmts):
         return None
 
-    canonical = "\n".join(ast.dump(s, include_attributes=False) for s in stmts)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    hasher = hashlib.sha256()
+    for idx, s in enumerate(stmts):
+        if idx:
+            hasher.update(b"\n")
+        hasher.update(ast.dump(s, include_attributes=False).encode("utf-8"))
+    return hasher.hexdigest()[:16]
 
 
 def _param_hash(
@@ -312,6 +359,7 @@ def _param_hash(
     annotation: ast.expr | None,
     default: ast.expr | None,
 ) -> str | None:
+    """Compute a 16-char SHA-256 hash of a parameter's kind, annotation, and default."""
     if param_kind == "arg" and annotation is None and default is None:
         return None
     ann_s = ast.dump(annotation, include_attributes=False) if annotation is not None else ""
@@ -327,6 +375,7 @@ def _walk_params(
     skip_receiver: bool,
     state: _WalkState,
 ) -> None:
+    """Extract parameter SymbolNodes in signature order, skipping bound receivers."""
     pos_args: list[tuple[_ParamKind, ast.arg]] = [
         *(("posonly", a) for a in arguments.posonlyargs),
         *(("arg", a) for a in arguments.args),
@@ -337,7 +386,7 @@ def _walk_params(
         (kind_tag, a, d)
         for (kind_tag, a), d in zip(pos_args, pos_defaults, strict=True)
     ]
-    if skip_receiver and entries and entries[0][1].arg in _RECEIVER_NAMES:
+    if skip_receiver and entries and entries[0][0] in {"posonly", "arg"}:
         entries = entries[1:]
     if arguments.vararg is not None:
         entries.append(("vararg", arguments.vararg, None))
@@ -367,29 +416,41 @@ def _record_callable(
     scope: tuple[str, ...],
     context: _ScopeContext,
     state: _WalkState,
-) -> _ScopeContext | None:
+) -> tuple[_ScopeContext, str | None] | None:
+    """Record a function, method, or property symbol and return its body walk context."""
     if _has_decorator(stmt.decorator_list, _OVERLOAD_DECORATORS):
         return None
 
     in_class = context == "class"
-    if in_class and _has_decorator(stmt.decorator_list, _PROPERTY_DECORATORS):
-        kind: SymbolKind = "property"
-    elif in_class:
-        kind = "async_method" if is_async else "method"
-    else:
-        kind = "async_function" if is_async else "function"
+    qualname = ".".join([*scope, stmt.name])
+    acc_kind = _property_accessor_kind(stmt.decorator_list, stmt.name) if in_class else None
+    body_digest = _body_hash(stmt.body)
+    end_line = stmt.end_lineno or stmt.lineno
 
-    line, col_offset = state.def_pos(stmt)
-    state.add_symbol(
-        stmt.name,
-        kind,
-        stmt,
-        scope,
-        line=line,
-        col_offset=col_offset,
-        ast_hash=_body_hash(stmt.body),
-        decorators=stmt.decorator_list,
-    )
+    if acc_kind is None or not state.merge_property_accessor(
+        qualname, acc_kind, end_line, body_digest
+    ):
+        if in_class and (
+            _has_decorator(stmt.decorator_list, _PROPERTY_DECORATORS) or acc_kind is not None
+        ):
+            kind: SymbolKind = "property"
+        elif in_class:
+            kind = "async_method" if is_async else "method"
+        else:
+            kind = "async_function" if is_async else "function"
+
+        line, col_offset = state.def_pos(stmt)
+        state.add_symbol(
+            stmt.name,
+            kind,
+            stmt,
+            scope,
+            line=line,
+            col_offset=col_offset,
+            ast_hash=body_digest,
+            decorators=stmt.decorator_list,
+        )
+
     is_static = _has_decorator(stmt.decorator_list, _STATICMETHOD_DECORATORS)
     _walk_params(
         stmt.args,
@@ -398,27 +459,30 @@ def _record_callable(
         state=state,
     )
     pos_params = [*stmt.args.posonlyargs, *stmt.args.args]
-    has_self_receiver = (
+    has_inst_receiver = (
         in_class
         and not is_static
         and not _has_decorator(stmt.decorator_list, _CLASSMETHOD_DECORATORS)
         and bool(pos_params)
-        and pos_params[0].arg == "self"
     )
-    return "method" if has_self_receiver else "function"
+    if has_inst_receiver:
+        return ("method", pos_params[0].arg)
+    return ("function", None)
 
 
 def _walk_assign(
     stmt: ast.Assign | ast.AnnAssign,
     scope: tuple[str, ...],
     context: _ScopeContext,
+    receiver: str | None,
     state: _WalkState,
 ) -> None:
+    """Extract variable, constant, type_alias, or field symbols from an assignment."""
     targets = [stmt.target] if isinstance(stmt, ast.AnnAssign) else stmt.targets
 
-    if context == "method":
+    if context == "method" and receiver is not None:
         for target in targets:
-            for attr_node in _self_attr_nodes(target):
+            for attr_node in _receiver_attr_nodes(target, receiver):
                 line, col_offset = state.attr_pos(attr_node)
                 state.add_symbol(
                     attr_node.attr,
@@ -469,6 +533,7 @@ def _walk_assign(
 
 
 def _walk_import(stmt: ast.Import | ast.ImportFrom, state: _WalkState) -> None:
+    """Extract external SymbolNodes from non-internal absolute imports."""
     if isinstance(stmt, ast.Import):
         for alias in stmt.names:
             if alias.name.split(".", 1)[0] in state.internal_pkgs:
@@ -492,11 +557,12 @@ def _walk_body(
     context: _ScopeContext,
     state: _WalkState,
 ) -> None:
-    stack: list[tuple[ast.stmt, tuple[str, ...], _ScopeContext]] = [
-        (stmt, scope, context) for stmt in reversed(stmts)
+    """Iteratively walk statement blocks to extract symbols across nested scopes."""
+    stack: list[tuple[ast.stmt, tuple[str, ...], _ScopeContext, str | None]] = [
+        (stmt, scope, context, None) for stmt in reversed(stmts)
     ]
     while stack:
-        stmt, cur_scope, cur_ctx = stack.pop()
+        stmt, cur_scope, cur_ctx, cur_recv = stack.pop()
         match stmt:
             case ast.ClassDef():
                 line, col_offset = state.def_pos(stmt)
@@ -511,23 +577,29 @@ def _walk_body(
                     decorators=stmt.decorator_list,
                 )
                 child_scope = (*cur_scope, stmt.name)
-                stack.extend((child, child_scope, "class") for child in reversed(stmt.body))
+                stack.extend((child, child_scope, "class", None) for child in reversed(stmt.body))
 
             case ast.FunctionDef():
                 body_ctx = _record_callable(
                     stmt, is_async=False, scope=cur_scope, context=cur_ctx, state=state
                 )
                 if body_ctx is not None:
+                    next_ctx, next_recv = body_ctx
                     child_scope = (*cur_scope, stmt.name)
-                    stack.extend((child, child_scope, body_ctx) for child in reversed(stmt.body))
+                    stack.extend(
+                        (child, child_scope, next_ctx, next_recv) for child in reversed(stmt.body)
+                    )
 
             case ast.AsyncFunctionDef():
                 body_ctx = _record_callable(
                     stmt, is_async=True, scope=cur_scope, context=cur_ctx, state=state
                 )
                 if body_ctx is not None:
+                    next_ctx, next_recv = body_ctx
                     child_scope = (*cur_scope, stmt.name)
-                    stack.extend((child, child_scope, body_ctx) for child in reversed(stmt.body))
+                    stack.extend(
+                        (child, child_scope, next_ctx, next_recv) for child in reversed(stmt.body)
+                    )
 
             case ast.TypeAlias() if cur_ctx in {"module", "class"}:
                 state.add_symbol(
@@ -540,13 +612,15 @@ def _walk_body(
                 )
 
             case ast.Assign() | ast.AnnAssign():
-                _walk_assign(stmt, cur_scope, cur_ctx, state)
+                _walk_assign(stmt, cur_scope, cur_ctx, cur_recv, state)
 
             case ast.Import() | ast.ImportFrom():
                 _walk_import(stmt, state)
 
             case ast.If() if cur_ctx == "module" and _is_main_guard(stmt.test):
-                stack.extend((child, cur_scope, cur_ctx) for child in reversed(stmt.orelse))
+                stack.extend(
+                    (child, cur_scope, cur_ctx, cur_recv) for child in reversed(stmt.orelse)
+                )
 
             case _:
                 children: list[ast.stmt] = []
@@ -555,36 +629,57 @@ def _walk_body(
                         children.append(child)
                     elif isinstance(child, ast.ExceptHandler | ast.match_case):
                         children.extend(child.body)
-                stack.extend((child, cur_scope, cur_ctx) for child in reversed(children))
+                stack.extend((child, cur_scope, cur_ctx, cur_recv) for child in reversed(children))
+
+
+def _is_module_stem(stem: str) -> bool:
+    """Return True if stem contains only identifier characters (leading digits allowed)."""
+    return bool(stem) and f"_{stem}".isidentifier()
 
 
 def _is_scannable_subdir(entry: Path) -> bool:
-    return (
-        not entry.name.startswith(".")
-        and entry.name not in _DISCOVER_SKIP_DIRS
-        and entry.name.isidentifier()
-        and entry.is_dir()
-        and not (entry / "pyvenv.cfg").exists()
-    )
+    """Return True if entry is a non-hidden, non-venv identifier directory worth scanning."""
+    try:
+        return (
+            not entry.name.startswith(".")
+            and entry.name not in _DISCOVER_SKIP_DIRS
+            and entry.name.isidentifier()
+            and entry.is_dir()
+            and not (entry / "pyvenv.cfg").exists()
+        )
+    except OSError:
+        return False
 
 
 def _contains_python_module(directory: Path) -> bool:
+    """Return True if directory or any scannable subdirectory contains a Python module."""
     visited: set[Path] = set()
     stack: list[Path] = [directory]
     while stack:
         current = stack.pop()
-        resolved = current.resolve()
+        try:
+            resolved = current.resolve()
+        except OSError:
+            continue
         if resolved in visited:
             continue
         visited.add(resolved)
-        for child in current.iterdir():
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for child in entries:
             if child.name.startswith(".") or child.name in _DISCOVER_SKIP_DIRS:
                 continue
-            if (
-                child.is_file()
-                and child.suffix == ".py"
-                and (child.stem == "__init__" or child.stem.isidentifier())
-            ):
+            try:
+                is_py = (
+                    child.is_file()
+                    and child.suffix == ".py"
+                    and _is_module_stem(child.stem)
+                )
+            except OSError:
+                continue
+            if is_py:
                 return True
             if _is_scannable_subdir(child):
                 stack.append(child)
@@ -595,23 +690,32 @@ def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
     """Return top-level Python package and module names under the given root directories."""
     names: set[str] = set()
     for raw_root in roots:
-        root = Path(raw_root).resolve()
-        if not root.is_dir() or (root / "pyvenv.cfg").exists():
+        try:
+            root = Path(raw_root).resolve()
+            if not root.is_dir() or (root / "pyvenv.cfg").exists():
+                continue
+            if (root / "__init__.py").exists() and root.name.isidentifier():
+                names.add(root.name)
+            entries = list(root.iterdir())
+        except OSError:
             continue
-        if (root / "__init__.py").exists() and root.name.isidentifier():
-            names.add(root.name)
-        for entry in root.iterdir():
+        for entry in entries:
             if entry.name.startswith(".") or entry.name in _DISCOVER_SKIP_DIRS:
                 continue
             if _is_scannable_subdir(entry) and _contains_python_module(entry):
                 names.add(entry.name)
-            elif (
-                entry.is_file()
-                and entry.suffix == ".py"
-                and entry.stem != "__init__"
-                and entry.stem.isidentifier()
-            ):
-                names.add(entry.stem)
+            else:
+                try:
+                    is_ident_py = (
+                        entry.is_file()
+                        and entry.suffix == ".py"
+                        and entry.stem != "__init__"
+                        and entry.stem.isidentifier()
+                    )
+                except OSError:
+                    continue
+                if is_ident_py:
+                    names.add(entry.stem)
     return frozenset(names)
 
 
@@ -619,19 +723,25 @@ def module_name_from_path(
     filepath: str | Path, src_root: str | Path | None = None
 ) -> str:
     """Convert a Python file path into its dotted module name (stripping __init__)."""
-    path = Path(filepath).resolve()
+    raw_path = Path(filepath)
     if src_root is None:
+        path = raw_path.resolve()
         if path.name == "__init__.py":
             return path.parent.name if path.parent.name.isidentifier() else "__init__"
         return path.stem
 
-    root = Path(src_root).resolve()
-    parts = list(path.relative_to(root).with_suffix("").parts)
+    raw_root = Path(src_root)
+    try:
+        rel = raw_path.absolute().relative_to(raw_root.absolute())
+    except ValueError:
+        rel = raw_path.resolve().relative_to(raw_root.resolve())
+    parts = list(rel.with_suffix("").parts)
     if parts and parts[-1] == "__init__":
         parts.pop()
     if parts:
         return ".".join(parts)
-    return root.name if root.name.isidentifier() else "__init__"
+    root_name = raw_root.resolve().name
+    return root_name if root_name.isidentifier() else "__init__"
 
 
 def extract_symbols(
@@ -643,31 +753,34 @@ def extract_symbols(
 ) -> list[SymbolNode]:
     """Parse Python source and return module, class, field, parameter, and callable symbols."""
     raw_name = str(filename)
-    full_path = raw_name if raw_name == "<memory>" else str(Path(filename).resolve())
+    is_pseudo = raw_name.startswith("<") and raw_name.endswith(">")
+    full_path = raw_name if is_pseudo else str(Path(filename).resolve())
     clean_source = source.removeprefix("\ufeff")
-    tree = ast.parse(clean_source, filename=full_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        tree = ast.parse(clean_source, filename=full_path)
 
     if module:
         mod_name = module.rsplit(".", 1)[-1]
         mod_qualname = module
-    elif raw_name == "<memory>":
-        mod_name = "<module>"
-        mod_qualname = "<module>"
+    elif is_pseudo:
+        mod_name = raw_name if raw_name != "<memory>" else "<module>"
+        mod_qualname = mod_name
     else:
         mod_name = module_name_from_path(full_path)
         mod_qualname = mod_name
     initial_scope: tuple[str, ...] = (mod_qualname,)
 
     internal = set(internal_packages)
-    if mod_qualname != "<module>":
+    if mod_qualname != "<module>" and not is_pseudo:
         internal.add(mod_qualname.split(".", 1)[0])
 
-    raw_lines = clean_source.splitlines()
+    norm_source = clean_source.replace("\r\n", "\n").replace("\r", "\n")
+    raw_lines = norm_source.removesuffix("\n").split("\n") if norm_source else []
     total_lines = max(len(raw_lines), 1)
     state = _WalkState(
         filepath=full_path,
-        source=clean_source,
-        lines_utf8=tuple(ln.encode("utf-8") for ln in raw_lines),
+        lines_utf8=tuple(ln.encode("utf-8", errors="replace") for ln in raw_lines),
         internal_pkgs=frozenset(internal),
     )
     state.add(
@@ -687,26 +800,41 @@ def extract_symbols(
 
 
 def _iter_python_files(root: Path) -> list[Path]:
-    if not root.is_dir() or (root / "pyvenv.cfg").exists():
+    """Return all indexable Python files under root in deterministic sorted path order."""
+    try:
+        if not root.is_dir() or (root / "pyvenv.cfg").exists():
+            return []
+    except OSError:
         return []
     files: list[Path] = []
     visited: set[Path] = set()
     stack: list[Path] = [root]
     while stack:
         current = stack.pop()
-        resolved = current.resolve()
+        try:
+            resolved = current.resolve()
+        except OSError:
+            continue
         if resolved in visited:
             continue
         visited.add(resolved)
         subdirs: list[Path] = []
-        for entry in sorted(current.iterdir(), key=lambda p: p.name):
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
             if entry.name.startswith(".") or entry.name in _DISCOVER_SKIP_DIRS:
                 continue
-            if (
-                entry.is_file()
-                and entry.suffix == ".py"
-                and (entry.stem == "__init__" or entry.stem.isidentifier())
-            ):
+            try:
+                is_py = (
+                    entry.is_file()
+                    and entry.suffix == ".py"
+                    and _is_module_stem(entry.stem)
+                )
+            except OSError:
+                continue
+            if is_py:
                 files.append(entry)
             elif _is_scannable_subdir(entry):
                 subdirs.append(entry)
@@ -721,8 +849,9 @@ def parse_file(
     internal_packages: Collection[str] | None = None,
 ) -> list[SymbolNode]:
     """Read a Python file from disk and extract all symbol nodes."""
-    path = Path(filepath).resolve()
-    mod = module_name_from_path(path, src_root)
+    raw_path = Path(filepath)
+    mod = module_name_from_path(raw_path, src_root)
+    path = raw_path.resolve()
     if internal_packages is None:
         internal: Collection[str] = (
             discover_internal_packages(src_root) if src_root is not None else ()
@@ -743,8 +872,9 @@ def parse_directory(
     root: str | Path,
     *,
     internal_packages: Collection[str] | None = None,
+    max_file_bytes: int = _MAX_FILE_BYTES,
 ) -> list[SymbolNode]:
-    """Parse all Python modules under root (across all subdirectories) in sorted path order."""
+    """Parse all Python modules under root in sorted order, skipping broken/oversized files."""
     root_path = Path(root).resolve()
     internal: Collection[str] = (
         discover_internal_packages(root_path)
@@ -753,7 +883,12 @@ def parse_directory(
     )
     symbols: list[SymbolNode] = []
     for filepath in _iter_python_files(root_path):
-        symbols.extend(parse_file(filepath, src_root=root_path, internal_packages=internal))
+        try:
+            if filepath.stat().st_size > max_file_bytes:
+                continue
+            symbols.extend(parse_file(filepath, src_root=root_path, internal_packages=internal))
+        except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, OSError):
+            continue
     return symbols
 
 

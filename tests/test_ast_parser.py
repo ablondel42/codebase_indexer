@@ -6,6 +6,7 @@ import hashlib
 import re
 import tokenize
 import unicodedata
+import warnings
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any, cast, get_args
@@ -70,6 +71,11 @@ def _expected_param_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def _split_python_lines(source: str) -> list[str]:
+    norm = source.replace("\r\n", "\n").replace("\r", "\n")
+    return norm.removesuffix("\n").split("\n") if norm else []
+
+
 def _assert_token_at_location(sym: SymbolNode, raw_lines: list[str]) -> None:
     if sym.kind == "module":
         assert (sym.line, sym.col_offset) == (1, 0)
@@ -91,7 +97,7 @@ def _assert_invariants(
     expected_mod_qualname: str,
 ) -> None:
     assert symbols
-    raw_lines = source.splitlines()
+    raw_lines = _split_python_lines(source)
     total_lines = max(len(raw_lines), 1)
 
     mod = symbols[0]
@@ -175,6 +181,8 @@ def test_f00_mock_fixture() -> None:
     assert by_q["cbi.ast.mock.TaskRecord"].decorators == ("dataclass(slots=True)",)
     assert by_q["cbi.ast.mock.TaskSummary.label"].decorators == ("computed_field", "property")
     assert by_q["cbi.ast.mock.TaskWorker.is_ready"].decorators == ("property",)
+    assert by_q["cbi.ast.mock.TaskWorker.is_ready"].start_line == 126
+    assert by_q["cbi.ast.mock.TaskWorker.is_ready"].end_line == 132
     assert by_q["cbi.ast.mock.TaskWorker.worker_id"].decorators == ("cached_property",)
     run_batch = by_q["cbi.ast.mock.run_batch"]
     assert run_batch.decorators == ("route('/tasks/batch')",)
@@ -1279,35 +1287,49 @@ def test_f32_parameters_receivers_and_hashes() -> None:
     assert len(set(diff_hashes)) == 5
 
 
-def test_f33_identifier_offsets_and_multiline_headers() -> None:
-    """Fixture: tests/fixtures/ast/f33_identifier_offsets_and_multiline_headers.py."""
-    path, _, symbols = _parse_fixture("f33_identifier_offsets_and_multiline_headers.py")
-    mod = "f33_identifier_offsets_and_multiline_headers"
+def test_f33_realistic_resilience_and_receivers() -> None:
+    """Fixture: tests/fixtures/ast/f33_realistic_resilience_and_receivers.py."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SyntaxWarning)
+        path, source, symbols = _parse_fixture("f33_realistic_resilience_and_receivers.py")
+    mod = "f33_realistic_resilience_and_receivers"
 
     rows = [(s.qualname, s.kind, s.line, s.col_offset, s.start_line, s.end_line) for s in symbols]
     assert rows == [
-        (mod, "module", 1, 0, 1, 43),
+        (mod, "module", 1, 0, 1, 30),
         ("urllib.parse", "external", 1, 14, 1, 1),
-        ("xml.etree.ElementTree", "external", 2, 17, 2, 2),
-        ("email.mime.text", "external", 3, 22, 3, 3),
-        ("urllib.request", "external", 5, 26, 5, 5),
-        (f"{mod}._identity", "function", 9, 4, 9, 10),
-        (f"{mod}._identity.fn", "parameter", 9, 14, 9, 9),
-        (f"{mod}.SpacedClass", "class", 13, 8, 13, 14),
-        (f"{mod}.spaced_fn", "function", 17, 7, 17, 18),
-        (f"{mod}.spaced_async", "async_function", 21, 16, 21, 22),
-        (f"{mod}.MultilineClass", "class", 26, 4, 25, 32),
-        (f"{mod}.MultilineClass.assign_attrs", "method", 27, 8, 27, 32),
-        (f"{mod}.MultilineClass.plain_attr", "field", 28, 13, 28, 28),
-        (f"{mod}.MultilineClass.spaced_attr", "field", 32, 12, 29, 32),
-        (f"{mod}.multiline_async", "async_function", 38, 4, 35, 39),
-        (f"{mod}.utf8_sig", "function", 42, 4, 42, 43),
-        (f"{mod}.utf8_sig.prefix", "parameter", 42, 13, 42, 42),
-        (f"{mod}.utf8_sig.target", "parameter", 42, 35, 42, 42),
+        (f"{mod}.LEGACY_PATTERN", "constant", 3, 0, 3, 3),
+        (f"{mod}.CustomModel", "class", 6, 6, 6, 25),
+        (f"{mod}.CustomModel.update", "method", 7, 8, 7, 8),
+        (f"{mod}.CustomModel.update.kwargs", "parameter", 7, 24, 7, 7),
+        (f"{mod}.CustomModel.updated", "field", 8, 14, 8, 8),
+        (f"{mod}.CustomModel.from_dict", "method", 11, 8, 10, 13),
+        (f"{mod}.CustomModel.from_dict.raw", "parameter", 11, 25, 11, 11),
+        (f"{mod}.CustomModel.score", "property", 16, 8, 15, 25),
+        (f"{mod}.CustomModel.score.value", "parameter", 20, 20, 20, 20),
+        (f"{mod}.CustomModel._score", "field", 21, 13, 21, 21),
+        (f"{mod}.utf8_sig", "function", 28, 4, 28, 30),
+        (f"{mod}.utf8_sig.prefix", "parameter", 28, 13, 28, 28),
+        (f"{mod}.utf8_sig.count", "parameter", 28, 35, 28, 28),
     ]
+    assert {s.qualname for s in symbols}.isdisjoint(
+        {f"{mod}.CustomModel.update._self", f"{mod}.CustomModel.from_dict.klass"}
+    )
     by_q = {s.qualname: s for s in symbols}
-    assert by_q[f"{mod}.multiline_async"].location == _loc(path, 38, 5)
-    assert by_q[f"{mod}.MultilineClass.spaced_attr"].location == _loc(path, 32, 13)
+    assert by_q[f"{mod}.CustomModel.score"].location == _loc(path, 16, 9)
+
+    edited_setter = source.replace("self._score = value", "self._score = max(0, value)")
+    edited_syms = {s.qualname: s for s in extract_symbols(edited_setter, filename=path, module=mod)}
+    assert (
+        edited_syms[f"{mod}.CustomModel.score"].ast_hash
+        != by_q[f"{mod}.CustomModel.score"].ast_hash
+    )
+
+    ff_syms = extract_symbols("\f\ndef after_ff() -> int:\n    return 1\n", module="m")
+    assert (ff_syms[0].end_line, ff_syms[1].line, ff_syms[1].col_offset) == (3, 2, 4)
+
+    stdin_syms = extract_symbols("x = 1\n", filename="<stdin>")
+    assert (stdin_syms[0].qualname, stdin_syms[0].location) == ("<stdin>", "<stdin>:1:1")
 
 
 # ---------------------------------------------------------------------------
@@ -1421,7 +1443,7 @@ def test_f37_hyphenated_root_dunder_init() -> None:
     assert syms_direct == syms_root
 
 
-def test_f38_deep_namespace_and_parse_directory() -> None:
+def test_f38_deep_namespace_and_parse_directory(tmp_path: Path) -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/deep_ns/sub_pkg/leaf.py."""
     leaf_py = (SAMPLE_PKG / "deep_ns" / "sub_pkg" / "leaf.py").resolve()
     source = leaf_py.read_text(encoding="utf-8")
@@ -1456,6 +1478,42 @@ def test_f38_deep_namespace_and_parse_directory() -> None:
         ("__init__.APP_VERSION", "constant"),
         ("__init__.create_app", "function"),
     ]
+
+    fixture_dir_syms = parse_directory(AST_FIXTURES)
+    fixture_mods = {s.qualname for s in fixture_dir_syms if s.kind == "module"}
+    assert "f28_syntax_error" not in fixture_mods
+    assert "f33_realistic_resilience_and_receivers" in fixture_mods
+
+    ext_dir = tmp_path / "external"
+    ext_dir.mkdir()
+    (ext_dir / "shared.py").write_text("SHARED = 1\n", encoding="utf-8")
+    (ext_dir / "sub.py").write_text("SUB = 2\n", encoding="utf-8")
+
+    repo = tmp_path / "repo"
+    (repo / "app" / "migrations").mkdir(parents=True)
+    (repo / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "app" / "migrations" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "app" / "migrations" / "0001_initial.py").write_text(
+        "class Migration:\n    pass\n", encoding="utf-8"
+    )
+    (repo / "app" / "linked_mod.py").symlink_to(ext_dir / "shared.py")
+    (repo / "linked_pkg").symlink_to(ext_dir)
+    (repo / "broken_syntax.py").write_text("def broken(:\n", encoding="utf-8")
+    (repo / "bad_bytes.py").write_bytes(b"# -*- coding: utf-8 -*-\nx = '\xff'\n")
+    (repo / "huge.py").write_text("HUGE = " + "1" * 80 + "\n", encoding="utf-8")
+
+    repo_syms = parse_directory(repo, max_file_bytes=64)
+    repo_mods = {s.qualname for s in repo_syms if s.kind == "module"}
+    assert {
+        "app",
+        "app.migrations",
+        "app.migrations.0001_initial",
+        "app.linked_mod",
+        "linked_pkg.shared",
+        "linked_pkg.sub",
+    }.issubset(repo_mods)
+    assert {"broken_syntax", "bad_bytes", "huge"}.isdisjoint(repo_mods)
+    assert "app.migrations.0001_initial.Migration" in {s.qualname for s in repo_syms}
 
 
 def test_f39_dogfood_ast_parser_and_api_contract() -> None:
