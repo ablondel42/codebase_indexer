@@ -32,6 +32,9 @@ SAMPLE_PKG = AST_FIXTURES / "sample_pkg"
 _CALLABLE_OR_CLASS_KINDS: frozenset[SymbolKind] = frozenset(
     {"class", "function", "async_function", "method", "async_method", "property"}
 )
+_HASHABLE_KINDS: frozenset[SymbolKind] = frozenset(
+    {"class", "function", "async_function", "method", "async_method", "property", "parameter"}
+)
 _HEX_CHARS: frozenset[str] = frozenset("0123456789abcdef")
 
 
@@ -42,6 +45,25 @@ def _loc(path: Path, line: int, col: int) -> str:
 def _expected_hash(stmt_source: str) -> str:
     body = ast.parse(stmt_source).body
     canonical = "\n".join(ast.dump(s, include_attributes=False) for s in body)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _expected_param_hash(
+    param_kind: str,
+    annotation_src: str | None = None,
+    default_src: str | None = None,
+) -> str:
+    ann_s = (
+        ast.dump(ast.parse(annotation_src, mode="eval").body, include_attributes=False)
+        if annotation_src is not None
+        else ""
+    )
+    def_s = (
+        ast.dump(ast.parse(default_src, mode="eval").body, include_attributes=False)
+        if default_src is not None
+        else ""
+    )
+    canonical = f"{param_kind}|{ann_s}|{def_s}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -65,7 +87,7 @@ def _assert_token_at_location(
             assert tail.startswith(b"async ")
         case "property":
             assert tail.startswith((b"def ", b"async "))
-        case "constant" | "variable" | "type_alias":
+        case "constant" | "variable" | "type_alias" | "parameter":
             assert tail.startswith(sym.name.encode("utf-8"))
         case "field":
             assert tail.startswith((sym.name.encode("utf-8"), b"self"))
@@ -107,12 +129,13 @@ def _assert_invariants(
             assert sym.qualname.startswith(f"{expected_mod_qualname}.")
             assert sym.qualname.endswith(f".{sym.name}")
 
-        if sym.kind in _CALLABLE_OR_CLASS_KINDS:
+        if sym.kind in _HASHABLE_KINDS:
             if sym.ast_hash is not None:
                 assert len(sym.ast_hash) == 16
                 assert set(sym.ast_hash) <= _HEX_CHARS
         else:
             assert sym.ast_hash is None
+        if sym.kind not in _CALLABLE_OR_CLASS_KINDS:
             assert sym.decorators == ()
 
 
@@ -155,10 +178,15 @@ def test_f00_mock_fixture() -> None:
     symbols = extract_symbols(source, filename=path, module="cbi.ast.mock")
     assert parse_file(path, src_root=SRC_ROOT) == symbols
     _assert_invariants(symbols, source, str(path), "cbi.ast.mock")
+    assert {sym.kind for sym in symbols} == set(get_args(SymbolKind))
 
     by_q = {sym.qualname: sym for sym in symbols}
     assert by_q["cbi.ast.mock.QuotaExceededError"].ast_hash is None
+    assert by_q["cbi.ast.mock.BaseWorker.reset"].ast_hash is None
     assert by_q["cbi.ast.mock.TaskRecord"].decorators == ("dataclass(slots=True)",)
+    assert by_q["cbi.ast.mock.TaskSummary.label"].decorators == ("computed_field", "property")
+    assert by_q["cbi.ast.mock.TaskWorker.is_ready"].decorators == ("property",)
+    assert by_q["cbi.ast.mock.TaskWorker.worker_id"].decorators == ("cached_property",)
     run_batch = by_q["cbi.ast.mock.run_batch"]
     assert run_batch.decorators == ("route('/tasks/batch')",)
     assert run_batch.start_line == int(run_batch.location.rsplit(":", 2)[1]) - 1
@@ -168,11 +196,14 @@ def test_f00_mock_fixture() -> None:
         "clean_tags",
         "tag",
         "summary",
+        "base",
         "resolved",
         "worker",
         "results",
         "rec",
         "exc",
+        "pprint",
+        "MAIN_ONLY_DEBUG",
     }
     assert leaked_locals.isdisjoint({sym.name for sym in symbols})
     assert "cbi.ast.mock.TaskWorker.process.tag_count" not in by_q
@@ -185,45 +216,84 @@ def test_f00_mock_fixture() -> None:
         ("collections.abc.Callable", "external"),
         ("dataclasses.dataclass", "external"),
         ("dataclasses.field", "external"),
+        ("enum.StrEnum", "external"),
+        ("functools.cached_property", "external"),
+        ("typing.TYPE_CHECKING", "external"),
         ("typing.Any", "external"),
+        ("typing.Final", "external"),
         ("typing.Self", "external"),
         ("typing.TypeAlias", "external"),
+        ("typing.overload", "external"),
         ("pydantic.BaseModel", "external"),
         ("pydantic.Field", "external"),
+        ("pydantic.computed_field", "external"),
+        ("sqlite3.Connection", "external"),
         ("cbi.ast.mock.__all__", "variable"),
         ("cbi.ast.mock.Payload", "type_alias"),
+        ("cbi.ast.mock.BatchResult", "type_alias"),
         ("cbi.ast.mock.DEFAULT_RETRIES", "constant"),
         ("cbi.ast.mock.SERVICE_NAME", "constant"),
         ("cbi.ast.mock.ROUTES", "constant"),
+        ("cbi.ast.mock.max_batch_size", "constant"),
+        ("cbi.ast.mock.active_workers", "variable"),
+        ("cbi.ast.mock.default_timeout", "variable"),
         ("cbi.ast.mock.route", "function"),
+        ("cbi.ast.mock.route.path", "parameter"),
         ("cbi.ast.mock.route.register", "function"),
+        ("cbi.ast.mock.route.register.fn", "parameter"),
         ("cbi.ast.mock.QuotaExceededError", "class"),
+        ("cbi.ast.mock.TaskStatus", "class"),
+        ("cbi.ast.mock.TaskStatus.PENDING", "field"),
+        ("cbi.ast.mock.TaskStatus.DONE", "field"),
         ("cbi.ast.mock.TaskRecord", "class"),
         ("cbi.ast.mock.TaskRecord.task_id", "field"),
         ("cbi.ast.mock.TaskRecord.title", "field"),
         ("cbi.ast.mock.TaskRecord.tags", "field"),
+        ("cbi.ast.mock.TaskRecord.slug", "field"),
+        ("cbi.ast.mock.TaskRecord.__post_init__", "method"),
         ("cbi.ast.mock.TaskSummary", "class"),
         ("cbi.ast.mock.TaskSummary.task_id", "field"),
         ("cbi.ast.mock.TaskSummary.title", "field"),
+        ("cbi.ast.mock.TaskSummary.status", "field"),
         ("cbi.ast.mock.TaskSummary.tag_count", "field"),
+        ("cbi.ast.mock.TaskSummary.label", "property"),
         ("cbi.ast.mock.BaseWorker", "class"),
         ("cbi.ast.mock.BaseWorker.kind", "field"),
+        ("cbi.ast.mock.BaseWorker.reset", "method"),
         ("cbi.ast.mock.BaseWorker.describe", "method"),
         ("cbi.ast.mock.TaskWorker", "class"),
+        ("cbi.ast.mock.TaskWorker.WorkerTag", "type_alias"),
         ("cbi.ast.mock.TaskWorker.kind", "field"),
+        ("cbi.ast.mock.TaskWorker.Config", "class"),
+        ("cbi.ast.mock.TaskWorker.Config.strict", "field"),
         ("cbi.ast.mock.TaskWorker.__init__", "method"),
+        ("cbi.ast.mock.TaskWorker.__init__.root", "parameter"),
+        ("cbi.ast.mock.TaskWorker.__init__.max_retries", "parameter"),
+        ("cbi.ast.mock.TaskWorker.__init__.conn", "parameter"),
         ("cbi.ast.mock.TaskWorker.root", "field"),
         ("cbi.ast.mock.TaskWorker.max_retries", "field"),
         ("cbi.ast.mock.TaskWorker._processed", "field"),
+        ("cbi.ast.mock.TaskWorker._ready", "field"),
         ("cbi.ast.mock.TaskWorker.from_cwd", "method"),
         ("cbi.ast.mock.TaskWorker.normalize_title", "method"),
+        ("cbi.ast.mock.TaskWorker.normalize_title.raw", "parameter"),
         ("cbi.ast.mock.TaskWorker.is_ready", "property"),
+        ("cbi.ast.mock.TaskWorker.is_ready.value", "parameter"),
+        ("cbi.ast.mock.TaskWorker.worker_id", "property"),
         ("cbi.ast.mock.TaskWorker.process", "method"),
+        ("cbi.ast.mock.TaskWorker.process.record", "parameter"),
+        ("cbi.ast.mock.TaskWorker.process.strict", "parameter"),
         ("cbi.ast.mock.TaskWorker.process_async", "async_method"),
+        ("cbi.ast.mock.TaskWorker.process_async.record", "parameter"),
+        ("cbi.ast.mock.TaskWorker.process_async.extra_tags", "parameter"),
+        ("cbi.ast.mock.TaskWorker.process_async.meta", "parameter"),
         ("cbi.ast.mock.build_worker", "function"),
+        ("cbi.ast.mock.build_worker.raw_dir", "parameter"),
         ("uuid", "external"),
         ("cbi.ast.mock.run_batch", "async_function"),
+        ("cbi.ast.mock.run_batch.records", "parameter"),
         ("cbi.ast.mock.run_batch.format_error", "function"),
+        ("cbi.ast.mock.run_batch.format_error.err", "parameter"),
         ("decimal.Decimal", "external"),
     ]
 
@@ -247,7 +317,7 @@ def test_f01_all_symbol_kinds() -> None:
         "    return 2\n"
         "def ping(self) -> None: ...\n"
     )
-    helper_body = 'return int(pathlib.PurePosixPath("a").name == "a") + LIMIT + count'
+    helper_body = 'return int(pathlib.PurePosixPath("a").name == "a") + LIMIT + count + step'
 
     assert symbols == [
         SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 29),
@@ -306,6 +376,15 @@ def test_f01_all_symbol_kinds() -> None:
             ast_hash=_expected_hash(helper_body),
         ),
         SymbolNode(
+            "step",
+            f"{mod}.helper.step",
+            "parameter",
+            _loc(path, 24, 12),
+            24,
+            24,
+            ast_hash=_expected_param_hash("arg", "int", "1"),
+        ),
+        SymbolNode(
             "run",
             f"{mod}.run",
             "async_function",
@@ -329,11 +408,15 @@ def test_f02_stacked_and_method_decorators() -> None:
         ("typing.TypeVar", "external"),
         (f"{mod}.T", "constant"),
         (f"{mod}.first", "function"),
+        (f"{mod}.first.cls", "parameter"),
         (f"{mod}.second", "function"),
+        (f"{mod}.second.flag", "parameter"),
         (f"{mod}.second.wrap", "function"),
+        (f"{mod}.second.wrap.cls", "parameter"),
         (f"{mod}.Service", "class"),
         (f"{mod}.Service.make", "method"),
         (f"{mod}.Service.check", "async_method"),
+        (f"{mod}.Service.check.x", "parameter"),
     ]
     by_q = {s.qualname: s for s in symbols}
     svc = by_q[f"{mod}.Service"]
@@ -353,10 +436,15 @@ def test_f03_pep614_and_multiline_decorators() -> None:
         ("collections.abc.Callable", "external"),
         ("typing.Any", "external"),
         (f"{mod}.dec_a", "function"),
+        (f"{mod}.dec_a.cls", "parameter"),
         (f"{mod}.dec_b", "function"),
+        (f"{mod}.dec_b.cls", "parameter"),
         (f"{mod}._Guard", "class"),
         (f"{mod}._Guard.guard", "method"),
+        (f"{mod}._Guard.guard.level", "parameter"),
         (f"{mod}.app_post", "function"),
+        (f"{mod}.app_post.path", "parameter"),
+        (f"{mod}.app_post.status_code", "parameter"),
         (f"{mod}.decorators", "variable"),
         (f"{mod}.FLAG", "constant"),
         (f"{mod}.registry", "variable"),
@@ -405,7 +493,9 @@ def test_f04_property_decorators() -> None:
         ("pydantic.BaseModel", "external"),
         ("pydantic.computed_field", "external"),
         (f"{mod}.trace", "function"),
+        (f"{mod}.trace.fn", "parameter"),
         (f"{mod}.top_fn", "function"),
+        (f"{mod}.top_fn.x", "parameter"),
         (f"{mod}.PlainItem", "class"),
         (f"{mod}.PlainItem.p_plain", "property"),
         (f"{mod}.PlainItem.p_cached", "property"),
@@ -430,7 +520,9 @@ def test_f05_property_setter_deleter() -> None:
         (f"{mod}.Account", "class"),
         (f"{mod}.Account._balance", "field"),
         (f"{mod}.Account.balance", "property"),
+        (f"{mod}.Account.balance.v", "parameter"),
         (f"{mod}.Account.balance.validate", "function"),
+        (f"{mod}.Account.balance.validate.raw", "parameter"),
     ]
     balance = {s.qualname: s for s in symbols}[f"{mod}.Account.balance"]
     assert balance.location == _loc(path, 5, 5)
@@ -447,10 +539,14 @@ def test_f06_overload_matrix() -> None:
         ("typing", "external"),
         ("typing.overload", "external"),
         (f"{mod}.parse", "function"),
+        (f"{mod}.parse.x", "parameter"),
         (f"{mod}.aparse", "async_function"),
+        (f"{mod}.aparse.x", "parameter"),
         (f"{mod}.Codec", "class"),
         (f"{mod}.Codec.encode", "method"),
+        (f"{mod}.Codec.encode.x", "parameter"),
         (f"{mod}.Codec.decode", "method"),
+        (f"{mod}.Codec.decode.x", "parameter"),
         (f"{mod}.Codec.prop", "property"),
     ]
     by_q = {s.qualname: s for s in symbols}
@@ -484,7 +580,10 @@ def test_f07_class_and_init_fields() -> None:
         (f"{mod}.Record.tag_a", "field"),
         (f"{mod}.Record.tag_b", "field"),
         (f"{mod}.Record.__setitem__", "method"),
+        (f"{mod}.Record.__setitem__.idx", "parameter"),
+        (f"{mod}.Record.__setitem__.val", "parameter"),
         (f"{mod}.Record.__init__", "method"),
+        (f"{mod}.Record.__init__.other", "parameter"),
         (f"{mod}.Record.bare_typed", "field"),
         (f"{mod}.Record.first", "field"),
         (f"{mod}.Record.mid", "field"),
@@ -513,6 +612,7 @@ def test_f08_field_deduplication() -> None:
         (f"{mod}.Item", "class", _loc(path, 1, 1)),
         (f"{mod}.Item.x", "field", _loc(path, 2, 5)),
         (f"{mod}.Item.__init__", "method", _loc(path, 4, 5)),
+        (f"{mod}.Item.__init__.flag", "parameter", _loc(path, 4, 24)),
         (f"{mod}.Item.y", "field", _loc(path, 7, 13)),
     ]
 
@@ -605,6 +705,7 @@ def test_f12_pep695_generics_and_type_stmt() -> None:
         (f"{mod}.Holder.value", "field", _loc(path, 9, 5), 9, 9),
         (f"{mod}.Holder.Nested", "type_alias", _loc(path, 10, 10), 10, 10),
         (f"{mod}.build", "function", _loc(path, 13, 1), 13, 16),
+        (f"{mod}.build.val", "parameter", _loc(path, 13, 14), 13, 13),
     ]
 
 
@@ -718,10 +819,12 @@ def test_f17_init_control_flow_and_nested_scopes() -> None:
         ("typing.Any", "external"),
         (f"{mod}.Complex", "class"),
         (f"{mod}.Complex.__init__", "method"),
+        (f"{mod}.Complex.__init__.items", "parameter"),
         (f"{mod}.Complex.empty", "field"),
         (f"{mod}.Complex.nonempty", "field"),
         (f"{mod}.Complex.failed", "field"),
         (f"{mod}.Complex.__init__.inner", "function"),
+        (f"{mod}.Complex.__init__.inner.self_arg", "parameter"),
         (f"{mod}.factory", "function"),
         (f"{mod}.factory.Inner", "class"),
         (f"{mod}.factory.Inner.cls_field", "field"),
@@ -742,14 +845,18 @@ def test_f18_overloaded_and_non_class_dunder_init() -> None:
         ("typing.overload", "external"),
         (f"{mod}.Client", "class"),
         (f"{mod}.Client.__init__", "method"),
+        (f"{mod}.Client.__init__.host", "parameter"),
+        (f"{mod}.Client.__init__.port", "parameter"),
         (f"{mod}.Client.host", "field"),
         (f"{mod}.Client.port", "field"),
         (f"{mod}.Client.__init__.LocalHelper", "class"),
         (f"{mod}.Client.__init__.LocalHelper.__init__", "method"),
         (f"{mod}.Client.__init__.LocalHelper.helper_only", "field"),
         (f"{mod}.__init__", "function"),
+        (f"{mod}.__init__.self", "parameter"),
         (f"{mod}.wrapper", "function"),
         (f"{mod}.wrapper.__init__", "function"),
+        (f"{mod}.wrapper.__init__.self", "parameter"),
     ]
     assert {s.qualname: s for s in symbols}[f"{mod}.Client.__init__"].location == _loc(path, 8, 5)
 
@@ -768,8 +875,12 @@ def test_f19_local_noise_torture() -> None:
         (f"{mod}.KEEP", "constant"),
         (f"{mod}.GLOBAL_VAR", "constant"),
         (f"{mod}.torture", "function"),
+        (f"{mod}.torture.items", "parameter"),
+        (f"{mod}.torture.other", "parameter"),
         (f"{mod}.torture.touch", "function"),
         (f"{mod}.async_torture", "async_function"),
+        (f"{mod}.async_torture.aiter", "parameter"),
+        (f"{mod}.async_torture.actx", "parameter"),
     ]
 
 
@@ -784,6 +895,7 @@ def test_f20_rebinding_and_shadowing() -> None:
         (f"{mod}.FLAG", "constant"),
         (f"{mod}.x", "variable"),
         (f"{mod}.sin", "function"),
+        (f"{mod}.sin.v", "parameter"),
         (f"{mod}.job", "function"),
         ("fractions", "external"),
         (f"{mod}.job.sub", "function"),
@@ -808,22 +920,33 @@ def test_f21_function_hash_clones_and_variants() -> None:
         ("collections.abc.Callable", "external"),
         ("typing.Any", "external"),
         (f"{mod}.dec_a", "function"),
+        (f"{mod}.dec_a.fn", "parameter"),
         (f"{mod}.dec_b", "function"),
+        (f"{mod}.dec_b.flag", "parameter"),
         (f"{mod}.alpha", "function"),
+        (f"{mod}.alpha.x", "parameter"),
         (f"{mod}.beta", "function"),
+        (f"{mod}.beta.x", "parameter"),
         (f"{mod}.gamma", "async_function"),
+        (f"{mod}.gamma.x", "parameter"),
         (f"{mod}.delta", "function"),
+        (f"{mod}.delta.y", "parameter"),
         (f"{mod}.eps", "function"),
+        (f"{mod}.eps.x", "parameter"),
         (f"{mod}.zeta", "function"),
         (f"{mod}.eta", "function"),
+        (f"{mod}.eta.x", "parameter"),
         (f"{mod}.theta", "function"),
+        (f"{mod}.theta.x", "parameter"),
         (f"{mod}.iota", "function"),
+        (f"{mod}.iota.x", "parameter"),
     ]
     by_q = {s.qualname: s for s in symbols}
     h_alpha = by_q[f"{mod}.alpha"].ast_hash
     assert h_alpha == _expected_hash("return x + 1")
     assert by_q[f"{mod}.beta"].ast_hash == h_alpha
     assert by_q[f"{mod}.gamma"].ast_hash == h_alpha
+    assert by_q[f"{mod}.alpha.x"].ast_hash != by_q[f"{mod}.beta.x"].ast_hash
 
     for variant in ("delta", "eps", "zeta", "eta", "theta", "iota"):
         h_var = by_q[f"{mod}.{variant}"].ast_hash
@@ -857,6 +980,7 @@ def test_f22_class_hash_clones_and_raises() -> None:
         (f"{mod}.make_err", "function"),
         (f"{mod}.fail_value_error", "function"),
         (f"{mod}.guarded_not_implemented", "function"),
+        (f"{mod}.guarded_not_implemented.flag", "parameter"),
         (f"{mod}.bare_reraise", "function"),
         (f"{mod}.dynamic_raise", "function"),
     ]
@@ -1034,6 +1158,7 @@ def test_f31_deep_elif_and_nesting() -> None:
     assert [(s.name, s.qualname, s.kind) for s in symbols] == [
         (mod, mod, "module"),
         ("dispatch_code", f"{mod}.dispatch_code", "function"),
+        ("code", f"{mod}.dispatch_code.code", "parameter"),
         ("fractions", "fractions", "external"),
         ("AFTER_CHAIN", f"{mod}.AFTER_CHAIN", "constant"),
     ]
@@ -1046,12 +1171,85 @@ def test_f31_deep_elif_and_nesting() -> None:
     assert by_q[f"{mod}.AFTER_CHAIN"].location == _loc(path, 38, 1)
 
 
+def test_f32_parameters_receivers_and_hashes() -> None:
+    """Fixture: tests/fixtures/ast/f32_parameters_receivers_and_hashes.py."""
+    path, _, symbols = _parse_fixture("f32_parameters_receivers_and_hashes.py")
+    mod = "f32_parameters_receivers_and_hashes"
+
+    assert [(s.qualname, s.kind) for s in symbols] == [
+        (mod, "module"),
+        (f"{mod}.full_sig", "function"),
+        (f"{mod}.full_sig.po_bare", "parameter"),
+        (f"{mod}.full_sig.bare", "parameter"),
+        (f"{mod}.full_sig.typed", "parameter"),
+        (f"{mod}.full_sig.opt", "parameter"),
+        (f"{mod}.full_sig.args", "parameter"),
+        (f"{mod}.full_sig.kw_req", "parameter"),
+        (f"{mod}.full_sig.kw_opt", "parameter"),
+        (f"{mod}.full_sig.kwargs", "parameter"),
+        (f"{mod}.posonly_default", "function"),
+        (f"{mod}.posonly_default.po_req", "parameter"),
+        (f"{mod}.posonly_default.po_def", "parameter"),
+        (f"{mod}.ReceiverDemo", "class"),
+        (f"{mod}.ReceiverDemo.inst_m", "method"),
+        (f"{mod}.ReceiverDemo.inst_m.a", "parameter"),
+        (f"{mod}.ReceiverDemo.pos_self", "method"),
+        (f"{mod}.ReceiverDemo.pos_self.val", "parameter"),
+        (f"{mod}.ReceiverDemo.cls_m", "method"),
+        (f"{mod}.ReceiverDemo.cls_m.token", "parameter"),
+        (f"{mod}.ReceiverDemo.stat_m", "method"),
+        (f"{mod}.ReceiverDemo.stat_m.self", "parameter"),
+        (f"{mod}.ReceiverDemo.stat_m.cls", "parameter"),
+        (f"{mod}.Meta", "class"),
+        (f"{mod}.Meta.__new__", "method"),
+        (f"{mod}.Meta.__new__.name", "parameter"),
+        (f"{mod}.top_fn", "function"),
+        (f"{mod}.top_fn.self", "parameter"),
+        (f"{mod}.top_fn.cls", "parameter"),
+        (f"{mod}.bare_only", "function"),
+        (f"{mod}.bare_only.bare", "parameter"),
+        (f"{mod}.clone_a", "function"),
+        (f"{mod}.clone_a.first", "parameter"),
+        (f"{mod}.clone_a.flag", "parameter"),
+        (f"{mod}.clone_b", "function"),
+        (f"{mod}.clone_b.second", "parameter"),
+        (f"{mod}.clone_b.active", "parameter"),
+        (f"{mod}.diff_forms", "function"),
+        (f"{mod}.diff_forms.a", "parameter"),
+        (f"{mod}.diff_forms.b", "parameter"),
+        (f"{mod}.diff_forms.c", "parameter"),
+        (f"{mod}.diff_forms.d", "parameter"),
+        (f"{mod}.diff_forms.e", "parameter"),
+    ]
+
+    by_q = {s.qualname: s for s in symbols}
+    assert by_q[f"{mod}.full_sig.po_bare"].ast_hash == _expected_param_hash("posonly")
+    assert by_q[f"{mod}.full_sig.bare"].ast_hash is None
+    assert by_q[f"{mod}.bare_only.bare"].ast_hash is None
+    assert by_q[f"{mod}.full_sig.args"].location == _loc(path, 8, 6)
+    assert by_q[f"{mod}.full_sig.kwargs"].location == _loc(path, 14, 7)
+
+    kw_opt = by_q[f"{mod}.full_sig.kw_opt"]
+    assert (kw_opt.start_line, kw_opt.end_line) == (10, 13)
+    assert kw_opt.ast_hash == _expected_param_hash("kwonly", "list[int]", "[1, 2]")
+
+    assert by_q[f"{mod}.ReceiverDemo.pos_self.val"].ast_hash == _expected_param_hash(
+        "arg", "int", "2"
+    )
+    assert by_q[f"{mod}.clone_a.first"].ast_hash == by_q[f"{mod}.clone_b.second"].ast_hash
+    assert by_q[f"{mod}.clone_a.flag"].ast_hash == by_q[f"{mod}.clone_b.active"].ast_hash
+
+    assert by_q[f"{mod}.posonly_default.po_def"].ast_hash == by_q[f"{mod}.diff_forms.a"].ast_hash
+    diff_hashes = [by_q[f"{mod}.diff_forms.{name}"].ast_hash for name in ("a", "b", "c", "d", "e")]
+    assert len(set(diff_hashes)) == 5
+
+
 # ---------------------------------------------------------------------------
-# f32 - f36: Package Layout, Discovery, API Contract & Dogfooding
+# f33 - f38: Package Layout, Discovery, API Contract & Dogfooding
 # ---------------------------------------------------------------------------
 
 
-def test_f32_package_init_and_self_import() -> None:
+def test_f33_package_init_and_self_import() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/__init__.py."""
     init_py = (SAMPLE_PKG / "mypkg" / "__init__.py").resolve()
     source = init_py.read_text(encoding="utf-8")
@@ -1075,7 +1273,7 @@ def test_f32_package_init_and_self_import() -> None:
     assert module_name_from_path(SAMPLE_PKG / "__init__.py", SAMPLE_PKG) == "sample_pkg"
 
 
-def test_f33_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
+def test_f34_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/__main__.py."""
     main_py = (SAMPLE_PKG / "mypkg" / "__main__.py").resolve()
     source = main_py.read_text(encoding="utf-8")
@@ -1099,7 +1297,7 @@ def test_f33_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
         module_name_from_path(tmp_path / "outside.py", SAMPLE_PKG)
 
 
-def test_f34_package_worker_and_discovery(tmp_path: Path) -> None:
+def test_f35_package_worker_and_discovery(tmp_path: Path) -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/worker.py."""
     worker_py = (SAMPLE_PKG / "mypkg" / "worker.py").resolve()
     source = worker_py.read_text(encoding="utf-8")
@@ -1134,7 +1332,7 @@ def test_f34_package_worker_and_discovery(tmp_path: Path) -> None:
     ]
 
 
-def test_f35_hyphenated_root_dunder_init() -> None:
+def test_f36_hyphenated_root_dunder_init() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/my-cool-saas/__init__.py."""
     hyphen_root = (SAMPLE_PKG / "my-cool-saas").resolve()
     hyphen_init = (hyphen_root / "__init__.py").resolve()
@@ -1157,7 +1355,7 @@ def test_f35_hyphenated_root_dunder_init() -> None:
     assert syms_direct == syms_root
 
 
-def test_f36_deep_namespace_and_parse_directory() -> None:
+def test_f37_deep_namespace_and_parse_directory() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/deep_ns/sub_pkg/leaf.py."""
     leaf_py = (SAMPLE_PKG / "deep_ns" / "sub_pkg" / "leaf.py").resolve()
     source = leaf_py.read_text(encoding="utf-8")
@@ -1194,7 +1392,7 @@ def test_f36_deep_namespace_and_parse_directory() -> None:
     ]
 
 
-def test_f37_dogfood_ast_parser_and_api_contract() -> None:
+def test_f38_dogfood_ast_parser_and_api_contract() -> None:
     """Fixture: src/cbi/ast/parser.py (plus __init__.py & test_ast_parser.py)."""
     expected_exports = {
         "SymbolKind",
@@ -1217,10 +1415,10 @@ def test_f37_dogfood_ast_parser_and_api_contract() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         cast(Any, node).name = "changed"
 
-    # Guard against orphan fixture files: f01..f31 on disk must match the 31 fixtures tested above.
+    # Guard against orphan fixture files: f01..f32 on disk must match the 32 fixtures tested above.
     disk_fixtures = sorted(p.name for p in AST_FIXTURES.glob("f*.py"))
-    assert len(disk_fixtures) == 31
-    assert [name[:3] for name in disk_fixtures] == [f"f{i:02d}" for i in range(1, 32)]
+    assert len(disk_fixtures) == 32
+    assert [name[:3] for name in disk_fixtures] == [f"f{i:02d}" for i in range(1, 33)]
 
     internal = discover_internal_packages(SRC_ROOT, TESTS_ROOT)
     assert "cbi" in internal

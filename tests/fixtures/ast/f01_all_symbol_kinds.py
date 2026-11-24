@@ -21,8 +21,8 @@ class Box:
     def ping(self) -> None: ...
 
 
-def helper() -> int:
-    return int(pathlib.PurePosixPath("a").name == "a") + LIMIT + count
+def helper(step: int = 1) -> int:
+    return int(pathlib.PurePosixPath("a").name == "a") + LIMIT + count + step
 
 
 async def run() -> int:

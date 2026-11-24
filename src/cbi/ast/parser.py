@@ -18,6 +18,7 @@ SymbolKind: TypeAlias = Literal[
     "async_method",
     "property",
     "field",
+    "parameter",
     "constant",
     "variable",
     "type_alias",
@@ -25,10 +26,13 @@ SymbolKind: TypeAlias = Literal[
 ]
 
 _ScopeContext: TypeAlias = Literal["module", "class", "init", "function"]
+_ParamKind: TypeAlias = Literal["posonly", "arg", "vararg", "kwonly", "kwarg"]
 _PROPERTY_DECORATORS: frozenset[str] = frozenset(
     {"property", "cached_property", "computed_field", "abstractproperty"}
 )
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
+_STATICMETHOD_DECORATORS: frozenset[str] = frozenset({"staticmethod", "abstractstaticmethod"})
+_RECEIVER_NAMES: frozenset[str] = frozenset({"self", "cls", "mcs", "metacls"})
 _DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
     {
         "__pycache__",
@@ -105,6 +109,26 @@ class _WalkState:
                 location=f"{self.filepath}:{alias.lineno}:{alias.col_offset + 1}",
                 start_line=alias.lineno,
                 end_line=alias.end_lineno or alias.lineno,
+            )
+        )
+
+    def add_param(
+        self,
+        arg: ast.arg,
+        scope: tuple[str, ...],
+        *,
+        end_line: int,
+        ast_hash: str | None,
+    ) -> None:
+        self.add(
+            SymbolNode(
+                name=arg.arg,
+                qualname=".".join([*scope, arg.arg]),
+                kind="parameter",
+                location=f"{self.filepath}:{arg.lineno}:{arg.col_offset + 1}",
+                start_line=arg.lineno,
+                end_line=end_line,
+                ast_hash=ast_hash,
             )
         )
 
@@ -218,6 +242,59 @@ def _body_hash(body: list[ast.stmt]) -> str | None:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+def _param_hash(
+    param_kind: _ParamKind,
+    annotation: ast.expr | None,
+    default: ast.expr | None,
+) -> str | None:
+    if param_kind == "arg" and annotation is None and default is None:
+        return None
+    ann_s = ast.dump(annotation, include_attributes=False) if annotation is not None else ""
+    def_s = ast.dump(default, include_attributes=False) if default is not None else ""
+    canonical = f"{param_kind}|{ann_s}|{def_s}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _walk_params(
+    arguments: ast.arguments,
+    scope: tuple[str, ...],
+    *,
+    skip_receiver: bool,
+    state: _WalkState,
+) -> None:
+    pos_args: list[tuple[_ParamKind, ast.arg]] = [
+        *(("posonly", a) for a in arguments.posonlyargs),
+        *(("arg", a) for a in arguments.args),
+    ]
+    pad = len(pos_args) - len(arguments.defaults)
+    pos_defaults: list[ast.expr | None] = [*([None] * pad), *arguments.defaults]
+    entries: list[tuple[_ParamKind, ast.arg, ast.expr | None]] = [
+        (kind_tag, a, d)
+        for (kind_tag, a), d in zip(pos_args, pos_defaults, strict=True)
+    ]
+    if skip_receiver and entries and entries[0][1].arg in _RECEIVER_NAMES:
+        entries = entries[1:]
+    if arguments.vararg is not None:
+        entries.append(("vararg", arguments.vararg, None))
+    for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
+        entries.append(("kwonly", a, d))
+    if arguments.kwarg is not None:
+        entries.append(("kwarg", arguments.kwarg, None))
+
+    for kind_tag, a, d in entries:
+        end_line = max(
+            a.lineno,
+            a.end_lineno or a.lineno,
+            d.end_lineno if d is not None and d.end_lineno is not None else a.lineno,
+        )
+        state.add_param(
+            a,
+            scope,
+            end_line=end_line,
+            ast_hash=_param_hash(kind_tag, a.annotation, d),
+        )
+
+
 def _record_callable(
     stmt: ast.FunctionDef | ast.AsyncFunctionDef,
     *,
@@ -244,6 +321,15 @@ def _record_callable(
         scope,
         ast_hash=_body_hash(stmt.body),
         decorators=stmt.decorator_list,
+    )
+    skip_receiver = in_class and not _has_decorator(
+        stmt.decorator_list, _STATICMETHOD_DECORATORS
+    )
+    _walk_params(
+        stmt.args,
+        (*scope, stmt.name),
+        skip_receiver=skip_receiver,
+        state=state,
     )
     return "init" if in_class and stmt.name in {"__init__", "__post_init__"} else "function"
 
@@ -449,7 +535,7 @@ def extract_symbols(
     module: str = "",
     internal_packages: Collection[str] = (),
 ) -> list[SymbolNode]:
-    """Parse Python source and return module, class, field, and callable symbol nodes."""
+    """Parse Python source and return module, class, field, parameter, and callable symbols."""
     raw_name = str(filename)
     full_path = raw_name if raw_name == "<memory>" else str(Path(filename).resolve())
     clean_source = source.removeprefix("\ufeff")
