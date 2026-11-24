@@ -28,3 +28,21 @@ class Record:
 
     def helper(self) -> None:
         self.late_attr = 99
+
+    async def ahelper(self) -> None:
+        self.async_attr: str = "ok"
+
+    @property
+    def lazy_prop(self) -> int:
+        self._cached_val = 1
+        return self._cached_val
+
+    @staticmethod
+    def stat_guard(self: Any) -> None:
+        self.static_ignored = 1
+
+    @classmethod
+    def cls_guard(cls) -> None:
+        _ = cls
+        self = SimpleNamespace()
+        self.cls_ignored = 1

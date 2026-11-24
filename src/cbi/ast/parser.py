@@ -25,13 +25,14 @@ SymbolKind: TypeAlias = Literal[
     "external",
 ]
 
-_ScopeContext: TypeAlias = Literal["module", "class", "init", "function"]
+_ScopeContext: TypeAlias = Literal["module", "class", "method", "function"]
 _ParamKind: TypeAlias = Literal["posonly", "arg", "vararg", "kwonly", "kwarg"]
 _PROPERTY_DECORATORS: frozenset[str] = frozenset(
     {"property", "cached_property", "computed_field", "abstractproperty"}
 )
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
 _STATICMETHOD_DECORATORS: frozenset[str] = frozenset({"staticmethod", "abstractstaticmethod"})
+_CLASSMETHOD_DECORATORS: frozenset[str] = frozenset({"classmethod", "abstractclassmethod"})
 _RECEIVER_NAMES: frozenset[str] = frozenset({"self", "cls", "mcs", "metacls"})
 _DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -322,16 +323,22 @@ def _record_callable(
         ast_hash=_body_hash(stmt.body),
         decorators=stmt.decorator_list,
     )
-    skip_receiver = in_class and not _has_decorator(
-        stmt.decorator_list, _STATICMETHOD_DECORATORS
-    )
+    is_static = _has_decorator(stmt.decorator_list, _STATICMETHOD_DECORATORS)
     _walk_params(
         stmt.args,
         (*scope, stmt.name),
-        skip_receiver=skip_receiver,
+        skip_receiver=in_class and not is_static,
         state=state,
     )
-    return "init" if in_class and stmt.name in {"__init__", "__post_init__"} else "function"
+    pos_params = [*stmt.args.posonlyargs, *stmt.args.args]
+    has_self_receiver = (
+        in_class
+        and not is_static
+        and not _has_decorator(stmt.decorator_list, _CLASSMETHOD_DECORATORS)
+        and bool(pos_params)
+        and pos_params[0].arg == "self"
+    )
+    return "method" if has_self_receiver else "function"
 
 
 def _walk_assign(
@@ -342,7 +349,7 @@ def _walk_assign(
 ) -> None:
     targets = [stmt.target] if isinstance(stmt, ast.AnnAssign) else stmt.targets
 
-    if context == "init":
+    if context == "method":
         for target in targets:
             for attr_node in _self_attr_nodes(target):
                 state.add_symbol(attr_node.attr, "field", stmt, scope[:-1], pos=attr_node)

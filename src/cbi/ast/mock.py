@@ -144,6 +144,7 @@ class TaskWorker(BaseWorker):
             raise QuotaExceededError(f"Too many tags: {tag_count}")
 
         self._processed += 1
+        self._last_task_id = record.task_id
         summary = TaskSummary(
             task_id=record.task_id,
             title=cleaned_title,

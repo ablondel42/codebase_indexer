@@ -283,6 +283,7 @@ def test_f00_mock_fixture() -> None:
         ("cbi.ast.mock.TaskWorker.process", "method"),
         ("cbi.ast.mock.TaskWorker.process.record", "parameter"),
         ("cbi.ast.mock.TaskWorker.process.strict", "parameter"),
+        ("cbi.ast.mock.TaskWorker._last_task_id", "field"),
         ("cbi.ast.mock.TaskWorker.process_async", "async_method"),
         ("cbi.ast.mock.TaskWorker.process_async.record", "parameter"),
         ("cbi.ast.mock.TaskWorker.process_async.extra_tags", "parameter"),
@@ -595,11 +596,21 @@ def test_f07_class_and_init_fields() -> None:
         (f"{mod}.Record.__post_init__", "method"),
         (f"{mod}.Record.ready", "field"),
         (f"{mod}.Record.helper", "method"),
+        (f"{mod}.Record.late_attr", "field"),
+        (f"{mod}.Record.ahelper", "async_method"),
+        (f"{mod}.Record.async_attr", "field"),
+        (f"{mod}.Record.lazy_prop", "property"),
+        (f"{mod}.Record._cached_val", "field"),
+        (f"{mod}.Record.stat_guard", "method"),
+        (f"{mod}.Record.stat_guard.self", "parameter"),
+        (f"{mod}.Record.cls_guard", "method"),
     ]
+    assert {"static_ignored", "cls_ignored"}.isdisjoint({s.name for s in symbols})
     by_q = {s.qualname: s for s in symbols}
     assert by_q[f"{mod}.Record.shared"].location == _loc(path, 7, 5)
     assert by_q[f"{mod}.Record.alpha"].location == _loc(path, 19, 10)
     assert by_q[f"{mod}.Record.beta"].location == _loc(path, 19, 23)
+    assert by_q[f"{mod}.Record.late_attr"].location == _loc(path, 30, 9)
 
 
 def test_f08_field_deduplication() -> None:
