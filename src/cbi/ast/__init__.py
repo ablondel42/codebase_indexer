@@ -6,6 +6,7 @@ from .parser import (
     discover_internal_packages,
     extract_symbols,
     module_name_from_path,
+    parse_directory,
     parse_file,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "discover_internal_packages",
     "extract_symbols",
     "module_name_from_path",
+    "parse_directory",
     "parse_file",
 ]

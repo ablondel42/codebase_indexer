@@ -17,6 +17,7 @@ from cbi.ast import (
     discover_internal_packages,
     extract_symbols,
     module_name_from_path,
+    parse_directory,
     parse_file,
 )
 
@@ -24,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 TESTS_ROOT = REPO_ROOT / "tests"
 FIXTURES_ROOT = TESTS_ROOT / "fixtures"
-MOCK_PATH = FIXTURES_ROOT / "mock.py"
+MOCK_PATH = SRC_ROOT / "cbi" / "ast" / "mock.py"
 AST_FIXTURES = FIXTURES_ROOT / "ast"
 SAMPLE_PKG = AST_FIXTURES / "sample_pkg"
 
@@ -143,15 +144,16 @@ def _parse_fixture(
 
 
 # ---------------------------------------------------------------------------
-# f00: Full Realistic Integration Fixture (tests/fixtures/mock.py)
+# f00: Full Realistic Integration Fixture (src/cbi/ast/mock.py)
 # ---------------------------------------------------------------------------
 
 
 def test_f00_mock_fixture() -> None:
-    """Fixture: tests/fixtures/mock.py."""
+    """Fixture: src/cbi/ast/mock.py."""
     path = MOCK_PATH.resolve()
     source = path.read_text(encoding="utf-8")
     symbols = extract_symbols(source, filename=path, module="cbi.ast.mock")
+    assert parse_file(path, src_root=SRC_ROOT) == symbols
     _assert_invariants(symbols, source, str(path), "cbi.ast.mock")
 
     by_q = {sym.qualname: sym for sym in symbols}
@@ -522,6 +524,8 @@ def test_f09_constants_and_variables() -> None:
 
     assert [(s.qualname, s.kind) for s in symbols] == [
         (mod, "module"),
+        ("typing", "external"),
+        ("typing.Final", "external"),
         (f"{mod}.UPPER_CASE", "constant"),
         (f"{mod}._PRIVATE_CONST", "constant"),
         (f"{mod}.HTTP_200_OK", "constant"),
@@ -531,6 +535,12 @@ def test_f09_constants_and_variables() -> None:
         (f"{mod}._private", "variable"),
         (f"{mod}._1", "variable"),
         (f"{mod}.__", "variable"),
+        (f"{mod}.final_flag", "constant"),
+        (f"{mod}.final_limit", "constant"),
+        (f"{mod}.qual_final", "constant"),
+        (f"{mod}.quoted_final", "constant"),
+        (f"{mod}.bare_final", "constant"),
+        (f"{mod}.typed_var", "variable"),
     ]
 
 
@@ -1095,8 +1105,10 @@ def test_f34_package_worker_and_discovery(tmp_path: Path) -> None:
     source = worker_py.read_text(encoding="utf-8")
 
     discovered = discover_internal_packages(str(SAMPLE_PKG), SAMPLE_PKG / "does_not_exist")
-    assert discovered == frozenset({"sample_pkg", "standalone", "mypkg", "ns_pkg"})
+    assert discovered == frozenset({"sample_pkg", "standalone", "mypkg", "ns_pkg", "deep_ns"})
     assert "custom_venv" not in discovered
+    assert "frontend_only" not in discovered
+    assert "venv_holder" not in discovered
     assert discover_internal_packages(SAMPLE_PKG / "custom_venv") == frozenset()
     assert "venv" not in discover_internal_packages(REPO_ROOT)
 
@@ -1145,7 +1157,44 @@ def test_f35_hyphenated_root_dunder_init() -> None:
     assert syms_direct == syms_root
 
 
-def test_f36_dogfood_ast_parser_and_api_contract() -> None:
+def test_f36_deep_namespace_and_parse_directory() -> None:
+    """Fixture: tests/fixtures/ast/sample_pkg/deep_ns/sub_pkg/leaf.py."""
+    leaf_py = (SAMPLE_PKG / "deep_ns" / "sub_pkg" / "leaf.py").resolve()
+    source = leaf_py.read_text(encoding="utf-8")
+
+    leaf_syms = parse_file(leaf_py, src_root=SAMPLE_PKG)
+    _assert_invariants(leaf_syms, source, str(leaf_py), "deep_ns.sub_pkg.leaf")
+    assert [(s.qualname, s.kind) for s in leaf_syms] == [
+        ("deep_ns.sub_pkg.leaf", "module"),
+        ("json", "external"),
+        ("deep_ns.sub_pkg.leaf.LEAF_CONST", "constant"),
+        ("deep_ns.sub_pkg.leaf.compute_leaf", "function"),
+    ]
+
+    all_syms = parse_directory(SAMPLE_PKG)
+    modules = [s.qualname for s in all_syms if s.kind == "module"]
+    assert modules == [
+        "sample_pkg",
+        "standalone",
+        "deep_ns.sub_pkg.leaf",
+        "mypkg",
+        "mypkg.__main__",
+        "mypkg.worker",
+        "ns_pkg.mod",
+    ]
+    assert "deep_ns.sub_pkg.leaf.compute_leaf" not in {
+        s.qualname for s in all_syms if s.kind == "external"
+    }
+
+    hyphen_syms = parse_directory(SAMPLE_PKG / "my-cool-saas")
+    assert [(s.qualname, s.kind) for s in hyphen_syms] == [
+        ("__init__", "module"),
+        ("__init__.APP_VERSION", "constant"),
+        ("__init__.create_app", "function"),
+    ]
+
+
+def test_f37_dogfood_ast_parser_and_api_contract() -> None:
     """Fixture: src/cbi/ast/parser.py (plus __init__.py & test_ast_parser.py)."""
     expected_exports = {
         "SymbolKind",
@@ -1153,6 +1202,7 @@ def test_f36_dogfood_ast_parser_and_api_contract() -> None:
         "discover_internal_packages",
         "extract_symbols",
         "module_name_from_path",
+        "parse_directory",
         "parse_file",
     }
     assert set(cbi_ast.__all__) == expected_exports

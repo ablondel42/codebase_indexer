@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import sys
 import tokenize
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -24,7 +25,9 @@ SymbolKind: TypeAlias = Literal[
 ]
 
 _ScopeContext: TypeAlias = Literal["module", "class", "init", "function"]
-_PROPERTY_DECORATORS: frozenset[str] = frozenset({"property", "cached_property", "computed_field"})
+_PROPERTY_DECORATORS: frozenset[str] = frozenset(
+    {"property", "cached_property", "computed_field", "abstractproperty"}
+)
 _OVERLOAD_DECORATORS: frozenset[str] = frozenset({"overload"})
 _DISCOVER_SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -123,6 +126,18 @@ def _is_type_alias(annotation: ast.expr) -> bool:
         return annotation.attr == "TypeAlias"
     if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
         return annotation.value == "TypeAlias" or annotation.value.endswith(".TypeAlias")
+    return False
+
+
+def _is_final_annotation(annotation: ast.expr) -> bool:
+    base = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+    if isinstance(base, ast.Name):
+        return base.id == "Final"
+    if isinstance(base, ast.Attribute):
+        return base.attr == "Final"
+    if isinstance(base, ast.Constant) and isinstance(base.value, str):
+        raw = base.value.split("[", 1)[0].strip()
+        return raw == "Final" or raw.endswith(".Final")
     return False
 
 
@@ -259,13 +274,14 @@ def _walk_assign(
             state.add_symbol(stmt.target.id, "type_alias", stmt, scope, pos=stmt.target)
         return
 
+    is_final = isinstance(stmt, ast.AnnAssign) and _is_final_annotation(stmt.annotation)
     for target in targets:
         for name_node in _target_nodes(target):
             name = name_node.id
             kind: SymbolKind = (
                 "field"
                 if context == "class"
-                else ("constant" if name.isupper() else "variable")
+                else ("constant" if (name.isupper() or is_final) else "variable")
             )
             state.add_symbol(name, kind, stmt, scope, pos=name_node)
 
@@ -350,6 +366,39 @@ def _walk_body(
                 stack.extend((child, cur_scope, cur_ctx) for child in reversed(children))
 
 
+def _is_scannable_subdir(entry: Path) -> bool:
+    return (
+        not entry.name.startswith(".")
+        and entry.name not in _DISCOVER_SKIP_DIRS
+        and entry.name.isidentifier()
+        and entry.is_dir()
+        and not (entry / "pyvenv.cfg").exists()
+    )
+
+
+def _contains_python_module(directory: Path) -> bool:
+    visited: set[Path] = set()
+    stack: list[Path] = [directory]
+    while stack:
+        current = stack.pop()
+        resolved = current.resolve()
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        for child in current.iterdir():
+            if child.name.startswith(".") or child.name in _DISCOVER_SKIP_DIRS:
+                continue
+            if (
+                child.is_file()
+                and child.suffix == ".py"
+                and (child.stem == "__init__" or child.stem.isidentifier())
+            ):
+                return True
+            if _is_scannable_subdir(child):
+                stack.append(child)
+    return False
+
+
 def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
     """Return top-level Python package and module names under the given root directories."""
     names: set[str] = set()
@@ -362,12 +411,7 @@ def discover_internal_packages(*roots: str | Path) -> frozenset[str]:
         for entry in root.iterdir():
             if entry.name.startswith(".") or entry.name in _DISCOVER_SKIP_DIRS:
                 continue
-            if (
-                entry.is_dir()
-                and entry.name.isidentifier()
-                and not (entry / "pyvenv.cfg").exists()
-                and ((entry / "__init__.py").exists() or any(entry.glob("*.py")))
-            ):
+            if _is_scannable_subdir(entry) and _contains_python_module(entry):
                 names.add(entry.name)
             elif (
                 entry.is_file()
@@ -442,6 +486,34 @@ def extract_symbols(
     return state.symbols
 
 
+def _iter_python_files(root: Path) -> list[Path]:
+    if not root.is_dir() or (root / "pyvenv.cfg").exists():
+        return []
+    files: list[Path] = []
+    visited: set[Path] = set()
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        resolved = current.resolve()
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        subdirs: list[Path] = []
+        for entry in sorted(current.iterdir(), key=lambda p: p.name):
+            if entry.name.startswith(".") or entry.name in _DISCOVER_SKIP_DIRS:
+                continue
+            if (
+                entry.is_file()
+                and entry.suffix == ".py"
+                and (entry.stem == "__init__" or entry.stem.isidentifier())
+            ):
+                files.append(entry)
+            elif _is_scannable_subdir(entry):
+                subdirs.append(entry)
+        stack.extend(reversed(subdirs))
+    return files
+
+
 def parse_file(
     filepath: str | Path,
     *,
@@ -465,3 +537,38 @@ def parse_file(
         module=mod,
         internal_packages=internal,
     )
+
+
+def parse_directory(
+    root: str | Path,
+    *,
+    internal_packages: Collection[str] | None = None,
+) -> list[SymbolNode]:
+    """Parse all Python modules under root (across all subdirectories) in sorted path order."""
+    root_path = Path(root).resolve()
+    internal: Collection[str] = (
+        discover_internal_packages(root_path)
+        if internal_packages is None
+        else internal_packages
+    )
+    symbols: list[SymbolNode] = []
+    for filepath in _iter_python_files(root_path):
+        symbols.extend(parse_file(filepath, src_root=root_path, internal_packages=internal))
+    return symbols
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        target = Path(sys.argv[1]).resolve()
+        src_arg = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
+        extracted = (
+            parse_directory(target)
+            if target.is_dir()
+            else parse_file(target, src_root=src_arg)
+        )
+    else:
+        mock_path = Path(__file__).with_name("mock.py").resolve()
+        extracted = parse_file(mock_path, src_root=mock_path.parents[2])
+    for sym in extracted:
+        digest = sym.ast_hash or "-"
+        print(f"{sym.kind:<15} {digest:<18} {sym.qualname:<40} {sym.location}")

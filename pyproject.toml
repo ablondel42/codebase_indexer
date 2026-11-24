@@ -40,7 +40,7 @@ line-length = 100
 target-version = "py311"
 preview = true
 force-exclude = true
-extend-exclude = ["tests/fixtures", ".agents", "src/ui"]
+extend-exclude = ["tests/fixtures", "src/cbi/ast/mock.py", ".agents", "src/ui"]
 
 [tool.ruff.lint]
 explicit-preview-rules = true
