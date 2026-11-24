@@ -3,7 +3,9 @@
 import ast
 import dataclasses
 import hashlib
+import re
 import tokenize
+import unicodedata
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any, cast, get_args
@@ -36,6 +38,7 @@ _HASHABLE_KINDS: frozenset[SymbolKind] = frozenset(
     {"class", "function", "async_function", "method", "async_method", "property", "parameter"}
 )
 _HEX_CHARS: frozenset[str] = frozenset("0123456789abcdef")
+_IDENT_RE: re.Pattern[str] = re.compile(r"\w+")
 
 
 def _loc(path: Path, line: int, col: int) -> str:
@@ -67,32 +70,18 @@ def _expected_param_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
-def _assert_token_at_location(
-    sym: SymbolNode, raw_lines: list[str], line: int, col: int
-) -> None:
-    if not raw_lines:
-        assert line == 1
-        assert col == 1
+def _assert_token_at_location(sym: SymbolNode, raw_lines: list[str]) -> None:
+    if sym.kind == "module":
+        assert (sym.line, sym.col_offset) == (1, 0)
         return
-    tail = raw_lines[line - 1].encode("utf-8")[col - 1 :]
-    match sym.kind:
-        case "module":
-            assert line == 1
-            assert col == 1
-        case "class":
-            assert tail.startswith(b"class ")
-        case "function" | "method":
-            assert tail.startswith(b"def ")
-        case "async_function" | "async_method":
-            assert tail.startswith(b"async ")
-        case "property":
-            assert tail.startswith((b"def ", b"async "))
-        case "constant" | "variable" | "type_alias" | "parameter":
-            assert tail.startswith(sym.name.encode("utf-8"))
-        case "field":
-            assert tail.startswith((sym.name.encode("utf-8"), b"self"))
-        case "external":
-            assert tail.startswith((sym.name.encode("utf-8"), sym.qualname.encode("utf-8")))
+    row_bytes = raw_lines[sym.line - 1].encode("utf-8")
+    tail = row_bytes[sym.col_offset :].decode("utf-8")
+    match = _IDENT_RE.match(tail)
+    assert match is not None, f"Expected {sym.name!r} at {sym.location}, got {tail!r}"
+    assert unicodedata.normalize("NFKC", match.group(0)) == sym.name
+    if sym.col_offset > 0:
+        prev_char = row_bytes[: sym.col_offset].decode("utf-8")[-1]
+        assert not _IDENT_RE.match(prev_char)
 
 
 def _assert_invariants(
@@ -109,6 +98,8 @@ def _assert_invariants(
     assert mod.kind == "module"
     assert mod.qualname == expected_mod_qualname
     assert mod.location == f"{filepath}:1:1"
+    assert mod.line == 1
+    assert mod.col_offset == 0
     assert mod.start_line == 1
     assert mod.end_line == total_lines
 
@@ -117,13 +108,11 @@ def _assert_invariants(
 
     for sym in symbols:
         assert sym.name != "_"
-        loc_path, line_str, col_str = sym.location.rsplit(":", 2)
-        line = int(line_str)
-        col = int(col_str)
-        assert loc_path == filepath
-        assert col >= 1
-        assert 1 <= sym.start_line <= line <= sym.end_line <= total_lines
-        _assert_token_at_location(sym, raw_lines, line, col)
+        assert sym.line >= 1
+        assert sym.col_offset >= 0
+        assert sym.location == f"{filepath}:{sym.line}:{sym.col_offset + 1}"
+        assert 1 <= sym.start_line <= sym.line <= sym.end_line <= total_lines
+        _assert_token_at_location(sym, raw_lines)
 
         if sym.kind not in {"module", "external"}:
             assert sym.qualname.startswith(f"{expected_mod_qualname}.")
@@ -189,7 +178,24 @@ def test_f00_mock_fixture() -> None:
     assert by_q["cbi.ast.mock.TaskWorker.worker_id"].decorators == ("cached_property",)
     run_batch = by_q["cbi.ast.mock.run_batch"]
     assert run_batch.decorators == ("route('/tasks/batch')",)
-    assert run_batch.start_line == int(run_batch.location.rsplit(":", 2)[1]) - 1
+    assert run_batch.start_line == run_batch.line - 1
+    assert (run_batch.line, run_batch.col_offset, run_batch.location) == (
+        188,
+        10,
+        _loc(path, 188, 11),
+    )
+    worker_cls = by_q["cbi.ast.mock.TaskWorker"]
+    assert (worker_cls.line, worker_cls.col_offset, worker_cls.location) == (
+        100,
+        6,
+        _loc(path, 100, 7),
+    )
+    root_field = by_q["cbi.ast.mock.TaskWorker.root"]
+    assert (root_field.line, root_field.col_offset, root_field.location) == (
+        113,
+        13,
+        _loc(path, 113, 14),
+    )
 
     leaked_locals = {
         "cleaned_title",
@@ -321,29 +327,35 @@ def test_f01_all_symbol_kinds() -> None:
     helper_body = 'return int(pathlib.PurePosixPath("a").name == "a") + LIMIT + count + step'
 
     assert symbols == [
-        SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 29),
-        SymbolNode("pathlib", "pathlib", "external", _loc(path, 1, 8), 1, 1),
-        SymbolNode("dataclass", "dataclasses.dataclass", "external", _loc(path, 2, 25), 2, 2),
-        SymbolNode("TypeAlias", "typing.TypeAlias", "external", _loc(path, 3, 20), 3, 3),
-        SymbolNode("Alias", f"{mod}.Alias", "type_alias", _loc(path, 5, 1), 5, 5),
-        SymbolNode("LIMIT", f"{mod}.LIMIT", "constant", _loc(path, 6, 1), 6, 6),
-        SymbolNode("count", f"{mod}.count", "variable", _loc(path, 7, 1), 7, 7),
+        SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 0, 1, 29),
+        SymbolNode("pathlib", "pathlib", "external", _loc(path, 1, 8), 1, 7, 1, 1),
+        SymbolNode(
+            "dataclass", "dataclasses.dataclass", "external", _loc(path, 2, 25), 2, 24, 2, 2
+        ),
+        SymbolNode("TypeAlias", "typing.TypeAlias", "external", _loc(path, 3, 20), 3, 19, 3, 3),
+        SymbolNode("Alias", f"{mod}.Alias", "type_alias", _loc(path, 5, 1), 5, 0, 5, 5),
+        SymbolNode("LIMIT", f"{mod}.LIMIT", "constant", _loc(path, 6, 1), 6, 0, 6, 6),
+        SymbolNode("count", f"{mod}.count", "variable", _loc(path, 7, 1), 7, 0, 7, 7),
         SymbolNode(
             "Box",
             f"{mod}.Box",
             "class",
-            _loc(path, 11, 1),
+            _loc(path, 11, 7),
+            11,
+            6,
             10,
             21,
             ast_hash=_expected_hash(expected_box_body),
             decorators=("dataclass",),
         ),
-        SymbolNode("tag", f"{mod}.Box.tag", "field", _loc(path, 12, 5), 12, 12),
+        SymbolNode("tag", f"{mod}.Box.tag", "field", _loc(path, 12, 5), 12, 4, 12, 12),
         SymbolNode(
             "size",
             f"{mod}.Box.size",
             "property",
-            _loc(path, 15, 5),
+            _loc(path, 15, 9),
+            15,
+            8,
             14,
             16,
             ast_hash=_expected_hash("return 1"),
@@ -353,7 +365,9 @@ def test_f01_all_symbol_kinds() -> None:
             "fetch",
             f"{mod}.Box.fetch",
             "async_method",
-            _loc(path, 18, 5),
+            _loc(path, 18, 15),
+            18,
+            14,
             18,
             19,
             ast_hash=_expected_hash("return 2"),
@@ -362,7 +376,9 @@ def test_f01_all_symbol_kinds() -> None:
             "ping",
             f"{mod}.Box.ping",
             "method",
-            _loc(path, 21, 5),
+            _loc(path, 21, 9),
+            21,
+            8,
             21,
             21,
             ast_hash=None,
@@ -371,7 +387,9 @@ def test_f01_all_symbol_kinds() -> None:
             "helper",
             f"{mod}.helper",
             "function",
-            _loc(path, 24, 1),
+            _loc(path, 24, 5),
+            24,
+            4,
             24,
             25,
             ast_hash=_expected_hash(helper_body),
@@ -382,6 +400,8 @@ def test_f01_all_symbol_kinds() -> None:
             "parameter",
             _loc(path, 24, 12),
             24,
+            11,
+            24,
             24,
             ast_hash=_expected_param_hash("arg", "int", "1"),
         ),
@@ -389,7 +409,9 @@ def test_f01_all_symbol_kinds() -> None:
             "run",
             f"{mod}.run",
             "async_function",
-            _loc(path, 28, 1),
+            _loc(path, 28, 11),
+            28,
+            10,
             28,
             29,
             ast_hash=_expected_hash("return 4"),
@@ -422,7 +444,7 @@ def test_f02_stacked_and_method_decorators() -> None:
     by_q = {s.qualname: s for s in symbols}
     svc = by_q[f"{mod}.Service"]
     assert svc.decorators == ("first", "second(flag=True)")
-    assert (svc.start_line, svc.location, svc.end_line) == (19, _loc(path, 21, 1), 28)
+    assert (svc.start_line, svc.location, svc.end_line) == (19, _loc(path, 21, 7), 28)
     assert by_q[f"{mod}.Service.make"].decorators == ("classmethod",)
     assert by_q[f"{mod}.Service.check"].decorators == ("staticmethod",)
 
@@ -456,7 +478,7 @@ def test_f03_pep614_and_multiline_decorators() -> None:
     endpoint = by_q[f"{mod}.Endpoint"]
     assert (endpoint.start_line, endpoint.location, endpoint.end_line) == (
         29,
-        _loc(path, 34, 1),
+        _loc(path, 34, 7),
         35,
     )
     assert endpoint.decorators == (
@@ -469,7 +491,7 @@ def test_f03_pep614_and_multiline_decorators() -> None:
     create_item = by_q[f"{mod}.create_item"]
     assert (create_item.start_line, create_item.location, create_item.end_line) == (
         38,
-        _loc(path, 43, 1),
+        _loc(path, 43, 11),
         44,
     )
     assert create_item.decorators == (
@@ -526,7 +548,7 @@ def test_f05_property_setter_deleter() -> None:
         (f"{mod}.Account.balance.validate.raw", "parameter"),
     ]
     balance = {s.qualname: s for s in symbols}[f"{mod}.Account.balance"]
-    assert balance.location == _loc(path, 5, 5)
+    assert balance.location == _loc(path, 5, 9)
     assert balance.decorators == ("property",)
 
 
@@ -551,12 +573,12 @@ def test_f06_overload_matrix() -> None:
         (f"{mod}.Codec.prop", "property"),
     ]
     by_q = {s.qualname: s for s in symbols}
-    assert by_q[f"{mod}.parse"].location == _loc(path, 13, 1)
-    assert by_q[f"{mod}.aparse"].location == _loc(path, 21, 1)
-    assert by_q[f"{mod}.Codec.encode"].location == _loc(path, 29, 5)
-    assert by_q[f"{mod}.Codec.decode"].location == _loc(path, 37, 5)
+    assert by_q[f"{mod}.parse"].location == _loc(path, 13, 5)
+    assert by_q[f"{mod}.aparse"].location == _loc(path, 21, 11)
+    assert by_q[f"{mod}.Codec.encode"].location == _loc(path, 29, 9)
+    assert by_q[f"{mod}.Codec.decode"].location == _loc(path, 37, 9)
     assert by_q[f"{mod}.Codec.decode"].decorators == ("classmethod",)
-    assert by_q[f"{mod}.Codec.prop"].location == _loc(path, 45, 5)
+    assert by_q[f"{mod}.Codec.prop"].location == _loc(path, 45, 9)
     assert by_q[f"{mod}.Codec.prop"].decorators == ("property",)
 
 
@@ -608,9 +630,9 @@ def test_f07_class_and_init_fields() -> None:
     assert {"static_ignored", "cls_ignored"}.isdisjoint({s.name for s in symbols})
     by_q = {s.qualname: s for s in symbols}
     assert by_q[f"{mod}.Record.shared"].location == _loc(path, 7, 5)
-    assert by_q[f"{mod}.Record.alpha"].location == _loc(path, 19, 10)
-    assert by_q[f"{mod}.Record.beta"].location == _loc(path, 19, 23)
-    assert by_q[f"{mod}.Record.late_attr"].location == _loc(path, 30, 9)
+    assert by_q[f"{mod}.Record.alpha"].location == _loc(path, 19, 15)
+    assert by_q[f"{mod}.Record.beta"].location == _loc(path, 19, 28)
+    assert by_q[f"{mod}.Record.late_attr"].location == _loc(path, 30, 14)
 
 
 def test_f08_field_deduplication() -> None:
@@ -620,11 +642,11 @@ def test_f08_field_deduplication() -> None:
 
     assert [(s.qualname, s.kind, s.location) for s in symbols] == [
         (mod, "module", _loc(path, 1, 1)),
-        (f"{mod}.Item", "class", _loc(path, 1, 1)),
+        (f"{mod}.Item", "class", _loc(path, 1, 7)),
         (f"{mod}.Item.x", "field", _loc(path, 2, 5)),
-        (f"{mod}.Item.__init__", "method", _loc(path, 4, 5)),
+        (f"{mod}.Item.__init__", "method", _loc(path, 4, 9)),
         (f"{mod}.Item.__init__.flag", "parameter", _loc(path, 4, 24)),
-        (f"{mod}.Item.y", "field", _loc(path, 7, 13)),
+        (f"{mod}.Item.y", "field", _loc(path, 7, 18)),
     ]
 
 
@@ -673,7 +695,7 @@ def test_f10_unpacking_multiline_and_semicolons() -> None:
         (f"{mod}.A", "constant", _loc(path, 12, 1), 12, 12),
         (f"{mod}.b", "variable", _loc(path, 12, 8), 12, 12),
         ("math", "external", _loc(path, 12, 22), 12, 12),
-        (f"{mod}.Inline", "class", _loc(path, 15, 1), 15, 16),
+        (f"{mod}.Inline", "class", _loc(path, 15, 7), 15, 16),
         (f"{mod}.Inline.x", "field", _loc(path, 16, 5), 16, 16),
         (f"{mod}.Inline.y", "field", _loc(path, 16, 12), 16, 16),
         (f"{mod}.items", "variable", _loc(path, 19, 1), 19, 19),
@@ -712,10 +734,10 @@ def test_f12_pep695_generics_and_type_stmt() -> None:
         (mod, "module", _loc(path, 1, 1), 1, 16),
         (f"{mod}.Vector", "type_alias", _loc(path, 1, 6), 1, 1),
         (f"{mod}.Matrix", "type_alias", _loc(path, 2, 6), 2, 4),
-        (f"{mod}.Holder", "class", _loc(path, 8, 1), 8, 10),
+        (f"{mod}.Holder", "class", _loc(path, 8, 7), 8, 10),
         (f"{mod}.Holder.value", "field", _loc(path, 9, 5), 9, 9),
         (f"{mod}.Holder.Nested", "type_alias", _loc(path, 10, 10), 10, 10),
-        (f"{mod}.build", "function", _loc(path, 13, 1), 13, 16),
+        (f"{mod}.build", "function", _loc(path, 13, 5), 13, 16),
         (f"{mod}.build.val", "parameter", _loc(path, 13, 14), 13, 13),
     ]
 
@@ -738,7 +760,7 @@ def test_f13_imports_spans_aliases_and_prefixes() -> None:
         (mod, mod, "module", _loc(path, 1, 1), 1, 16),
         ("os", "os", "external", _loc(path, 1, 8), 1, 1),
         ("sys", "sys", "external", _loc(path, 1, 12), 1, 1),
-        ("parse", "urllib.parse", "external", _loc(path, 2, 8), 2, 2),
+        ("parse", "urllib.parse", "external", _loc(path, 2, 15), 2, 2),
         ("BaseModel", "pydantic.BaseModel", "external", _loc(path, 5, 5), 5, 5),
         ("Field", "pydantic.Field", "external", _loc(path, 6, 5), 6, 6),
         ("Field", "dataclasses.Field", "external", _loc(path, 8, 25), 8, 8),
@@ -815,8 +837,8 @@ def test_f16_nested_classes_and_conditional_bodies() -> None:
         (f"{mod}.Outer.slow", "field"),
     ]
     by_q = {s.qualname: s for s in symbols}
-    assert by_q[f"{mod}.Outer.__init__"].location == _loc(path, 19, 9)
-    assert by_q[f"{mod}.Outer.run"].location == _loc(path, 22, 9)
+    assert by_q[f"{mod}.Outer.__init__"].location == _loc(path, 19, 13)
+    assert by_q[f"{mod}.Outer.run"].location == _loc(path, 22, 13)
 
 
 def test_f17_init_control_flow_and_nested_scopes() -> None:
@@ -869,7 +891,7 @@ def test_f18_overloaded_and_non_class_dunder_init() -> None:
         (f"{mod}.wrapper.__init__", "function"),
         (f"{mod}.wrapper.__init__.self", "parameter"),
     ]
-    assert {s.qualname: s for s in symbols}[f"{mod}.Client.__init__"].location == _loc(path, 8, 5)
+    assert {s.qualname: s for s in symbols}[f"{mod}.Client.__init__"].location == _loc(path, 8, 9)
 
 
 def test_f19_local_noise_torture() -> None:
@@ -913,7 +935,7 @@ def test_f20_rebinding_and_shadowing() -> None:
     ]
     by_q = {s.qualname: s for s in symbols}
     assert by_q[f"{mod}.x"].location == _loc(path, 4, 1)
-    assert by_q[f"{mod}.job"].location == _loc(path, 13, 5)
+    assert by_q[f"{mod}.job"].location == _loc(path, 13, 9)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,14 +1065,14 @@ def test_f24_empty_file() -> None:
     """Fixture: tests/fixtures/ast/f24_empty_file.py."""
     path, _, symbols = _parse_fixture("f24_empty_file.py")
     mod = "f24_empty_file"
-    assert symbols == [SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 1)]
+    assert symbols == [SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 0, 1, 1)]
 
 
 def test_f25_comments_and_docstring_only() -> None:
     """Fixture: tests/fixtures/ast/f25_comments_and_docstring_only.py."""
     path, source, symbols = _parse_fixture("f25_comments_and_docstring_only.py")
     mod = "f25_comments_and_docstring_only"
-    assert symbols == [SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 4)]
+    assert symbols == [SymbolNode(mod, mod, "module", _loc(path, 1, 1), 1, 0, 1, 4)]
 
     # Leading/trailing newlines without trailing code line preserve exact splitlines() count.
     assert extract_symbols(source.strip("\n"))[0].end_line == 3
@@ -1067,9 +1089,9 @@ def test_f26_unicode_identifiers() -> None:
     assert [(s.name, s.qualname, s.kind, s.location) for s in symbols] == [
         (mod, mod, "module", _loc(path, 1, 1)),
         ("π", f"{mod}.π", "variable", _loc(path, 1, 1)),
-        ("Données", f"{mod}.Données", "class", _loc(path, 4, 1)),
+        ("Données", f"{mod}.Données", "class", _loc(path, 4, 7)),
         ("valeur", f"{mod}.Données.valeur", "field", _loc(path, 5, 5)),
-        ("café", f"{mod}.café", "function", _loc(path, 8, 1)),
+        ("café", f"{mod}.café", "function", _loc(path, 8, 5)),
     ]
 
     crlf_source = source.replace("\n", "\r\n")
@@ -1092,7 +1114,7 @@ def test_f27_memory_and_self_import_collision() -> None:
     assert [(s.name, s.qualname, s.kind, s.location) for s in symbols] == [
         (mod, mod, "module", _loc(path, 1, 1)),
         ("json", "json", "external", _loc(path, 1, 8)),
-        ("json", f"{mod}.json", "function", _loc(path, 6, 1)),
+        ("json", f"{mod}.json", "function", _loc(path, 6, 5)),
     ]
 
     mem_symbols = extract_symbols(source)
@@ -1138,7 +1160,9 @@ def test_f29_utf8_bom() -> None:
 
     bom_only = extract_symbols("\ufeff")
     _assert_invariants(bom_only, "", "<memory>", "<module>")
-    assert bom_only == [SymbolNode("<module>", "<module>", "module", "<memory>:1:1", 1, 1)]
+    assert bom_only == [
+        SymbolNode("<module>", "<module>", "module", "<memory>:1:1", 1, 0, 1, 1)
+    ]
 
 
 def test_f30_pep263_latin1_cookie() -> None:
@@ -1154,7 +1178,7 @@ def test_f30_pep263_latin1_cookie() -> None:
         (mod, mod, "module", _loc(path, 1, 1)),
         ("decimal", "decimal", "external", _loc(path, 2, 8)),
         ("CAFE_PRICE", f"{mod}.CAFE_PRICE", "constant", _loc(path, 4, 1)),
-        ("résumé", f"{mod}.résumé", "function", _loc(path, 7, 1)),
+        ("résumé", f"{mod}.résumé", "function", _loc(path, 7, 5)),
     ]
     fn = {s.qualname: s for s in symbols}[f"{mod}.résumé"]
     assert fn.ast_hash is not None
@@ -1255,12 +1279,43 @@ def test_f32_parameters_receivers_and_hashes() -> None:
     assert len(set(diff_hashes)) == 5
 
 
+def test_f33_identifier_offsets_and_multiline_headers() -> None:
+    """Fixture: tests/fixtures/ast/f33_identifier_offsets_and_multiline_headers.py."""
+    path, _, symbols = _parse_fixture("f33_identifier_offsets_and_multiline_headers.py")
+    mod = "f33_identifier_offsets_and_multiline_headers"
+
+    rows = [(s.qualname, s.kind, s.line, s.col_offset, s.start_line, s.end_line) for s in symbols]
+    assert rows == [
+        (mod, "module", 1, 0, 1, 43),
+        ("urllib.parse", "external", 1, 14, 1, 1),
+        ("xml.etree.ElementTree", "external", 2, 17, 2, 2),
+        ("email.mime.text", "external", 3, 22, 3, 3),
+        ("urllib.request", "external", 5, 26, 5, 5),
+        (f"{mod}._identity", "function", 9, 4, 9, 10),
+        (f"{mod}._identity.fn", "parameter", 9, 14, 9, 9),
+        (f"{mod}.SpacedClass", "class", 13, 8, 13, 14),
+        (f"{mod}.spaced_fn", "function", 17, 7, 17, 18),
+        (f"{mod}.spaced_async", "async_function", 21, 16, 21, 22),
+        (f"{mod}.MultilineClass", "class", 26, 4, 25, 32),
+        (f"{mod}.MultilineClass.assign_attrs", "method", 27, 8, 27, 32),
+        (f"{mod}.MultilineClass.plain_attr", "field", 28, 13, 28, 28),
+        (f"{mod}.MultilineClass.spaced_attr", "field", 32, 12, 29, 32),
+        (f"{mod}.multiline_async", "async_function", 38, 4, 35, 39),
+        (f"{mod}.utf8_sig", "function", 42, 4, 42, 43),
+        (f"{mod}.utf8_sig.prefix", "parameter", 42, 13, 42, 42),
+        (f"{mod}.utf8_sig.target", "parameter", 42, 35, 42, 42),
+    ]
+    by_q = {s.qualname: s for s in symbols}
+    assert by_q[f"{mod}.multiline_async"].location == _loc(path, 38, 5)
+    assert by_q[f"{mod}.MultilineClass.spaced_attr"].location == _loc(path, 32, 13)
+
+
 # ---------------------------------------------------------------------------
-# f33 - f38: Package Layout, Discovery, API Contract & Dogfooding
+# f34 - f39: Package Layout, Discovery, API Contract & Dogfooding
 # ---------------------------------------------------------------------------
 
 
-def test_f33_package_init_and_self_import() -> None:
+def test_f34_package_init_and_self_import() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/__init__.py."""
     init_py = (SAMPLE_PKG / "mypkg" / "__init__.py").resolve()
     source = init_py.read_text(encoding="utf-8")
@@ -1284,7 +1339,7 @@ def test_f33_package_init_and_self_import() -> None:
     assert module_name_from_path(SAMPLE_PKG / "__init__.py", SAMPLE_PKG) == "sample_pkg"
 
 
-def test_f34_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
+def test_f35_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/__main__.py."""
     main_py = (SAMPLE_PKG / "mypkg" / "__main__.py").resolve()
     source = main_py.read_text(encoding="utf-8")
@@ -1308,7 +1363,7 @@ def test_f34_package_dunder_main_and_symlinks(tmp_path: Path) -> None:
         module_name_from_path(tmp_path / "outside.py", SAMPLE_PKG)
 
 
-def test_f35_package_worker_and_discovery(tmp_path: Path) -> None:
+def test_f36_package_worker_and_discovery(tmp_path: Path) -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/mypkg/worker.py."""
     worker_py = (SAMPLE_PKG / "mypkg" / "worker.py").resolve()
     source = worker_py.read_text(encoding="utf-8")
@@ -1343,7 +1398,7 @@ def test_f35_package_worker_and_discovery(tmp_path: Path) -> None:
     ]
 
 
-def test_f36_hyphenated_root_dunder_init() -> None:
+def test_f37_hyphenated_root_dunder_init() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/my-cool-saas/__init__.py."""
     hyphen_root = (SAMPLE_PKG / "my-cool-saas").resolve()
     hyphen_init = (hyphen_root / "__init__.py").resolve()
@@ -1366,7 +1421,7 @@ def test_f36_hyphenated_root_dunder_init() -> None:
     assert syms_direct == syms_root
 
 
-def test_f37_deep_namespace_and_parse_directory() -> None:
+def test_f38_deep_namespace_and_parse_directory() -> None:
     """Fixture: tests/fixtures/ast/sample_pkg/deep_ns/sub_pkg/leaf.py."""
     leaf_py = (SAMPLE_PKG / "deep_ns" / "sub_pkg" / "leaf.py").resolve()
     source = leaf_py.read_text(encoding="utf-8")
@@ -1403,7 +1458,7 @@ def test_f37_deep_namespace_and_parse_directory() -> None:
     ]
 
 
-def test_f38_dogfood_ast_parser_and_api_contract() -> None:
+def test_f39_dogfood_ast_parser_and_api_contract() -> None:
     """Fixture: src/cbi/ast/parser.py (plus __init__.py & test_ast_parser.py)."""
     expected_exports = {
         "SymbolKind",
@@ -1418,18 +1473,18 @@ def test_f38_dogfood_ast_parser_and_api_contract() -> None:
     for name in expected_exports:
         assert hasattr(cbi_ast, name)
 
-    node = SymbolNode("fn", "pkg.fn", "function", "<memory>:1:1", 1, 2)
+    node = SymbolNode("fn", "pkg.fn", "function", "<memory>:1:5", 1, 4, 1, 2)
     assert node.ast_hash is None
     assert node.decorators == ()
     assert not hasattr(node, "__dict__")
-    assert len({node, SymbolNode("fn", "pkg.fn", "function", "<memory>:1:1", 1, 2)}) == 1
+    assert len({node, SymbolNode("fn", "pkg.fn", "function", "<memory>:1:5", 1, 4, 1, 2)}) == 1
     with pytest.raises(dataclasses.FrozenInstanceError):
         cast(Any, node).name = "changed"
 
-    # Guard against orphan fixture files: f01..f32 on disk must match the 32 fixtures tested above.
+    # Guard against orphan fixture files: f01..f33 on disk must match the 33 fixtures tested above.
     disk_fixtures = sorted(p.name for p in AST_FIXTURES.glob("f*.py"))
-    assert len(disk_fixtures) == 32
-    assert [name[:3] for name in disk_fixtures] == [f"f{i:02d}" for i in range(1, 33)]
+    assert len(disk_fixtures) == 33
+    assert [name[:3] for name in disk_fixtures] == [f"f{i:02d}" for i in range(1, 34)]
 
     internal = discover_internal_packages(SRC_ROOT, TESTS_ROOT)
     assert "cbi" in internal

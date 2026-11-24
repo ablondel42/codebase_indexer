@@ -1,7 +1,9 @@
 """Extract symbol definitions and their kinds from Python source using stdlib ast."""
 
 import ast
+import bisect
 import hashlib
+import io
 import sys
 import tokenize
 from collections.abc import Collection
@@ -56,6 +58,8 @@ class SymbolNode:
     qualname: str
     kind: SymbolKind
     location: str
+    line: int
+    col_offset: int
     start_line: int
     end_line: int
     ast_hash: str | None = None
@@ -65,9 +69,62 @@ class SymbolNode:
 @dataclass(slots=True)
 class _WalkState:
     filepath: str
+    source: str
+    lines_utf8: tuple[bytes, ...]
     internal_pkgs: frozenset[str] = frozenset()
     symbols: list[SymbolNode] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
+    _name_tokens: list[tuple[int, int]] | None = None
+
+    def _nth_name_from(self, line: int, col_offset: int, skip: int) -> tuple[int, int]:
+        if self._name_tokens is None:
+            self._name_tokens = [
+                (tok.start[0], len(tok.line[: tok.start[1]].encode("utf-8")))
+                for tok in tokenize.generate_tokens(io.StringIO(self.source).readline)
+                if tok.type == tokenize.NAME
+            ]
+        idx = bisect.bisect_left(self._name_tokens, (line, col_offset))
+        return self._name_tokens[idx + skip]
+
+    def def_pos(
+        self, stmt: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> tuple[int, int]:
+        if isinstance(stmt, ast.ClassDef):
+            prefix, skip = b"class ", 1
+        elif isinstance(stmt, ast.AsyncFunctionDef):
+            prefix, skip = b"async def ", 2
+        else:
+            prefix, skip = b"def ", 1
+        expected = prefix + stmt.name.encode("utf-8")
+        row = self.lines_utf8[stmt.lineno - 1]
+        after = stmt.col_offset + len(expected)
+        if row[stmt.col_offset : after] == expected and (
+            after == len(row) or row[after] in b"([: \t\\#"
+        ):
+            return stmt.lineno, stmt.col_offset + len(prefix)
+        return self._nth_name_from(stmt.lineno, stmt.col_offset, skip)
+
+    def attr_pos(self, node: ast.Attribute) -> tuple[int, int]:
+        end_ln = node.end_lineno or node.lineno
+        end_col = node.end_col_offset or 0
+        dot_attr = b"." + node.attr.encode("utf-8")
+        row = self.lines_utf8[end_ln - 1]
+        if end_col >= len(dot_attr) and row[end_col - len(dot_attr) : end_col] == dot_attr:
+            return end_ln, end_col - len(dot_attr) + 1
+        return self._nth_name_from(node.lineno, node.col_offset, 1)
+
+    def import_pos(self, alias: ast.alias, short_name: str) -> tuple[int, int]:
+        if "." not in alias.name:
+            return alias.lineno, alias.col_offset
+        row = self.lines_utf8[alias.lineno - 1]
+        full_b = alias.name.encode("utf-8")
+        short_b = short_name.encode("utf-8")
+        after = alias.col_offset + len(full_b)
+        if row[alias.col_offset : after] == full_b and (
+            after == len(row) or row[after] in b" \t,;\\#)"
+        ):
+            return alias.lineno, after - len(short_b)
+        return self._nth_name_from(alias.lineno, alias.col_offset, alias.name.count("."))
 
     def add(self, node: SymbolNode) -> None:
         if node.name != "_" and node.qualname not in self.seen:
@@ -81,11 +138,11 @@ class _WalkState:
         stmt: ast.stmt,
         scope: tuple[str, ...],
         *,
-        pos: ast.stmt | ast.expr | None = None,
+        line: int,
+        col_offset: int,
         ast_hash: str | None = None,
         decorators: list[ast.expr] | None = None,
     ) -> None:
-        anchor = pos if pos is not None else stmt
         first_line = decorators[0].lineno if decorators else stmt.lineno
         dec_names = tuple(ast.unparse(d) for d in decorators) if decorators else ()
         self.add(
@@ -93,7 +150,9 @@ class _WalkState:
                 name=name,
                 qualname=".".join([*scope, name]),
                 kind=kind,
-                location=f"{self.filepath}:{anchor.lineno}:{anchor.col_offset + 1}",
+                location=f"{self.filepath}:{line}:{col_offset + 1}",
+                line=line,
+                col_offset=col_offset,
                 start_line=first_line,
                 end_line=stmt.end_lineno or stmt.lineno,
                 ast_hash=ast_hash,
@@ -102,12 +161,15 @@ class _WalkState:
         )
 
     def add_external(self, name: str, qualname: str, alias: ast.alias) -> None:
+        line, col_offset = self.import_pos(alias, name)
         self.add(
             SymbolNode(
                 name=name,
                 qualname=qualname,
                 kind="external",
-                location=f"{self.filepath}:{alias.lineno}:{alias.col_offset + 1}",
+                location=f"{self.filepath}:{line}:{col_offset + 1}",
+                line=line,
+                col_offset=col_offset,
                 start_line=alias.lineno,
                 end_line=alias.end_lineno or alias.lineno,
             )
@@ -127,6 +189,8 @@ class _WalkState:
                 qualname=".".join([*scope, arg.arg]),
                 kind="parameter",
                 location=f"{self.filepath}:{arg.lineno}:{arg.col_offset + 1}",
+                line=arg.lineno,
+                col_offset=arg.col_offset,
                 start_line=arg.lineno,
                 end_line=end_line,
                 ast_hash=ast_hash,
@@ -315,11 +379,14 @@ def _record_callable(
     else:
         kind = "async_function" if is_async else "function"
 
+    line, col_offset = state.def_pos(stmt)
     state.add_symbol(
         stmt.name,
         kind,
         stmt,
         scope,
+        line=line,
+        col_offset=col_offset,
         ast_hash=_body_hash(stmt.body),
         decorators=stmt.decorator_list,
     )
@@ -352,7 +419,15 @@ def _walk_assign(
     if context == "method":
         for target in targets:
             for attr_node in _self_attr_nodes(target):
-                state.add_symbol(attr_node.attr, "field", stmt, scope[:-1], pos=attr_node)
+                line, col_offset = state.attr_pos(attr_node)
+                state.add_symbol(
+                    attr_node.attr,
+                    "field",
+                    stmt,
+                    scope[:-1],
+                    line=line,
+                    col_offset=col_offset,
+                )
         return
 
     if context not in {"module", "class"}:
@@ -364,7 +439,14 @@ def _walk_assign(
         and _is_type_alias(stmt.annotation)
     ):
         if isinstance(stmt.target, ast.Name):
-            state.add_symbol(stmt.target.id, "type_alias", stmt, scope, pos=stmt.target)
+            state.add_symbol(
+                stmt.target.id,
+                "type_alias",
+                stmt,
+                scope,
+                line=stmt.target.lineno,
+                col_offset=stmt.target.col_offset,
+            )
         return
 
     is_final = isinstance(stmt, ast.AnnAssign) and _is_final_annotation(stmt.annotation)
@@ -376,7 +458,14 @@ def _walk_assign(
                 if context == "class"
                 else ("constant" if (name.isupper() or is_final) else "variable")
             )
-            state.add_symbol(name, kind, stmt, scope, pos=name_node)
+            state.add_symbol(
+                name,
+                kind,
+                stmt,
+                scope,
+                line=name_node.lineno,
+                col_offset=name_node.col_offset,
+            )
 
 
 def _walk_import(stmt: ast.Import | ast.ImportFrom, state: _WalkState) -> None:
@@ -410,11 +499,14 @@ def _walk_body(
         stmt, cur_scope, cur_ctx = stack.pop()
         match stmt:
             case ast.ClassDef():
+                line, col_offset = state.def_pos(stmt)
                 state.add_symbol(
                     stmt.name,
                     "class",
                     stmt,
                     cur_scope,
+                    line=line,
+                    col_offset=col_offset,
                     ast_hash=_body_hash(stmt.body),
                     decorators=stmt.decorator_list,
                 )
@@ -438,7 +530,14 @@ def _walk_body(
                     stack.extend((child, child_scope, body_ctx) for child in reversed(stmt.body))
 
             case ast.TypeAlias() if cur_ctx in {"module", "class"}:
-                state.add_symbol(stmt.name.id, "type_alias", stmt, cur_scope, pos=stmt.name)
+                state.add_symbol(
+                    stmt.name.id,
+                    "type_alias",
+                    stmt,
+                    cur_scope,
+                    line=stmt.name.lineno,
+                    col_offset=stmt.name.col_offset,
+                )
 
             case ast.Assign() | ast.AnnAssign():
                 _walk_assign(stmt, cur_scope, cur_ctx, state)
@@ -563,14 +662,22 @@ def extract_symbols(
     if mod_qualname != "<module>":
         internal.add(mod_qualname.split(".", 1)[0])
 
-    total_lines = max(len(clean_source.splitlines()), 1)
-    state = _WalkState(filepath=full_path, internal_pkgs=frozenset(internal))
+    raw_lines = clean_source.splitlines()
+    total_lines = max(len(raw_lines), 1)
+    state = _WalkState(
+        filepath=full_path,
+        source=clean_source,
+        lines_utf8=tuple(ln.encode("utf-8") for ln in raw_lines),
+        internal_pkgs=frozenset(internal),
+    )
     state.add(
         SymbolNode(
             name=mod_name,
             qualname=mod_qualname,
             kind="module",
             location=f"{full_path}:1:1",
+            line=1,
+            col_offset=0,
             start_line=1,
             end_line=total_lines,
         )
