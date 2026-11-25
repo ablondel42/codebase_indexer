@@ -1,1 +1,0 @@
-"""Simulated custom virtualenv root."""
